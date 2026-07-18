@@ -8,10 +8,13 @@ import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import worker from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
+const TOKEN_KEY = "nexudus"; // must match src/index.ts
+
 const testEnv = {
 	...env,
 	NEXUDUS_USERNAME: "svc@example.com",
-	NEXUDUS_PASSWORD: "pw",
+	NEXUDUS_ACCESS_TOKEN: "seed-access",
+	NEXUDUS_REFRESH_TOKEN: "seed-refresh",
 	SLACK_SIGNING_SECRET: SIGNING_SECRET,
 	SLACK_BOT_TOKEN: "xoxb-test",
 } satisfies Env;
@@ -29,8 +32,9 @@ beforeAll(() => {
 	fetchMock.activate();
 	fetchMock.disableNetConnect();
 });
-afterEach(() => {
+afterEach(async () => {
 	fetchMock.assertNoPendingInterceptors();
+	await env.TOKENS.delete(TOKEN_KEY); // isolate KV state between tests
 });
 
 // --- Slack signing helpers (mirror the Worker) -----------------------------
@@ -108,6 +112,15 @@ function submissionBody(
 
 // --- Mocks -----------------------------------------------------------------
 
+function headerGet(headers: unknown, name: string): string | undefined {
+	if (!headers) return undefined;
+	const h = headers as { get?: (n: string) => string | null } & Record<string, string>;
+	if (typeof h.get === "function") return h.get(name) ?? undefined;
+	const lower = name.toLowerCase();
+	for (const k of Object.keys(h)) if (k.toLowerCase() === lower) return h[k];
+	return undefined;
+}
+
 function mockSlack(method: string, capture?: (body: any) => void, reply: object = { ok: true }) {
 	fetchMock
 		.get(SLACK_BASE)
@@ -118,20 +131,29 @@ function mockSlack(method: string, capture?: (body: any) => void, reply: object 
 		});
 }
 
-function mockToken(accessToken: string | null = "tok-123") {
-	fetchMock
-		.get(NEXUDUS_BASE)
-		.intercept({ path: "/api/token", method: "POST" })
-		.reply(accessToken === null ? 401 : 200, accessToken === null ? "bad" : { access_token: accessToken });
-}
+type Captured = { body?: string; auth?: string; clientId?: string };
 
-function mockVisitors(capture?: (body: any) => void, status = 200, data = "") {
+function mockVisitors(capture?: (c: Captured) => void, status = 200, data = "") {
 	fetchMock
 		.get(NEXUDUS_BASE)
 		.intercept({ path: "/api/public/visitors", method: "POST" })
 		.reply((opts) => {
-			if (capture) capture(JSON.parse(opts.body as string));
+			if (capture) capture({ body: opts.body as string, auth: headerGet(opts.headers, "authorization") });
 			return { statusCode: status, data };
+		});
+}
+
+function mockRefresh(
+	capture?: (c: Captured) => void,
+	status = 200,
+	reply: object = { access_token: "new-access", refresh_token: "new-refresh", expires_in: 1209599 },
+) {
+	fetchMock
+		.get(NEXUDUS_BASE)
+		.intercept({ path: "/api/token", method: "POST" })
+		.reply((opts) => {
+			if (capture) capture({ body: opts.body as string, clientId: headerGet(opts.headers, "client_id") });
+			return { statusCode: status, data: status === 200 ? JSON.stringify(reply) : "bad_grant" };
 		});
 }
 
@@ -177,8 +199,6 @@ describe("slash command → open modal", () => {
 		expect(res.status).toBe(200);
 		expect(viewsOpen.trigger_id).toBe("trigger-123");
 		expect(viewsOpen.view.callback_id).toBe("visitor_registration");
-		expect(viewsOpen.view.type).toBe("modal");
-		// The six expected input blocks are present.
 		const blockIds = viewsOpen.view.blocks.map((b: any) => b.block_id);
 		expect(blockIds).toEqual(["full_name", "email", "phone", "arrival", "host", "notes"]);
 	});
@@ -192,48 +212,89 @@ describe("slash command → open modal", () => {
 });
 
 describe("view_submission → register + DM", () => {
-	it("acks 200, registers the visitor, and DMs a success message", async () => {
-		mockToken();
-		let visitor: any;
+	it("registers with the seed access token and DMs success (KV empty)", async () => {
+		let visitor: Captured | undefined;
 		let dm: any;
-		mockVisitors((b) => (visitor = b), 200, JSON.stringify([{ Id: 1 }]));
+		mockVisitors((c) => (visitor = c), 200, JSON.stringify([{ Id: 1 }]));
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(await res.text()).toBe(""); // empty ack closes the modal
+		expect(await res.text()).toBe("");
 
-		// Outbound Nexudus visitor body.
-		expect(Array.isArray(visitor)).toBe(true);
-		expect(visitor).toHaveLength(1);
-		expect(visitor[0].BusinessId).toBe(1000000000); // from config
-		expect(visitor[0].FullName).toBe("Jane Doe");
-		expect(visitor[0].Email).toBe("jane.doe@gmail.com");
-		expect(visitor[0].PhoneNumber).toBe("+44 7700 900123");
-		expect(visitor[0].ExpectedArrival).toBe(ARRIVAL_WALLCLOCK); // wall-clock, no offset
-		expect(visitor[0].CustomerNotes).toBe(
+		// Used the seed token; no refresh happened, KV stays empty.
+		expect(visitor?.auth).toBe("Bearer seed-access");
+		expect(await env.TOKENS.get(TOKEN_KEY)).toBeNull();
+
+		const body = JSON.parse(visitor!.body!);
+		expect(body).toHaveLength(1);
+		expect(body[0].BusinessId).toBe(1000000000);
+		expect(body[0].FullName).toBe("Jane Doe");
+		expect(body[0].Email).toBe("jane.doe@gmail.com");
+		expect(body[0].PhoneNumber).toBe("+44 7700 900123");
+		expect(body[0].ExpectedArrival).toBe(ARRIVAL_WALLCLOCK);
+		expect(body[0].CustomerNotes).toBe(
 			"Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access",
 		);
 
-		// DM back to the submitter.
 		expect(dm.channel).toBe("U1");
 		expect(dm.text).toBe("✅ Registered Jane Doe, expected 2026-07-20 15:30:00 (Europe/London).");
 	});
 
-	it("DMs an auth failure when the Nexudus token call fails (no visitor call)", async () => {
-		mockToken(null);
+	it("uses the KV token pair when present, not the seed", async () => {
+		await env.TOKENS.put(TOKEN_KEY, JSON.stringify({ access_token: "kv-access", refresh_token: "kv-refresh" }));
+		let visitor: Captured | undefined;
+		mockVisitors((c) => (visitor = c));
+		mockSlack("chat.postMessage");
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(visitor?.auth).toBe("Bearer kv-access");
+	});
+
+	it("refreshes on 401, persists the rotated pair to KV, retries, and DMs success", async () => {
+		let refresh: Captured | undefined;
+		let retried: Captured | undefined;
 		let dm: any;
+		mockVisitors(undefined, 401); // first attempt: access token expired
+		mockRefresh((c) => (refresh = c)); // → new-access / new-refresh
+		mockVisitors((c) => (retried = c), 200); // retry with the fresh token
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(dm.text).toContain("could not sign in to Nexudus");
+
+		// Refresh used the seed refresh token + client_id = the account email.
+		expect(refresh?.clientId).toBe("svc@example.com");
+		expect(refresh?.body).toContain("grant_type=refresh_token");
+		expect(refresh?.body).toContain("refresh_token=seed-refresh");
+
+		// Retry used the new access token, and KV now holds the rotated pair.
+		expect(retried?.auth).toBe("Bearer new-access");
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual({
+			access_token: "new-access",
+			refresh_token: "new-refresh",
+		});
+
+		expect(dm.text).toContain("✅ Registered Jane Doe");
+	});
+
+	it("DMs a re-seed message when the refresh itself fails", async () => {
+		let dm: any;
+		mockVisitors(undefined, 401);
+		mockRefresh(undefined, 400); // refresh rejected
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("re-seed");
+		// KV untouched because the refresh failed.
+		expect(await env.TOKENS.get(TOKEN_KEY)).toBeNull();
 	});
 
 	it("DMs the Nexudus rejection detail on a 400", async () => {
-		mockToken();
-		mockVisitors(undefined, 400, "Invalid Email Address");
 		let dm: any;
+		mockVisitors(undefined, 400, "Invalid Email Address");
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
@@ -246,7 +307,6 @@ describe("view_submission → register + DM", () => {
 		let dm: any;
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
-		// Omit the datetimepicker value entirely.
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
@@ -262,6 +322,5 @@ describe("view_submission → register + DM", () => {
 			await slackRequest("/slack/interactivity", submissionBody(undefined, { callback_id: "something_else" })),
 		);
 		expect(res.status).toBe(200);
-		// No interceptors registered → assertNoPendingInterceptors confirms nothing was called.
 	});
 });

@@ -172,7 +172,60 @@ function readDateTime(state: ViewState, block: string, action: string): number |
 }
 
 // ---------------------------------------------------------------------------
-// Nexudus registration (Option A: fresh token per request, no cache)
+// Nexudus tokens (KV-backed, auto-refreshing)
+// ---------------------------------------------------------------------------
+//
+// The account password never reaches the Worker. It authenticates with an
+// access token that lasts ~14 days. When that token 401s we exchange the
+// refresh token for a new pair (client_id = the account email) — but Nexudus
+// refresh tokens are single-use and rotate on every exchange, so the live pair
+// is kept in KV (env.TOKENS) and the new refresh token is written back. The
+// NEXUDUS_ACCESS_TOKEN / NEXUDUS_REFRESH_TOKEN secrets are only the initial
+// seed, used until the first refresh populates KV; re-seed with
+// scripts/nexudus-token.sh if KV is ever cleared.
+
+const TOKEN_KEY = "nexudus";
+
+interface TokenPair {
+	access_token: string;
+	refresh_token: string;
+}
+
+async function readTokens(env: Env): Promise<TokenPair> {
+	const raw = await env.TOKENS.get(TOKEN_KEY);
+	if (raw) {
+		try {
+			const parsed = JSON.parse(raw) as Partial<TokenPair>;
+			if (typeof parsed.access_token === "string" && typeof parsed.refresh_token === "string") {
+				return { access_token: parsed.access_token, refresh_token: parsed.refresh_token };
+			}
+		} catch {
+			// fall through to the seed
+		}
+	}
+	return { access_token: env.NEXUDUS_ACCESS_TOKEN, refresh_token: env.NEXUDUS_REFRESH_TOKEN };
+}
+
+// Exchange the (single-use) refresh token for a fresh pair. client_id is the
+// account email, sent as a header (Nexudus requirement). Returns null on any
+// failure — the caller surfaces a "re-seed" message.
+async function refreshTokens(env: Env, base: string, refreshToken: string): Promise<TokenPair | null> {
+	const res = await fetch(`${base}/api/token`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/x-www-form-urlencoded",
+			client_id: env.NEXUDUS_USERNAME,
+		},
+		body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }),
+	});
+	if (!res.ok) return null;
+	const body = (await res.json().catch(() => null)) as Partial<TokenPair> | null;
+	if (typeof body?.access_token !== "string" || typeof body?.refresh_token !== "string") return null;
+	return { access_token: body.access_token, refresh_token: body.refresh_token };
+}
+
+// ---------------------------------------------------------------------------
+// Nexudus registration
 // ---------------------------------------------------------------------------
 
 // Epoch seconds → "YYYY-MM-DDTHH:mm:ss" wall-clock in the space's timezone —
@@ -210,23 +263,6 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<string> {
 
 	const base = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 
-	const tokenRes = await fetch(`${base}/api/token`, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams({
-			grant_type: "password",
-			username: env.NEXUDUS_USERNAME,
-			password: env.NEXUDUS_PASSWORD,
-		}),
-	});
-	const tokenBody = tokenRes.ok
-		? ((await tokenRes.json().catch(() => null)) as { access_token?: unknown } | null)
-		: null;
-	const token = typeof tokenBody?.access_token === "string" ? tokenBody.access_token : null;
-	if (!token) {
-		return "❌ Registration failed: could not sign in to Nexudus. Ask an admin to check the Worker's Nexudus secrets.";
-	}
-
 	// All registrations go through one account, so CustomerNotes is reception's
 	// only view of who submitted and who the visitor is for.
 	const noteLines: string[] = [`Submitted via Slack by ${input.submittedBy}`];
@@ -241,12 +277,28 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<string> {
 		ExpectedArrival: arrival,
 		CustomerNotes: noteLines.join("\n"),
 	};
+	const body = JSON.stringify([visitor]); // body is an array of visitors
 
-	const regRes = await fetch(`${base}/api/public/visitors`, {
-		method: "POST",
-		headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-		body: JSON.stringify([visitor]), // body is an array of visitors
-	});
+	const createVisitor = (accessToken: string) =>
+		fetch(`${base}/api/public/visitors`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+			body,
+		});
+
+	const tokens = await readTokens(env);
+	let regRes = await createVisitor(tokens.access_token);
+
+	// Access token expired → refresh (rotates the pair), persist, and retry once.
+	if (regRes.status === 401) {
+		const refreshed = await refreshTokens(env, base, tokens.refresh_token);
+		if (!refreshed) {
+			return "❌ Registration failed: the Nexudus session expired and couldn't be renewed. An admin needs to re-seed the tokens (scripts/nexudus-token.sh).";
+		}
+		await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
+		regRes = await createVisitor(refreshed.access_token);
+	}
+
 	if (!regRes.ok) {
 		const detail = (await regRes.text().catch(() => "")).slice(0, 300);
 		return `❌ Nexudus rejected the registration: ${detail || `HTTP ${regRes.status}`}`;
