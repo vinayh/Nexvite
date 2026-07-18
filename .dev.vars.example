@@ -2,10 +2,12 @@
 # These are the SECRET values, injected for `wrangler dev` locally and via
 # `wrangler secret put <NAME>` in production. Non-secret config lives in wrangler.jsonc `vars`.
 
-# Service member account used to authenticate to the Nexudus API (no 2FA).
+# Nexudus account the Worker signs in with (must not have 2FA — SPEC.md §7).
 NEXUDUS_USERNAME="service-account@example.com"
 NEXUDUS_PASSWORD="change-me"
 
-# Shared secret checked against the Slack request's X-Shared-Secret header.
-# Generate with: openssl rand -hex 32
-SLACK_SHARED_SECRET="change-me"
+# Slack app credentials (Basic Information → Signing Secret; OAuth & Permissions
+# → Bot User OAuth Token). Used to verify inbound requests and to open the modal
+# / DM the result. See SPEC.md §12 for the app-setup steps.
+SLACK_SIGNING_SECRET="change-me"
+SLACK_BOT_TOKEN="xoxb-change-me"

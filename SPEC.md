@@ -1,84 +1,109 @@
 # Spec: Slack → Nexudus Visitor Registration
 
-**A micro service on Cloudflare Workers. One Slack form registers a visitor via the Nexudus Members Portal API.**
+**A micro service on Cloudflare Workers. A Slack slash command opens a modal form that registers a visitor via the Nexudus Members Portal API.**
 
 Version: Option A (stateless — the Worker authenticates to Nexudus on each submission using a service account; no token cache, no database).
 
-> **Feasibility verified 2026-07-18.** Both API calls were tested end-to-end against the live Nexudus space: `POST /api/token` returns a valid token (account has no 2FA), and `POST /api/public/visitors` creates a visitor with the field mapping in §5. Test visitors were created, listed under the host, and deleted successfully. The two behaviours this surfaced are captured in §7.
+> **Feasibility verified 2026-07-18.** Both Nexudus API calls were tested end-to-end against the live space: `POST /api/token` returns a valid token (the account has no 2FA), and `POST /api/public/visitors` creates a visitor with the field mapping in §5. Test visitors were created, listed under the host, and deleted successfully. The behaviours this surfaced are in §7.
+>
+> **Revised 2026-07-18 — Slack integration path changed.** The original design assumed a Slack Workflow Builder form with a "Send a web request" step. **Slack has no native step for sending an outbound HTTP request to an arbitrary URL** — its native "webhook" is an *inbound* trigger only — and the third-party app that used to add one (Workflow Buddy) is no longer available. So the integration is now a **custom Slack app for which this Worker is the backend**: a `/visitor` slash command opens a Block Kit modal, and the modal submission is delivered to the Worker as a signed `view_submission` request. This resolves the old date-format unknown for free (see §7) and replaces the shared-secret with Slack request signing.
 
 ---
 
 ## 1. Goal
 
-A member fills out a Slack form with visitor details. Submitting it triggers a Cloudflare Worker that authenticates to Nexudus and registers the visitor. One form, one Worker, two outbound API calls — no dashboards, no persistence, no per-member login.
+A member runs `/visitor` in Slack, fills in a short modal (name, email, arrival, …) and submits. The Worker verifies the request came from Slack, registers the visitor in Nexudus, and DMs the member a ✅/❌ result. One slash command, one modal, one Worker — no dashboards, no persistence, no per-member login.
 
 ## 2. Architecture
 
 ```
-Slack Workflow (form) ──POST JSON──► Cloudflare Worker ──► Nexudus Public API
-                                          │                 1. POST /api/token
-                                          │                 2. POST /api/public/visitors
-                                          ▼
-                                   200 / error back to Slack
+Slack member
+   │  /visitor
+   ▼
+POST /slack/command ──► Worker ──► Slack views.open  (opens the modal)
+   │
+   │  member fills modal, clicks Register
+   ▼
+POST /slack/interactivity ──► Worker
+        1. verify X-Slack-Signature (HMAC, SLACK_SIGNING_SECRET)
+        2. ack 200 within 3s (closes the modal)
+        3. [background] Nexudus POST /api/token → POST /api/public/visitors
+        4. Slack chat.postMessage → DM the member ✅/❌
 ```
 
-1. **Slack Workflow** — a Workflow Builder form trigger collects visitor details, then a "Send a web request" step POSTs them to the Worker with a shared-secret header.
-2. **Cloudflare Worker** — one stateless `fetch` handler: verifies the secret, gets a fresh Nexudus token, maps fields, registers the visitor. The free tier (100k requests/day) far exceeds need, deploy is a single `wrangler deploy`, and secrets are managed by Wrangler (`wrangler secret put`) — never committed.
+1. **Slack app** — a custom app (not Workflow Builder) with a `/visitor` slash command and Interactivity enabled, both pointed at this Worker. Setup steps are in §12. Requires a Slack **bot token** (to open the modal and DM the result) and the app's **signing secret** (to verify inbound requests).
+2. **Cloudflare Worker** — one stateless `fetch` handler with two routes. It verifies Slack's signature, opens the modal on the slash command, and on submission registers the visitor and notifies the member. The free tier (100k requests/day) far exceeds need; deploy is a single `wrangler deploy`; secrets are managed by Wrangler (`wrangler secret put`).
 3. **Nexudus Public API** — `POST /api/token` for auth, `POST /api/public/visitors` to create the visitor.
 
 ## 3. Nexudus environment
 
-Environment-specific values are **not** hardcoded in this document — they live in the repo's config files:
+Environment-specific values live in the repo's config files, **not** hardcoded in this document:
 
-- **Non-secret config** → `wrangler.jsonc` `vars`: `NEXUDUS_SUBDOMAIN`, `NEXUDUS_BUSINESS_ID`.
-- **Secrets** → `.dev.vars` locally (gitignored; template in `.dev.vars.example`), `wrangler secret put` in production: `NEXUDUS_USERNAME`, `NEXUDUS_PASSWORD`, `SLACK_SHARED_SECRET`.
+- **Non-secret config** → `wrangler.jsonc` `vars`: `NEXUDUS_SUBDOMAIN`, `NEXUDUS_BUSINESS_ID`, `SPACE_TIMEZONE`.
+- **Secrets** → `.dev.vars` locally (gitignored; template in `.dev.vars.example`), `wrangler secret put` in production: `NEXUDUS_USERNAME`, `NEXUDUS_PASSWORD`, `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`.
 
 Notes from the feasibility test:
 
-- The API base URL is `https://<NEXUDUS_SUBDOMAIN>.spaces.nexudus.com`. Use the `.spaces.nexudus.com` host, **not** the `….nexudus.site` portal URL — the portal URL returns `405` for the API.
+- The API base URL is `https://<NEXUDUS_SUBDOMAIN>.spaces.nexudus.com`. Use the `.spaces.nexudus.com` host, **not** the `….nexudus.site` portal URL — the portal returns `405` for the API.
 - The space is single-site, so `NEXUDUS_BUSINESS_ID` is one fixed value (read once from `GET /api/public/businesses/all`) rather than a per-request Location dropdown.
 
-## 4. Slack form fields
+## 4. The modal
 
-| Label | Type | Required |
-|---|---|---|
-| Full name | Short text | Yes |
-| Email | Short text | **Yes** (see §7) |
-| Phone | Short text | No |
-| Expected arrival | Date + time | Yes |
-| Notes | Long text | No |
+The `/visitor` command opens a Block Kit modal (`callback_id: visitor_registration`) with these input blocks:
 
-Single-site, so there is no Location dropdown — `BusinessId` comes from config.
+| Block id | Label | Element | Required |
+|---|---|---|---|
+| `full_name` | Full name | `plain_text_input` | Yes |
+| `email` | Email | `email_text_input` | **Yes** (see §7); the element enforces email format client-side |
+| `phone` | Phone | `plain_text_input` | No |
+| `arrival` | Expected arrival | `datetimepicker` | Yes |
+| `host` | Who are they visiting? | `plain_text_input` | No |
+| `notes` | Notes | `plain_text_input` (multiline) | No |
 
-The "Send a web request" step is configured with:
-- **URL:** the deployed Worker URL (`https://<name>.<subdomain>.workers.dev/register`)
-- **Method:** POST
-- **Header:** `X-Shared-Secret: <SLACK_SHARED_SECRET>`
-- **Body:** JSON containing the form variables.
+Required inputs are enforced by Slack **before** submission, so most bad input never reaches the Worker. The submitter's identity (`SubmittedBy`) comes from the `view_submission` payload's `user` field — not a form field — so every registration is attributable even though all requests reach Nexudus through a single account (§7).
+
+`datetimepicker` returns `selected_date_time` as **Unix epoch seconds** — the instant of the wall-clock time the member picked in their Slack timezone. This is exactly what the Worker's arrival conversion consumes (§5), which is why the old "what date format does Slack send?" unknown no longer exists.
+
+Single-site, so there is no Location field — `BusinessId` comes from config.
 
 ## 5. Worker behaviour
 
-Single endpoint: `POST /register`.
+Two endpoints. Any other path returns `404`; any non-POST returns `405`.
 
-1. **Verify** the `X-Shared-Secret` header matches the configured secret. Reject with `401` otherwise.
-2. **Authenticate**: `POST /api/token` (form-urlencoded `grant_type=password`, `username`, `password`); read `access_token`. Fresh token every request — this is Option A.
-3. **Map** the payload to a Nexudus visitor (below) and `POST /api/public/visitors` with `Authorization: Bearer {token}` and a JSON **array** of one visitor.
-4. **Respond** `200` on success; on a Nexudus 4xx, return the error text so it surfaces in the Slack step.
+- `POST /slack/command` — the slash command.
+- `POST /slack/interactivity` — modal submissions (and other interaction callbacks, which are acked and ignored).
+
+### Steps (both endpoints)
+
+1. **Route**: reject non-matching paths (`404`) and non-POST methods (`405`).
+2. **Verify signature**: read the raw body, compute `v0=HMAC-SHA256(SLACK_SIGNING_SECRET, "v0:{timestamp}:{body}")`, and compare against `X-Slack-Signature` with a **constant-time comparison** (`crypto.subtle.timingSafeEqual`). Reject with `401` if the header is missing, the timestamp is older than 5 minutes (replay protection), or the signature mismatches.
+
+### `POST /slack/command`
+
+3. Parse the form-urlencoded body, take `trigger_id`, and call `views.open` with the modal. Respond `200` (empty) on success. If `views.open` fails, respond `200` with a short "couldn't open the form" text (the slash-command response is shown to the member). The Slack error *code* may be logged; never the token.
+
+### `POST /slack/interactivity`
+
+3. Parse `payload` (URL-decoded JSON). If it isn't a `view_submission` for `callback_id: visitor_registration`, ack `200` and ignore.
+4. **Extract & bound** the modal values: trim and length-cap each string (FullName 200, Email 320, PhoneNumber 50, Host 200, Notes 1000). Read `arrival` as `selected_date_time` (epoch seconds). Take `SubmittedBy` from `payload.user.name`.
+5. **Ack immediately** with an empty `200` (this closes the modal), and do the rest in the background (`ctx.waitUntil`) — Slack requires a response within 3 seconds and the two Nexudus calls can exceed that.
+6. **Register (background)**: convert arrival to **wall-clock time in `SPACE_TIMEZONE`** with no `Z`/offset (§7); `POST /api/token` (form-urlencoded `grant_type=password`) and validate the response actually contains `access_token`; then `POST /api/public/visitors` with `Authorization: Bearer {token}` and a JSON **array** of one visitor. `BusinessId` comes from config **only**.
+7. **Notify (background)**: `chat.postMessage` a DM to `payload.user.id` — ✅ with the visitor's name and arrival on success, or ❌ with the reason (missing fields, auth failure, or the Nexudus rejection text, truncated to 300 chars) on failure.
+
+**Never log the modal values, visitor fields, tokens, or Nexudus/Slack response bodies.** Observability is on in `wrangler.jsonc`, so anything logged is retained in Workers Logs — visitor PII must not end up there (§7). Slack/Nexudus error *codes* are safe to log.
 
 ### Field mapping
 
-| Slack field | Nexudus field | Notes |
+| Modal field | Nexudus field | Notes |
 |---|---|---|
-| — | `BusinessId` | From `NEXUDUS_BUSINESS_ID` |
+| — | `BusinessId` | From `NEXUDUS_BUSINESS_ID` only |
 | Full name | `FullName` | Required |
 | Email | `Email` | Required; must be a real domain (§7) |
 | Phone | `PhoneNumber` | Optional |
-| Expected arrival | `ExpectedArrival` | ISO 8601; see §7 timezone note |
-| Notes | `CustomerNotes` | Optional |
+| Expected arrival | `ExpectedArrival` | Epoch seconds → wall-clock in `SPACE_TIMEZONE`, no offset (§7) |
+| `user.name`, Host, Notes | `CustomerNotes` | Lines: `Submitted via Slack by {SubmittedBy}` · `Visiting: {Host}` · `{Notes}` |
 
 ## 6. Configuration
-
-Two kinds of config, kept out of this document (values live in the files noted in §3):
 
 **Non-secret `vars`** — committed in `wrangler.jsonc`:
 
@@ -86,128 +111,118 @@ Two kinds of config, kept out of this document (values live in the files noted i
 |---|---|
 | `NEXUDUS_SUBDOMAIN` | Space subdomain → `https://{sub}.spaces.nexudus.com` |
 | `NEXUDUS_BUSINESS_ID` | Default location id |
+| `SPACE_TIMEZONE` | IANA timezone of the space; used to render `ExpectedArrival` as wall-clock time |
 
 **Secrets** — `.dev.vars` locally (gitignored), `wrangler secret put <NAME>` in production; template in `.dev.vars.example`:
 
 | Name | Purpose |
 |---|---|
-| `NEXUDUS_USERNAME` | Service member account email |
-| `NEXUDUS_PASSWORD` | Service member account password |
-| `SLACK_SHARED_SECRET` | Shared secret checked against the request header |
+| `NEXUDUS_USERNAME` | Nexudus account email the Worker signs in with |
+| `NEXUDUS_PASSWORD` | That account's password |
+| `SLACK_SIGNING_SECRET` | Verifies the HMAC on inbound Slack requests (Basic Information → Signing Secret) |
+| `SLACK_BOT_TOKEN` | `xoxb-…` bot token; opens the modal and DMs the result (OAuth & Permissions) |
 
-The TypeScript `Env` type for all of these is generated by `npm run cf-typegen` into `worker-configuration.d.ts`.
+The TypeScript `Env` type is generated by `npm run cf-typegen` into `worker-configuration.d.ts`.
 
 ## 7. Constraints & tested caveats
 
-- **Email is required for this space.** A visitor with no email is rejected `400 "not valid"` — the generic Nexudus docs call Email optional, but this space enforces it, so the form marks it required.
-- **Email must be a real domain.** `@example.com` returns `400 "Invalid Email Address"`; normal member emails (gmail, outlook, proton, …) are accepted. Real submissions are fine, and the Worker surfaces any 400 back to Slack.
-- **Arrival timezone.** Nexudus appears to store/display arrival in the space's local time (a value sent as UTC came back with the same wall-clock digits and no offset). Confirm the space timezone so a "10:00" arrival isn't shifted by the Worker's UTC conversion; adjust date handling if needed.
-- **Service account must not have 2FA** (the tested account has none) — otherwise the token step needs a TOTP source. Use a dedicated, low-privilege member account.
-- All credentials live as Wrangler secrets — never in the Slack workflow or in code. Keep `SLACK_SHARED_SECRET` long and random; it is the only thing gating the endpoint.
-- Public API rate limit is 10 requests / 5 s. One submission = two calls — well within it.
-- Confirm whether visitors require operator approval, which affects whether a registration is immediately "live."
+- **Email is required for this space.** A visitor with no email is rejected `400 "not valid"`, so the modal marks Email required.
+- **Email must be a real domain.** `@example.com` returns `400 "Invalid Email Address"`; normal member emails (gmail, outlook, proton, …) are accepted. The Worker surfaces any 400 back to the member as a ❌ DM.
+- **Arrival timezone (rule decided).** Nexudus stores/displays arrival as wall-clock time in the space's local timezone. Slack's `datetimepicker` gives the Worker an absolute instant (epoch seconds); the Worker renders that instant as wall-clock time in `SPACE_TIMEZONE` and sends it without a `Z`/offset. For a submitter in the space's own timezone the displayed time matches what they picked; a submitter in another timezone gets the same instant expressed in space-local time.
+- **Single-account model (accepted).** All registrations go through one Nexudus account (a dedicated lower-privilege account isn't possible for this space): every visitor is hosted by that account, and Nexudus host notifications go to it. Mitigation: `SubmittedBy` (the Slack submitter) and `Host` are written into `CustomerNotes` so reception can see who is expecting the visitor. Real host attribution would need the admin API — noted as an upgrade path in §11.
+- **The account must not have 2FA** (the tested account has none) — otherwise the token step needs a TOTP source.
+- **Slack request signing is the only gate.** There is no shared secret. Any request without a valid, recent `X-Slack-Signature` is rejected `401`. Keep `SLACK_SIGNING_SECRET` and `SLACK_BOT_TOKEN` as Wrangler secrets — never in code.
+- **Secret rotation:** in the Slack app dashboard, regenerate the signing secret or reinstall for a new bot token, then `wrangler secret put` the new value. Rotate the bot token if it leaks (it can post as the app).
+- **No PII or credentials in logs.** The Worker never logs modal values, visitor fields, tokens, or response bodies.
+- Public API rate limit is 10 requests / 5 s. One submission = two Nexudus calls, so 3+ near-simultaneous submissions could 429; that surfaces as a ❌ DM and the member retries. Accepted at this scale.
+- **Duplicate submissions are possible** (no idempotency): a double-submit creates a duplicate visitor, cleaned up in the portal. Accepted at this scale.
 
-## 8. Acceptance criteria
+## 8. Pre-deployment checklist
 
-- Submitting the form with a valid name + email + arrival creates a matching visitor in Nexudus, visible under the host's registered visitors. *(Verified via direct API test.)*
-- Missing required fields are blocked by Slack form validation before the webhook fires.
-- A request without the correct shared secret is rejected with `401`.
-- A Nexudus error returns a readable message into the Slack workflow rather than failing silently.
+The old C1–C3 (capture the Slack payload / confirm serialization / confirm error surfacing) are **resolved** by the custom-app design: the payload shape is the documented `view_submission`, the date is epoch seconds from `datetimepicker`, and outcomes are delivered as DMs. Remaining items:
 
-## 9. Non-goals & upgrade path
+- [ ] **S1 — Create the Slack app and wire the two request URLs** (§12). Needs the Worker deployed first (Slack can't reach localhost).
+- [ ] **S2 — Confirm the modal renders and submits.** Run `/visitor`, check all six fields appear and required-field enforcement works.
+- [ ] **S3 — Confirm the DM path.** Ensure the bot can DM the submitter (scope `chat:write`; if DMs don't arrive, add `im:write`). Verify ✅ and ❌ messages both arrive.
+- [ ] **S4 — Confirm the timezone end-to-end.** Submit a known arrival and check the Nexudus portal shows that wall-clock time.
+- [ ] **C4 — Operator approval.** Confirm whether visitors require operator approval in this space (affects what the ✅ DM should promise).
+- [ ] **C5 — Slash-command access scope.** Decide who can run `/visitor` (guests? Slack Connect?) and restrict if broader than intended.
+- [ ] **C6 — Post-deploy rate limiting.** Add a Cloudflare WAF rate-limiting rule for `/slack/*` (e.g. 10 requests/min per IP) — cheap insurance, though Slack signing already gates the endpoint.
 
-Keep it micro: no token caching, persistence, visitor listing/cancellation UI, retry queue, or per-member login. Editing or deleting a visitor is done in the Nexudus portal (or `DELETE /api/public/visitors/{id}`). If the per-request token call ever matters (higher volume or latency sensitivity), upgrade to **Option B**: cache `{ access_token, refresh_token, expires_at }` in Workers KV and refresh only near expiry — no other part of this design changes.
+## 9. Acceptance criteria
+
+- Running `/visitor` opens a modal with the six fields; submitting a valid name + email + arrival creates a matching visitor in Nexudus, visible under the account's registered visitors, with `CustomerNotes` identifying the submitter (and host, if given). *(Nexudus side verified via direct API test.)*
+- The submitter always receives a DM: ✅ with the visitor's name and arrival on success, or ❌ with a readable reason on any failure (invalid email, Nexudus rejection, auth failure). Nothing fails silently.
+- The arrival time shown in Nexudus matches the wall-clock time the submitter picked (submitter in the space timezone).
+- Missing required fields are blocked by the modal before submission.
+- A request without a valid, recent Slack signature is rejected `401`; wrong path/method get `404`/`405`.
+- No visitor PII, credentials, or tokens appear in Workers Logs.
+
+## 10. Test plan
+
+`npm test` runs Vitest with `@cloudflare/vitest-pool-workers`; Slack and Nexudus are mocked with `fetchMock`. `npm run check` typechecks `src/` and `test/`. Cases:
+
+- Unknown path → `404`; non-POST → `405`.
+- Missing / bad / stale-timestamp Slack signature → `401`; no outbound call.
+- Slash command → `views.open` called with the `trigger_id` and the six-block modal; `200`. `views.open` failure → `200` with a retry message.
+- `view_submission` happy path → `200` empty ack; asserts the outbound Nexudus visitor body (`BusinessId` from config, wall-clock arrival in `SPACE_TIMEZONE`, `CustomerNotes` assembly, array-of-one shape) and the ✅ DM (`chat.postMessage` channel + text).
+- Nexudus token failure / missing `access_token` → ❌ auth DM, no visitor call.
+- Nexudus registration `400` → ❌ DM containing the Nexudus detail.
+- Missing required value (arrival) → ❌ required DM, no Nexudus call.
+- Foreign `callback_id` / non-submission interaction → `200` ack, no outbound calls.
+
+## 11. Non-goals & upgrade path
+
+Keep it micro: no token caching, persistence, visitor listing/cancellation UI, retry queue, or per-member login. Editing or deleting a visitor is done in the Nexudus portal (or `DELETE /api/public/visitors/{id}`). Two upgrade paths, neither of which changes the rest of the design:
+
+- **Option B (token caching):** if the per-request token call ever matters (higher volume or latency), cache `{ access_token, refresh_token, expires_at }` in Workers KV and refresh only near expiry.
+- **Real host attribution:** the admin-level Nexudus API can likely create visitors with a real host coworker, so notifications reach the actual host instead of the shared account. Revisit if the `CustomerNotes` mitigation proves insufficient.
+
+## 12. Slack app setup
+
+Done once in the Slack app dashboard (<https://api.slack.com/apps>). The Worker must be deployed first so you have its public URL (`https://<name>.<subdomain>.workers.dev`).
+
+1. **Create app** → "From scratch", pick the workspace.
+2. **OAuth & Permissions → Bot Token Scopes:** add `commands` and `chat:write` (add `im:write` if DMs to the submitter don't deliver).
+3. **Slash Commands → Create:** command `/visitor`, Request URL `https://<worker>/slack/command`.
+4. **Interactivity & Shortcuts → On:** Request URL `https://<worker>/slack/interactivity`.
+5. **Install to Workspace.** Copy the **Bot User OAuth Token** (`xoxb-…`) → `SLACK_BOT_TOKEN`. From **Basic Information**, copy the **Signing Secret** → `SLACK_SIGNING_SECRET`.
+6. Set both as Worker secrets (`wrangler secret put …`) and redeploy if needed.
 
 ---
 
-## Appendix A — Reference Worker (single file)
+## Appendix A — Implementation
 
-```javascript
-// worker.js — Option A: fresh Nexudus token per request, no cache.
+The Worker is implemented in **`src/index.ts`** (the reference implementation is the code itself, to avoid drift). Structure:
 
-export default {
-  async fetch(request, env) {
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    // 1. Verify shared secret from Slack's web-request step.
-    if (request.headers.get("X-Shared-Secret") !== env.SLACK_SHARED_SECRET) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    const base = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
-
-    let payload;
-    try {
-      payload = await request.json();
-    } catch {
-      return new Response("Bad JSON", { status: 400 });
-    }
-
-    // Email is required for this space (see §7).
-    if (!payload.FullName || !payload.Email || !payload.ExpectedArrival) {
-      return new Response("Missing FullName, Email, or ExpectedArrival", { status: 400 });
-    }
-
-    // 2. Authenticate (fresh token each request).
-    const tokenRes = await fetch(`${base}/api/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "password",
-        username: env.NEXUDUS_USERNAME,
-        password: env.NEXUDUS_PASSWORD,
-      }),
-    });
-    if (!tokenRes.ok) {
-      return new Response("Nexudus auth failed", { status: 502 });
-    }
-    const { access_token } = await tokenRes.json();
-
-    // 3. Map Slack fields → Nexudus visitor (body is an array).
-    const visitor = {
-      BusinessId: Number(payload.BusinessId ?? env.NEXUDUS_BUSINESS_ID),
-      FullName: payload.FullName,
-      Email: payload.Email,
-      PhoneNumber: payload.PhoneNumber || undefined,
-      ExpectedArrival: new Date(payload.ExpectedArrival).toISOString(),
-      CustomerNotes: payload.Notes || undefined,
-    };
-
-    // 4. Register the visitor.
-    const regRes = await fetch(`${base}/api/public/visitors`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify([visitor]),
-    });
-    if (!regRes.ok) {
-      const detail = await regRes.text();
-      return new Response(`Registration failed: ${detail}`, { status: 502 });
-    }
-
-    return new Response(`Registered ${visitor.FullName}.`, { status: 200 });
-  },
-};
-```
+- **Signature** — `verifySlackSignature` (HMAC-SHA256 over `v0:{ts}:{body}`, 5-minute replay window, constant-time compare).
+- **Slack Web API** — `slackApi` (bot-token POST helper), `postDM`, `views.open`.
+- **Modal** — `visitorModal` / `inputBlock` build the Block Kit view.
+- **Extraction** — `readText` (trim + cap) and `readDateTime` pull values from `view.state.values`.
+- **Nexudus** — `toWallClock` (epoch → space-local wall-clock) and `registerVisitor` (token → create, returns the ✅/❌ message; never throws).
+- **Router** — the two endpoints; the interactivity handler acks immediately and does register-then-DM in `ctx.waitUntil`.
 
 ## Appendix B — Deploy checklist
 
 ```bash
-# Scaffold already exists in this repo; put the Worker above in src/index.ts.
-
-# Local dev: copy the template and fill in real secret values (.dev.vars is gitignored).
+# Local dev: copy the template and fill in real values (.dev.vars is gitignored).
 cp .dev.vars.example .dev.vars
 npm run cf-typegen        # regenerate the Env type after any config change
+npm run check             # typecheck src/ and test/
+npm test                  # unit tests (§10)
 
-# Production secrets (NEXUDUS_SUBDOMAIN / NEXUDUS_BUSINESS_ID are non-secret vars in wrangler.jsonc):
+# Deploy (NEXUDUS_SUBDOMAIN / NEXUDUS_BUSINESS_ID / SPACE_TIMEZONE are non-secret
+# vars in wrangler.jsonc):
+wrangler login
+wrangler deploy
+# → note the printed workers.dev URL for the Slack app request URLs (§12)
+
+# Production secrets:
 wrangler secret put NEXUDUS_USERNAME
 wrangler secret put NEXUDUS_PASSWORD
-wrangler secret put SLACK_SHARED_SECRET
+wrangler secret put SLACK_SIGNING_SECRET
+wrangler secret put SLACK_BOT_TOKEN
 
-wrangler deploy
-# → copy the printed workers.dev URL into the Slack "Send a web request" step
+# Then do the Slack app setup (§12), pointing both request URLs at the Worker.
+# Post-deploy (§8 C6): add a Cloudflare WAF rate-limiting rule for /slack/*.
 ```
