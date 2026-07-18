@@ -22,9 +22,22 @@ const testEnv = {
 const NEXUDUS_BASE = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 const SLACK_BASE = "https://slack.com";
 
-// 2026-07-20 14:30:00 UTC → 15:30:00 in Europe/London (BST, UTC+1).
+// 2026-07-20 14:30:00 UTC → 15:30 in Europe/London (BST, UTC+1).
 const ARRIVAL_EPOCH = Date.UTC(2026, 6, 20, 14, 30, 0) / 1000;
-const ARRIVAL_WALLCLOCK = "2026-07-20T15:30:00";
+const ARRIVAL_UTC = "2026-07-20T14:30:00"; // sent to Nexudus (naive UTC)
+const ARRIVAL_LOCAL = "2026-07-20 15:30"; // shown in messages (Europe/London, BST)
+
+// What the default submissionBody() produces as a success message.
+const SUCCESS_TEXT = [
+	"✅ *Visitor registered*",
+	"*Name:* Jane Doe",
+	"*Email:* jane.doe@gmail.com",
+	"*Phone:* +44 7700 900123",
+	`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
+	"*Visiting:* Sam",
+	"*Notes:* Needs step-free access",
+	"*Submitted by:* Vinay Hiremath",
+].join("\n");
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
@@ -106,6 +119,22 @@ function submissionBody(
 			callback_id: over.callback_id ?? "visitor_registration",
 			state: { values: values ?? defaults },
 		},
+	};
+	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
+}
+
+function blockActionsBody(
+	actionId = "open_visitor_form",
+	triggerId = "trig-xyz",
+	extra: { value?: string; responseUrl?: string; messageText?: string } = {},
+): string {
+	const payload = {
+		type: "block_actions",
+		user: { id: "U1", name: "Vinay Hiremath" },
+		trigger_id: triggerId,
+		actions: [{ action_id: actionId, ...(extra.value ? { value: extra.value } : {}) }],
+		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
+		...(extra.messageText ? { message: { text: extra.messageText } } : {}),
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
 }
@@ -212,11 +241,12 @@ describe("slash command → open modal", () => {
 });
 
 describe("view_submission → register + DM", () => {
-	it("registers with the seed access token and DMs success (KV empty)", async () => {
+	it("registers with the seed access token, DMs success, and logs to the channel (KV empty)", async () => {
 		let visitor: Captured | undefined;
-		let dm: any;
+		const posts: any[] = [];
 		mockVisitors((c) => (visitor = c), 200, JSON.stringify([{ Id: 1 }]));
-		mockSlack("chat.postMessage", (b) => (dm = b));
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM to the submitter
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -232,20 +262,34 @@ describe("view_submission → register + DM", () => {
 		expect(body[0].FullName).toBe("Jane Doe");
 		expect(body[0].Email).toBe("jane.doe@gmail.com");
 		expect(body[0].PhoneNumber).toBe("+44 7700 900123");
-		expect(body[0].ExpectedArrival).toBe(ARRIVAL_WALLCLOCK);
+		expect(body[0].ExpectedArrival).toBe(ARRIVAL_UTC); // UTC, not space-local
 		expect(body[0].CustomerNotes).toBe(
 			"Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access",
 		);
 
-		expect(dm.channel).toBe("U1");
-		expect(dm.text).toBe("✅ Registered Jane Doe, expected 2026-07-20 15:30:00 (Europe/London).");
+		// DM first, then the same summary to the visitors channel.
+		expect(posts).toHaveLength(2);
+		expect(posts[0].channel).toBe("U1");
+		expect(posts[0].text).toBe(SUCCESS_TEXT);
+		expect(posts[1].channel).toBe("#visitor-requests");
+		expect(posts[1].text).toBe(SUCCESS_TEXT);
+
+		// Both carry the summary + a Delete button holding the lookup reference
+		// (email + the arrival exactly as sent), since Nexudus returns no Id.
+		for (const post of posts) {
+			expect(post.blocks[0].text.text).toBe(SUCCESS_TEXT);
+			const button = post.blocks.find((b: any) => b.type === "actions").elements[0];
+			expect(button.action_id).toBe("delete_visitor");
+			expect(JSON.parse(button.value)).toEqual({ e: "jane.doe@gmail.com", a: ARRIVAL_UTC });
+		}
 	});
 
 	it("uses the KV token pair when present, not the seed", async () => {
 		await env.TOKENS.put(TOKEN_KEY, JSON.stringify({ access_token: "kv-access", refresh_token: "kv-refresh" }));
 		let visitor: Captured | undefined;
 		mockVisitors((c) => (visitor = c));
-		mockSlack("chat.postMessage");
+		mockSlack("chat.postMessage"); // DM
+		mockSlack("chat.postMessage"); // channel log
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -255,11 +299,12 @@ describe("view_submission → register + DM", () => {
 	it("refreshes on 401, persists the rotated pair to KV, retries, and DMs success", async () => {
 		let refresh: Captured | undefined;
 		let retried: Captured | undefined;
-		let dm: any;
+		const posts: any[] = [];
 		mockVisitors(undefined, 401); // first attempt: access token expired
 		mockRefresh((c) => (refresh = c)); // → new-access / new-refresh
 		mockVisitors((c) => (retried = c), 200); // retry with the fresh token
-		mockSlack("chat.postMessage", (b) => (dm = b));
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -276,10 +321,10 @@ describe("view_submission → register + DM", () => {
 			refresh_token: "new-refresh",
 		});
 
-		expect(dm.text).toContain("✅ Registered Jane Doe");
+		expect(posts[0].text).toBe(SUCCESS_TEXT);
 	});
 
-	it("DMs a re-seed message when the refresh itself fails", async () => {
+	it("DMs a friendly failure (no jargon) when the refresh itself fails; nothing to the channel", async () => {
 		let dm: any;
 		mockVisitors(undefined, 401);
 		mockRefresh(undefined, 400); // refresh rejected
@@ -287,20 +332,28 @@ describe("view_submission → register + DM", () => {
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(dm.text).toContain("re-seed");
+		expect(dm.channel).toBe("U1");
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("couldn't connect to the visitor system");
+		expect(dm.text).toContain("*Name:* Jane Doe"); // summary included on failure too
+		// The operational hint stays out of the member-facing message.
+		expect(dm.text).not.toContain("re-seed");
+		expect(dm.text).not.toContain("token");
 		// KV untouched because the refresh failed.
 		expect(await env.TOKENS.get(TOKEN_KEY)).toBeNull();
 	});
 
-	it("DMs the Nexudus rejection detail on a 400", async () => {
+	it("DMs the Nexudus rejection detail on a 400; nothing to the channel", async () => {
 		let dm: any;
 		mockVisitors(undefined, 400, "Invalid Email Address");
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(dm.text).toContain("❌ Nexudus rejected the registration:");
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("Nexudus rejected the registration:");
 		expect(dm.text).toContain("Invalid Email Address");
+		expect(dm.text).toContain("*Submitted by:* Vinay Hiremath");
 	});
 
 	it("DMs a required-fields error and never calls Nexudus when arrival is missing", async () => {
@@ -314,12 +367,224 @@ describe("view_submission → register + DM", () => {
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
+		expect(dm.text).toContain("❌ *Registration failed*");
 		expect(dm.text).toContain("required");
 	});
 
 	it("acks and ignores a submission with a foreign callback_id (no outbound calls)", async () => {
 		const res = await run(
 			await slackRequest("/slack/interactivity", submissionBody(undefined, { callback_id: "something_else" })),
+		);
+		expect(res.status).toBe(200);
+	});
+});
+
+describe("DM → button → modal", () => {
+	function eventBody(event: Record<string, unknown>): string {
+		return JSON.stringify({ type: "event_callback", event });
+	}
+
+	it("echoes the url_verification challenge", async () => {
+		const body = JSON.stringify({ type: "url_verification", challenge: "chal-123" });
+		const res = await run(await slackRequest("/slack/events", body));
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("chal-123");
+	});
+
+	it("replies to a member DM with the register button", async () => {
+		let msg: any;
+		mockSlack("chat.postMessage", (b) => (msg = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/events",
+				eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", text: "hi" }),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(msg.channel).toBe("D42");
+		const actions = msg.blocks.find((b: any) => b.type === "actions");
+		expect(actions.elements[0].action_id).toBe("open_visitor_form");
+	});
+
+	it("ignores the bot's own DM messages (no outbound calls)", async () => {
+		const res = await run(
+			await slackRequest(
+				"/slack/events",
+				eventBody({ type: "message", channel_type: "im", channel: "D42", bot_id: "B1", text: "…" }),
+			),
+		);
+		expect(res.status).toBe(200); // afterEach asserts no chat.postMessage happened
+	});
+
+	it("ignores message edits (subtype) in the DM (no outbound calls)", async () => {
+		const res = await run(
+			await slackRequest(
+				"/slack/events",
+				eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", subtype: "message_changed" }),
+			),
+		);
+		expect(res.status).toBe(200);
+	});
+
+	it("opens the modal when the button is clicked (block_actions)", async () => {
+		let viewsOpen: any;
+		mockSlack("views.open", (b) => (viewsOpen = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", blockActionsBody()));
+		expect(res.status).toBe(200);
+		expect(viewsOpen.trigger_id).toBe("trig-xyz");
+		expect(viewsOpen.view.callback_id).toBe("visitor_registration");
+	});
+
+	it("acks and ignores block_actions for an unknown action_id (no outbound calls)", async () => {
+		const res = await run(await slackRequest("/slack/interactivity", blockActionsBody("some_other_action")));
+		expect(res.status).toBe(200);
+	});
+});
+
+describe("delete button → remove visitor", () => {
+	const RESPOND_BASE = "https://hooks.slack.test";
+	const REF = JSON.stringify({ e: "jane.doe@gmail.com", a: ARRIVAL_UTC });
+
+	function mockList(records: unknown[], envelope: (r: unknown[]) => unknown = (r) => ({ Records: r })) {
+		fetchMock
+			.get(NEXUDUS_BASE)
+			.intercept({ path: "/api/public/visitors/my", method: "GET", query: { showUpcoming: "true" } })
+			.reply(200, JSON.stringify(envelope(records)));
+	}
+
+	function mockDelete(id: number, status = 200) {
+		fetchMock
+			.get(NEXUDUS_BASE)
+			.intercept({ path: `/api/public/visitors/${id}`, method: "DELETE" })
+			.reply(status, "");
+	}
+
+	function mockRespond(capture: (body: any) => void) {
+		fetchMock
+			.get(RESPOND_BASE)
+			.intercept({ path: "/respond", method: "POST" })
+			.reply((opts) => {
+				capture(JSON.parse(opts.body as string));
+				return { statusCode: 200, data: "ok" };
+			});
+	}
+
+	async function clickDelete(): Promise<Response> {
+		return run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: REF,
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageText: SUCCESS_TEXT,
+				}),
+			),
+		);
+	}
+
+	it("deletes the newest exact email+arrival match and confirms with the DELETED RECORD's details", async () => {
+		// Id 9 matches by ISO ExpectedArrival, Id 12 via UtcExpectedArrival in the
+		// legacy /Date(ms)/ form (its space-local ExpectedArrival doesn't match);
+		// Id 20 is newer but a different visit, so the exact pool {9, 12} wins.
+		mockList([
+			{ Id: 7, Email: "other@example.net", ExpectedArrival: ARRIVAL_UTC },
+			{ Id: 9, Email: "jane.doe@gmail.com", FullName: "Jane Doe", ExpectedArrival: ARRIVAL_UTC },
+			{
+				Id: 12,
+				Email: "Jane.Doe@gmail.com",
+				FullName: "Jane Doe",
+				ExpectedArrival: "2026-07-20T15:30:00",
+				UtcExpectedArrival: `/Date(${ARRIVAL_EPOCH * 1000})/`,
+				CustomerNotes: "Submitted via Slack by Vinay Hiremath",
+			},
+			{ Id: 20, Email: "jane.doe@gmail.com", FullName: "Jane Doe", ExpectedArrival: "2026-08-01T09:00:00" },
+		]);
+		mockDelete(12);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe("");
+		expect(respond.replace_original).toBe(true);
+		// The confirmation is built from record 12 itself — including its Id — not
+		// from the clicked message's text.
+		expect(respond.text).toBe(
+			[
+				"🗑️ *Registration deleted*",
+				"*Name:* Jane Doe",
+				"*Email:* Jane.Doe@gmail.com",
+				`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
+				"*Notes:* Submitted via Slack by Vinay Hiremath",
+				"*Nexudus Id:* 12",
+			].join("\n"),
+		);
+	});
+
+	it("refuses to delete when the email matches but no arrival does (no DELETE call)", async () => {
+		mockList([
+			{ Id: 3, Email: "jane.doe@gmail.com", ExpectedArrival: "2026-01-01T00:00:00" },
+			{ Id: 5, Email: "jane.doe@gmail.com", ExpectedArrival: "not-a-date" },
+		]);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("nothing was deleted");
+		expect(respond.text).toContain("Nexudus portal");
+	});
+
+	it("handles a bare-array list body (no Records envelope)", async () => {
+		mockList([{ Id: 9, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }], (r) => r);
+		mockDelete(9);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(respond.text).toContain("🗑️ *Registration deleted*");
+		expect(respond.text).toContain("*Nexudus Id:* 9");
+	});
+
+	it("reports already-deleted (ephemeral) when no record matches; no DELETE call", async () => {
+		mockList([{ Id: 7, Email: "other@example.net", ExpectedArrival: ARRIVAL_UTC }]);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("may already be deleted");
+	});
+
+	it("reports a delete failure (ephemeral) when the DELETE call errors", async () => {
+		mockList([{ Id: 9, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockDelete(9, 500);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("remove the visitor in the Nexudus portal");
+	});
+
+	it("ignores a delete click with a malformed value (no outbound calls)", async () => {
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: "not-json",
+					responseUrl: `${RESPOND_BASE}/respond`,
+				}),
+			),
 		);
 		expect(res.status).toBe(200);
 	});

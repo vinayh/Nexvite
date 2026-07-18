@@ -21,12 +21,16 @@ while IFS='=' read -r key value; do
 	esac
 done
 
-if [ -z "$USERNAME" ] || [ -z "$ACCESS" ] || [ -z "$REFRESH" ]; then
-	echo "Expected NEXUDUS_USERNAME / NEXUDUS_ACCESS_TOKEN / NEXUDUS_REFRESH_TOKEN on stdin." >&2
+if [ -z "$ACCESS" ] || [ -z "$REFRESH" ]; then
+	echo "Expected NEXUDUS_ACCESS_TOKEN and NEXUDUS_REFRESH_TOKEN on stdin." >&2
 	exit 1
 fi
 
-printf '%s' "$USERNAME" | npx wrangler secret put NEXUDUS_USERNAME
+# NEXUDUS_USERNAME (the stable account email) is set once, separately
+# (`wrangler secret put NEXUDUS_USERNAME`), but honor a piped line if present.
+if [ -n "$USERNAME" ]; then
+	printf '%s' "$USERNAME" | npx wrangler secret put NEXUDUS_USERNAME
+fi
 printf '%s' "$ACCESS" | npx wrangler secret put NEXUDUS_ACCESS_TOKEN
 printf '%s' "$REFRESH" | npx wrangler secret put NEXUDUS_REFRESH_TOKEN
 
