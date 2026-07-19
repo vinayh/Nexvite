@@ -148,14 +148,10 @@ wrangler secret put SLACK_BOT_TOKEN
 
 ## Slack app setup
 
-Done once in the [Slack app dashboard](https://api.slack.com/apps). The Worker must be deployed first so you have its public URL.
+The app config is [`slack-manifest.yaml`](slack-manifest.yaml) — the scopes, the `/visitor` command, the three request URLs, and the Home/Messages-tab setup (Messages tab read-only, so DMs *to* the bot are impossible). Deploy the Worker first — Slack verifies the events URL via the `url_verification` handshake. Then:
 
-1. **Create app** → "From scratch", pick the workspace.
-2. **OAuth & Permissions → Bot Token Scopes:** add `commands`, `chat:write`, and `users:read` (the submitter's full name; without it messages fall back to the username). Add `im:write` if the result DMs don't deliver.
-3. **Slash Commands → Create:** command `/visitor`, Request URL `https://<worker>/slack/command`.
-4. **Interactivity & Shortcuts → On:** Request URL `https://<worker>/slack/interactivity`.
-5. **Event Subscriptions → On:** Request URL `https://<worker>/slack/events` (the Worker answers the `url_verification` challenge on save); under **Subscribe to bot events** add `app_home_opened`.
-6. **App Home:** enable the **Home Tab** (the button entry point, visible to every workspace user) and keep the **Messages Tab** enabled — the bot's ✅/❌ result DMs land there. Leave "Allow users to send Slash commands and messages from the messages tab" **unchecked**, so DMs *to* the bot are impossible.
-7. **Install to Workspace** (reinstall after any scope/event change). Copy the **Bot User OAuth Token** (`xoxb-…`) → `SLACK_BOT_TOKEN`; from **Basic Information**, copy the **Signing Secret** → `SLACK_SIGNING_SECRET`.
-8. Set both as Worker secrets (`wrangler secret put …`).
-9. **Invite the bot to `VISITOR_CHANNEL`** (`/invite @<bot name>` in the channel) — without this, channel logging fails with `not_in_channel`.
+1. [Create the app from the manifest](https://api.slack.com/apps?new_app=1) in the workspace — or paste it into an existing app's **App Manifest** page. Reinstall after any scope or event change.
+2. **Install to Workspace**, then set the two secrets: the **Bot User OAuth Token** (`xoxb-…`, OAuth & Permissions) → `wrangler secret put SLACK_BOT_TOKEN`, and the **Signing Secret** (Basic Information) → `wrangler secret put SLACK_SIGNING_SECRET`.
+3. **Invite the bot to `VISITOR_CHANNEL`** (`/invite @<bot name>` in the channel) — without this, channel logging fails with `not_in_channel`.
+
+Add `im:write` to the scopes if the result DMs ever fail to deliver. Keep `token_rotation_enabled: false` — the Worker assumes a static bot token.

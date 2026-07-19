@@ -1,0 +1,38 @@
+# Slack app manifest — create the app from this (or paste into an existing
+# app's "App Manifest" page), then follow README.md, "Slack app setup".
+display_information:
+  name: LISA Visitor Registration
+  description: Register a visitor at LISA through the Nexudus platform
+  background_color: "#170717"
+features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: true
+  bot_user:
+    display_name: LISA Visitor Registration
+    always_online: true
+  slash_commands:
+    - command: /visitor
+      url: https://nexvite.vinayh.workers.dev/slack/command
+      description: Register a visitor at LISA
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+      - users:read
+  pkce_enabled: false
+settings:
+  event_subscriptions:
+    request_url: https://nexvite.vinayh.workers.dev/slack/events
+    bot_events:
+      - app_home_opened
+  interactivity:
+    is_enabled: true
+    request_url: https://nexvite.vinayh.workers.dev/slack/interactivity
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
+  is_mcp_enabled: false
