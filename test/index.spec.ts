@@ -68,15 +68,18 @@ async function sign(rawBody: string, timestamp: string): Promise<string> {
 	return `v0=${hex(mac)}`;
 }
 
+let nextIp = 1; // unique per request so tests don't trip the per-IP rate limiter
+
 async function slackRequest(
 	path: string,
 	rawBody: string,
-	opts: { timestamp?: number; signature?: string; omitSignature?: boolean } = {},
+	opts: { timestamp?: number; signature?: string; omitSignature?: boolean; ip?: string } = {},
 ): Promise<Request<unknown, IncomingRequestCfProperties>> {
 	const ts = String(opts.timestamp ?? Math.floor(Date.now() / 1000));
 	const headers: Record<string, string> = {
 		"Content-Type": "application/x-www-form-urlencoded",
 		"X-Slack-Request-Timestamp": ts,
+		"CF-Connecting-IP": opts.ip ?? `10.0.${(nextIp >> 8) & 255}.${nextIp++ & 255}`,
 	};
 	if (!opts.omitSignature) {
 		headers["X-Slack-Signature"] = opts.signature ?? (await sign(rawBody, ts));
@@ -114,7 +117,7 @@ function submissionBody(
 	};
 	const payload = {
 		type: over.type ?? "view_submission",
-		user: { id: "U1", name: "Vinay Hiremath" },
+		user: { id: "U1", name: "vinay" }, // `name` is the *username*; the full name comes from users.info
 		view: {
 			callback_id: over.callback_id ?? "visitor_registration",
 			state: { values: values ?? defaults },
@@ -126,7 +129,7 @@ function submissionBody(
 function blockActionsBody(
 	actionId = "open_visitor_form",
 	triggerId = "trig-xyz",
-	extra: { value?: string; responseUrl?: string; messageText?: string } = {},
+	extra: { value?: string; responseUrl?: string } = {},
 ): string {
 	const payload = {
 		type: "block_actions",
@@ -134,7 +137,6 @@ function blockActionsBody(
 		trigger_id: triggerId,
 		actions: [{ action_id: actionId, ...(extra.value ? { value: extra.value } : {}) }],
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
-		...(extra.messageText ? { message: { text: extra.messageText } } : {}),
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
 }
@@ -148,6 +150,14 @@ function headerGet(headers: unknown, name: string): string | undefined {
 	const lower = name.toLowerCase();
 	for (const k of Object.keys(h)) if (k.toLowerCase() === lower) return h[k];
 	return undefined;
+}
+
+// users.info lookup for the submitter's full name (GET, unlike the POST methods).
+function mockUserInfo(reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } }) {
+	fetchMock
+		.get(SLACK_BASE)
+		.intercept({ path: "/api/users.info", method: "GET", query: { user: "U1" } })
+		.reply(200, JSON.stringify(reply));
 }
 
 function mockSlack(method: string, capture?: (body: any) => void, reply: object = { ok: true }) {
@@ -201,6 +211,23 @@ describe("routing", () => {
 	});
 });
 
+describe("rate limiting", () => {
+	it("throttles a single IP with 429 once the per-minute limit is exceeded", async () => {
+		// Limit is 20/min (wrangler.jsonc ratelimits). Unsigned requests suffice —
+		// the limiter runs before signature verification, so the first 20 get 401
+		// and the 21st is cut off with 429 (no outbound calls either way).
+		const statuses: number[] = [];
+		for (let i = 0; i < 21; i++) {
+			const res = await run(
+				await slackRequest("/slack/command", COMMAND_BODY, { omitSignature: true, ip: "203.0.113.9" }),
+			);
+			statuses.push(res.status);
+		}
+		expect(statuses[0]).toBe(401);
+		expect(statuses[20]).toBe(429);
+	});
+});
+
 describe("signature verification", () => {
 	it("rejects a request with no signature header (401)", async () => {
 		const res = await run(await slackRequest("/slack/command", COMMAND_BODY, { omitSignature: true }));
@@ -244,6 +271,7 @@ describe("view_submission → register + DM", () => {
 	it("registers with the seed access token, DMs success, and logs to the channel (KV empty)", async () => {
 		let visitor: Captured | undefined;
 		const posts: any[] = [];
+		mockUserInfo();
 		mockVisitors((c) => (visitor = c), 200, JSON.stringify([{ Id: 1 }]));
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM to the submitter
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
@@ -258,7 +286,7 @@ describe("view_submission → register + DM", () => {
 
 		const body = JSON.parse(visitor!.body!);
 		expect(body).toHaveLength(1);
-		expect(body[0].BusinessId).toBe(1000000000);
+		expect(body[0].BusinessId).toBe(Number(env.NEXUDUS_BUSINESS_ID));
 		expect(body[0].FullName).toBe("Jane Doe");
 		expect(body[0].Email).toBe("jane.doe@gmail.com");
 		expect(body[0].PhoneNumber).toBe("+44 7700 900123");
@@ -271,7 +299,7 @@ describe("view_submission → register + DM", () => {
 		expect(posts).toHaveLength(2);
 		expect(posts[0].channel).toBe("U1");
 		expect(posts[0].text).toBe(SUCCESS_TEXT);
-		expect(posts[1].channel).toBe("#visitor-requests");
+		expect(posts[1].channel).toBe(env.VISITOR_CHANNEL);
 		expect(posts[1].text).toBe(SUCCESS_TEXT);
 
 		// Both carry the summary + a Delete button holding the lookup reference
@@ -287,6 +315,7 @@ describe("view_submission → register + DM", () => {
 	it("uses the KV token pair when present, not the seed", async () => {
 		await env.TOKENS.put(TOKEN_KEY, JSON.stringify({ access_token: "kv-access", refresh_token: "kv-refresh" }));
 		let visitor: Captured | undefined;
+		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
 		mockSlack("chat.postMessage"); // DM
 		mockSlack("chat.postMessage"); // channel log
@@ -300,6 +329,7 @@ describe("view_submission → register + DM", () => {
 		let refresh: Captured | undefined;
 		let retried: Captured | undefined;
 		const posts: any[] = [];
+		mockUserInfo();
 		mockVisitors(undefined, 401); // first attempt: access token expired
 		mockRefresh((c) => (refresh = c)); // → new-access / new-refresh
 		mockVisitors((c) => (retried = c), 200); // retry with the fresh token
@@ -326,6 +356,7 @@ describe("view_submission → register + DM", () => {
 
 	it("DMs a friendly failure (no jargon) when the refresh itself fails; nothing to the channel", async () => {
 		let dm: any;
+		mockUserInfo();
 		mockVisitors(undefined, 401);
 		mockRefresh(undefined, 400); // refresh rejected
 		mockSlack("chat.postMessage", (b) => (dm = b));
@@ -345,6 +376,7 @@ describe("view_submission → register + DM", () => {
 
 	it("DMs the Nexudus rejection detail on a 400; nothing to the channel", async () => {
 		let dm: any;
+		mockUserInfo();
 		mockVisitors(undefined, 400, "Invalid Email Address");
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
@@ -358,6 +390,7 @@ describe("view_submission → register + DM", () => {
 
 	it("DMs a required-fields error and never calls Nexudus when arrival is missing", async () => {
 		let dm: any;
+		mockUserInfo();
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const values = {
@@ -371,6 +404,45 @@ describe("view_submission → register + DM", () => {
 		expect(dm.text).toContain("required");
 	});
 
+	it("escapes mrkdwn control characters in member-provided fields (Slack only, not Nexudus)", async () => {
+		let visitor: Captured | undefined;
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const values = {
+			full_name: { value: { type: "plain_text_input", value: "Jane <!channel> & Co" } },
+			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+			arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+
+		// The Slack messages carry the escaped form — no mention injection…
+		for (const post of posts) {
+			expect(post.text).toContain("*Name:* Jane &lt;!channel&gt; &amp; Co");
+			expect(post.text).not.toContain("<!channel>");
+		}
+		// …while Nexudus receives the text as typed.
+		expect(JSON.parse(visitor!.body!)[0].FullName).toBe("Jane <!channel> & Co");
+	});
+
+	it("falls back to the username when the full-name lookup fails", async () => {
+		let visitor: Captured | undefined;
+		const posts: any[] = [];
+		mockUserInfo({ ok: false, error: "missing_scope" });
+		mockVisitors((c) => (visitor = c));
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Submitted by:* vinay");
+		expect(JSON.parse(visitor!.body!)[0].CustomerNotes).toContain("Submitted via Slack by vinay");
+	});
+
 	it("acks and ignores a submission with a foreign callback_id (no outbound calls)", async () => {
 		const res = await run(
 			await slackRequest("/slack/interactivity", submissionBody(undefined, { callback_id: "something_else" })),
@@ -379,7 +451,7 @@ describe("view_submission → register + DM", () => {
 	});
 });
 
-describe("DM → button → modal", () => {
+describe("App Home → button → modal", () => {
 	function eventBody(event: Record<string, unknown>): string {
 		return JSON.stringify({ type: "event_callback", event });
 	}
@@ -391,37 +463,32 @@ describe("DM → button → modal", () => {
 		expect(await res.text()).toBe("chal-123");
 	});
 
-	it("replies to a member DM with the register button", async () => {
-		let msg: any;
-		mockSlack("chat.postMessage", (b) => (msg = b));
+	it("publishes the Home tab with the register button on app_home_opened", async () => {
+		let publish: any;
+		mockSlack("views.publish", (b) => (publish = b));
 
+		const res = await run(
+			await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "home" })),
+		);
+		expect(res.status).toBe(200);
+		expect(publish.user_id).toBe("U1");
+		expect(publish.view.type).toBe("home");
+		const actions = publish.view.blocks.find((b: any) => b.type === "actions");
+		expect(actions.elements[0].action_id).toBe("open_visitor_form");
+	});
+
+	it("ignores app_home_opened for the Messages tab (no outbound calls)", async () => {
+		const res = await run(
+			await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "messages" })),
+		);
+		expect(res.status).toBe(200); // afterEach asserts no views.publish happened
+	});
+
+	it("ignores a DM to the bot — the DM entry point is disabled (no outbound calls)", async () => {
 		const res = await run(
 			await slackRequest(
 				"/slack/events",
 				eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", text: "hi" }),
-			),
-		);
-		expect(res.status).toBe(200);
-		expect(msg.channel).toBe("D42");
-		const actions = msg.blocks.find((b: any) => b.type === "actions");
-		expect(actions.elements[0].action_id).toBe("open_visitor_form");
-	});
-
-	it("ignores the bot's own DM messages (no outbound calls)", async () => {
-		const res = await run(
-			await slackRequest(
-				"/slack/events",
-				eventBody({ type: "message", channel_type: "im", channel: "D42", bot_id: "B1", text: "…" }),
-			),
-		);
-		expect(res.status).toBe(200); // afterEach asserts no chat.postMessage happened
-	});
-
-	it("ignores message edits (subtype) in the DM (no outbound calls)", async () => {
-		const res = await run(
-			await slackRequest(
-				"/slack/events",
-				eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", subtype: "message_changed" }),
 			),
 		);
 		expect(res.status).toBe(200);
@@ -478,7 +545,6 @@ describe("delete button → remove visitor", () => {
 				blockActionsBody("delete_visitor", "trig-del", {
 					value: REF,
 					responseUrl: `${RESPOND_BASE}/respond`,
-					messageText: SUCCESS_TEXT,
 				}),
 			),
 		);
@@ -509,16 +575,17 @@ describe("delete button → remove visitor", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("");
 		expect(respond.replace_original).toBe(true);
-		// The confirmation is built from record 12 itself — including its Id — not
-		// from the clicked message's text.
+		// The confirmation is built from record 12 itself — including its ID — not
+		// from the clicked message's text. The "Submitted via Slack by" note line
+		// is parsed back into a Submitted-by line, with the Nexudus ID below it.
 		expect(respond.text).toBe(
 			[
 				"🗑️ *Registration deleted*",
 				"*Name:* Jane Doe",
 				"*Email:* Jane.Doe@gmail.com",
 				`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
-				"*Notes:* Submitted via Slack by Vinay Hiremath",
-				"*Nexudus Id:* 12",
+				"*Submitted by:* Vinay Hiremath",
+				"*Nexudus ID:* 12",
 			].join("\n"),
 		);
 	});
@@ -548,7 +615,7 @@ describe("delete button → remove visitor", () => {
 		const res = await clickDelete();
 		expect(res.status).toBe(200);
 		expect(respond.text).toContain("🗑️ *Registration deleted*");
-		expect(respond.text).toContain("*Nexudus Id:* 9");
+		expect(respond.text).toContain("*Nexudus ID:* 9");
 	});
 
 	it("reports already-deleted (ephemeral) when no record matches; no DELETE call", async () => {

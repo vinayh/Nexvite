@@ -12,6 +12,6 @@ NEXUDUS_REFRESH_TOKEN="change-me"
 
 # Slack app credentials (Basic Information → Signing Secret; OAuth & Permissions
 # → Bot User OAuth Token). Used to verify inbound requests and to open the modal
-# / DM the result. See SPEC.md §12 for the app-setup steps.
+# / DM the result. See README.md (Slack app setup) for the app-setup steps.
 SLACK_SIGNING_SECRET="change-me"
 SLACK_BOT_TOKEN="xoxb-change-me"

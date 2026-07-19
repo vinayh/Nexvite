@@ -5,6 +5,9 @@
  * instead of Slack POSTing a form to us, this Worker *is* the Slack app:
  *
  *   /visitor slash command  → POST /slack/command      → open a modal (views.open)
+ *   App Home opened          → POST /slack/events       → publish the Home tab; its
+ *                              "Register a visitor" button (block_actions, which
+ *                              carries a trigger_id) opens the same modal
  *   member submits the modal → POST /slack/interactivity → verify signature, ack,
  *                              then (in the background) register the visitor in
  *                              Nexudus and DM the member ✅/❌.
@@ -18,7 +21,7 @@
  */
 
 const CALLBACK_ID = "visitor_registration";
-const OPEN_ACTION = "open_visitor_form"; // button that DMs the bot posts to open the modal
+const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
 const DELETE_ACTION = "delete_visitor"; // button on the ✅ confirmation messages
 
 // Modal block/action ids → how we read each value back out of view.state.values.
@@ -78,17 +81,23 @@ async function verifySlackSignature(
 // Slack Web API
 // ---------------------------------------------------------------------------
 
+// Never throws — a Slack network failure must not 500 the endpoint or kill the
+// background notify chain (a failed DM should still let the channel log post).
 async function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: boolean; error?: string }> {
-	const res = await fetch(`${SLACK_API}/${method}`, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
-			"Content-Type": "application/json; charset=utf-8",
-		},
-		body: JSON.stringify(body),
-	});
-	const json = (await res.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
-	return { ok: Boolean(json?.ok), error: json?.error };
+	try {
+		const res = await fetch(`${SLACK_API}/${method}`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
+				"Content-Type": "application/json; charset=utf-8",
+			},
+			body: JSON.stringify(body),
+		});
+		const json = (await res.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
+		return { ok: Boolean(json?.ok), error: json?.error };
+	} catch {
+		return { ok: false, error: "network_error" };
+	}
 }
 
 // Post a message. `channel` may be a user id (chat.postMessage opens the IM)
@@ -97,6 +106,36 @@ async function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: 
 async function postMessage(env: Env, channel: string, text: string, blocks?: unknown[]): Promise<void> {
 	const { ok, error } = await slackApi(env, "chat.postMessage", { channel, text, ...(blocks && { blocks }) });
 	if (!ok) console.log(`chat.postMessage failed: ${error ?? "unknown"}`); // error code only, no PII
+}
+
+// The interactivity payload only carries the submitter's *username* — the
+// profile's full name needs a users.info lookup (scope: users:read). Returns
+// null on any failure so the caller can keep the username as a fallback.
+async function fetchFullName(env: Env, userId: string): Promise<string | null> {
+	try {
+		const res = await fetch(`${SLACK_API}/users.info?user=${encodeURIComponent(userId)}`, {
+			headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+		});
+		const json = (await res.json().catch(() => null)) as {
+			ok?: boolean;
+			error?: string;
+			user?: { real_name?: string; profile?: { real_name?: string } };
+		} | null;
+		if (!json?.ok) {
+			console.log(`users.info failed: ${json?.error ?? "unknown"}`); // error code only, no PII
+			return null;
+		}
+		return json.user?.profile?.real_name || json.user?.real_name || null;
+	} catch {
+		return null;
+	}
+}
+
+// Member-provided text goes into mrkdwn messages (DM + channel log); escape
+// Slack's control characters so a visitor name/note can't smuggle in a
+// mention like <!channel>. https://docs.slack.dev/messaging/formatting-message-text
+function mrkdwnEscape(text: string): string {
+	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 // ---------------------------------------------------------------------------
@@ -159,27 +198,40 @@ function openModal(env: Env, triggerId: string) {
 	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal() });
 }
 
-// The message a DM to the bot gets back: a button that opens the modal. A plain
-// message event carries no trigger_id, so a button (which does) is the only way
-// to open a modal in response to a DM.
-function formPromptBlocks() {
-	return [
-		{
-			type: "section",
-			text: { type: "mrkdwn", text: "Need to register a visitor? Tap the button to open the form." },
-		},
-		{
-			type: "actions",
-			elements: [
-				{
-					type: "button",
-					text: { type: "plain_text", text: "Register a visitor" },
-					style: "primary",
-					action_id: OPEN_ACTION,
+// The App Home tab: the button entry point, visible to every workspace user
+// who opens the app. The tab itself can't open a modal — but its button click
+// arrives as block_actions with a trigger_id, which is what views.open needs.
+function homeView() {
+	return {
+		type: "home",
+		blocks: [
+			{ type: "header", text: { type: "plain_text", text: "Visitor registration" } },
+			{
+				type: "section",
+				text: {
+					type: "mrkdwn",
+					text: "Expecting a guest? Register them so reception knows they're coming. You can also run `/visitor` from any channel.",
 				},
-			],
-		},
-	];
+			},
+			{
+				type: "actions",
+				elements: [
+					{
+						type: "button",
+						text: { type: "plain_text", text: "Register a visitor" },
+						style: "primary",
+						action_id: OPEN_ACTION,
+					},
+				],
+			},
+		],
+	};
+}
+
+// (Re)publish the Home tab for one user — done on every app_home_opened.
+async function publishHome(env: Env, userId: string): Promise<void> {
+	const { ok, error } = await slackApi(env, "views.publish", { user_id: userId, view: homeView() });
+	if (!ok) console.log(`views.publish failed: ${error ?? "unknown"}`); // error code only, no PII
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +350,13 @@ function toWallClock(epochSeconds: number, timeZone: string): string {
 	return wallClock.replace(" ", "T");
 }
 
+// mrkdwn arrival line, space-local and minute-granular (like the datetimepicker),
+// e.g. "*Arrival:* 2026-07-20 15:30 (Europe/London)".
+function arrivalLine(env: Env, epochSeconds: number): string {
+	const local = toWallClock(epochSeconds, env.SPACE_TIMEZONE).replace("T", " ").slice(0, 16);
+	return `*Arrival:* ${local} (${env.SPACE_TIMEZONE})`;
+}
+
 interface VisitorInput {
 	fullName?: string;
 	email?: string;
@@ -308,28 +367,29 @@ interface VisitorInput {
 	submittedBy: string;
 }
 
+// CustomerNotes line prefixes — written by registerVisitor, parsed back out
+// by deletedSummary so the 🗑️ message can mirror the ✅ summary's lines.
+const NOTE_SUBMITTED = "Submitted via Slack by ";
+const NOTE_VISITING = "Visiting: ";
+
 // mrkdwn summary of what was submitted, shown under both the ✅ and ❌ headers
 // (and in the channel log). Blank optional fields are omitted; arrival is
 // space-local, matching what the portal displays.
 function submissionSummary(env: Env, input: VisitorInput): string {
 	const lines: string[] = [];
-	if (input.fullName) lines.push(`*Name:* ${input.fullName}`);
-	if (input.email) lines.push(`*Email:* ${input.email}`);
-	if (input.phone) lines.push(`*Phone:* ${input.phone}`);
-	if (input.arrivalEpoch != null) {
-		// drop the seconds — the datetimepicker is minute-granular
-		const local = toWallClock(input.arrivalEpoch, env.SPACE_TIMEZONE).replace("T", " ").slice(0, 16);
-		lines.push(`*Arrival:* ${local} (${env.SPACE_TIMEZONE})`);
-	}
-	if (input.host) lines.push(`*Visiting:* ${input.host}`);
-	if (input.notes) lines.push(`*Notes:* ${input.notes}`);
-	lines.push(`*Submitted by:* ${input.submittedBy}`);
+	if (input.fullName) lines.push(`*Name:* ${mrkdwnEscape(input.fullName)}`);
+	if (input.email) lines.push(`*Email:* ${mrkdwnEscape(input.email)}`);
+	if (input.phone) lines.push(`*Phone:* ${mrkdwnEscape(input.phone)}`);
+	if (input.arrivalEpoch != null) lines.push(arrivalLine(env, input.arrivalEpoch));
+	if (input.host) lines.push(`*Visiting:* ${mrkdwnEscape(input.host)}`);
+	if (input.notes) lines.push(`*Notes:* ${mrkdwnEscape(input.notes)}`);
+	lines.push(`*Submitted by:* ${mrkdwnEscape(input.submittedBy)}`);
 	return lines.join("\n");
 }
 
 // What the delete button needs to find the visitor again at click time: the
 // create response has no Id, so the button carries the identifying fields and
-// the click handler looks the Id up in the visitor list (SPEC §11 → item D).
+// the click handler looks the Id up in the visitor list (README, delete flow).
 interface DeleteRef {
 	e: string; // email
 	a: string; // ExpectedArrival exactly as sent to Nexudus (naive UTC)
@@ -387,8 +447,8 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 
 	// All registrations go through one account, so CustomerNotes is reception's
 	// only view of who submitted and who the visitor is for.
-	const noteLines: string[] = [`Submitted via Slack by ${input.submittedBy}`];
-	if (input.host) noteLines.push(`Visiting: ${input.host}`);
+	const noteLines: string[] = [`${NOTE_SUBMITTED}${input.submittedBy}`];
+	if (input.host) noteLines.push(`${NOTE_VISITING}${input.host}`);
 	if (input.notes) noteLines.push(input.notes);
 
 	const visitor = {
@@ -401,13 +461,20 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	};
 	const body = JSON.stringify([visitor]); // body is an array of visitors
 
-	const regRes = await nexudusFetch(env, base, (accessToken) =>
-		fetch(`${base}/api/public/visitors`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-			body,
-		}),
-	);
+	let regRes: Response | null;
+	try {
+		regRes = await nexudusFetch(env, base, (accessToken) =>
+			fetch(`${base}/api/public/visitors`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+				body,
+			}),
+		);
+	} catch (err) {
+		// Network failure — without this the member would get no DM at all.
+		console.log(`nexudus create threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
+		regRes = null;
+	}
 
 	if (!regRes) {
 		// Auth couldn't be renewed — the member can't fix that, so keep it friendly
@@ -418,7 +485,7 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	}
 	if (!regRes.ok) {
 		const detail = (await regRes.text().catch(() => "")).slice(0, 300);
-		return failed(`Nexudus rejected the registration: ${detail || `HTTP ${regRes.status}`}`);
+		return failed(`Nexudus rejected the registration: ${detail ? mrkdwnEscape(detail) : `HTTP ${regRes.status}`}`);
 	}
 
 	const message = `✅ *Visitor registered*\n${summary}`;
@@ -431,7 +498,7 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 //
 // The create response carries no visitor Id, so deletion is a click-time
 // lookup via GET /api/public/visitors/my — the authenticated customer's own
-// registrations, which (single-account model, SPEC §7) is exactly the set this
+// registrations, which (single-account model, see README) is exactly the set this
 // Worker creates. Match on email (and arrival, when recognizable), DELETE the
 // newest match. Docs: learn.nexudus.com/api/endpoints/visitors/list-visitors.
 
@@ -509,27 +576,39 @@ async function findVisitor(
 }
 
 // The 🗑️ confirmation is built from the record Nexudus actually deleted — not
-// from the clicked message — so a mismatch could never pass unnoticed. The
-// Nexudus Id is included as the one unambiguous identifier between duplicates.
+// from the clicked message — so a mismatch could never pass unnoticed. It
+// mirrors the ✅ summary's lines (CustomerNotes parsed back into Visiting /
+// Notes / Submitted by), with the Nexudus ID added as the one unambiguous
+// identifier between duplicates.
 function deletedSummary(env: Env, r: VisitorRecord): string {
 	const lines = ["🗑️ *Registration deleted*"];
-	if (typeof r.FullName === "string" && r.FullName) lines.push(`*Name:* ${r.FullName}`);
-	lines.push(`*Email:* ${r.Email}`);
-	if (typeof r.PhoneNumber === "string" && r.PhoneNumber) lines.push(`*Phone:* ${r.PhoneNumber}`);
+	if (typeof r.FullName === "string" && r.FullName) lines.push(`*Name:* ${mrkdwnEscape(r.FullName)}`);
+	lines.push(`*Email:* ${mrkdwnEscape(r.Email)}`);
+	if (typeof r.PhoneNumber === "string" && r.PhoneNumber) lines.push(`*Phone:* ${mrkdwnEscape(r.PhoneNumber)}`);
 	const ms = parseNexudusInstant(r.UtcExpectedArrival) ?? parseNexudusInstant(r.ExpectedArrival);
-	if (ms != null) {
-		const local = toWallClock(ms / 1000, env.SPACE_TIMEZONE).replace("T", " ").slice(0, 16);
-		lines.push(`*Arrival:* ${local} (${env.SPACE_TIMEZONE})`);
-	}
-	if (typeof r.CustomerNotes === "string" && r.CustomerNotes) lines.push(`*Notes:* ${r.CustomerNotes}`);
-	lines.push(`*Nexudus Id:* ${r.Id}`);
+	if (ms != null) lines.push(arrivalLine(env, ms / 1000));
+	const noteLines = typeof r.CustomerNotes === "string" ? r.CustomerNotes.split("\n") : [];
+	const submittedBy = noteLines.find((l) => l.startsWith(NOTE_SUBMITTED))?.slice(NOTE_SUBMITTED.length);
+	const visiting = noteLines.find((l) => l.startsWith(NOTE_VISITING))?.slice(NOTE_VISITING.length);
+	const rest = noteLines.filter((l) => !l.startsWith(NOTE_SUBMITTED) && !l.startsWith(NOTE_VISITING)).join("\n");
+	if (visiting) lines.push(`*Visiting:* ${mrkdwnEscape(visiting)}`);
+	if (rest) lines.push(`*Notes:* ${mrkdwnEscape(rest)}`);
+	if (submittedBy) lines.push(`*Submitted by:* ${mrkdwnEscape(submittedBy)}`);
+	lines.push(`*Nexudus ID:* ${r.Id}`);
 	return lines.join("\n");
 }
 
 // Delete the visitor the button points at. Returns the member-facing outcome.
+// Never throws — a network failure must still produce feedback for the clicker.
 async function deleteVisitor(env: Env, ref: DeleteRef): Promise<{ ok: boolean; text: string }> {
 	const base = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
-	const found = await findVisitor(env, base, ref);
+	let found: Awaited<ReturnType<typeof findVisitor>>;
+	try {
+		found = await findVisitor(env, base, ref);
+	} catch (err) {
+		console.log(`visitor lookup threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
+		found = null;
+	}
 	if (!found) {
 		return {
 			ok: false,
@@ -545,12 +624,18 @@ async function deleteVisitor(env: Env, ref: DeleteRef): Promise<{ ok: boolean; t
 					: "⚠️ Couldn't find this registration in Nexudus — it may already be deleted, or the visit time has passed. If it still shows in the portal, remove it there.",
 		};
 	}
-	const res = await nexudusFetch(env, base, (accessToken) =>
-		fetch(`${base}/api/public/visitors/${found.match!.Id}`, {
-			method: "DELETE",
-			headers: { Authorization: `Bearer ${accessToken}` },
-		}),
-	);
+	let res: Response | null;
+	try {
+		res = await nexudusFetch(env, base, (accessToken) =>
+			fetch(`${base}/api/public/visitors/${found.match!.Id}`, {
+				method: "DELETE",
+				headers: { Authorization: `Bearer ${accessToken}` },
+			}),
+		);
+	} catch (err) {
+		console.log(`visitor delete threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
+		res = null;
+	}
 	if (!res?.ok) {
 		if (res) console.log(`visitor delete failed: HTTP ${res.status}`); // status only, no PII
 		return { ok: false, text: "⚠️ Deleting failed — please remove the visitor in the Nexudus portal." };
@@ -563,16 +648,20 @@ async function deleteVisitor(env: Env, ref: DeleteRef): Promise<{ ok: boolean; t
 // on success, or an ephemeral note to the clicker on failure.
 async function handleDeleteClick(env: Env, ref: DeleteRef, responseUrl: string): Promise<void> {
 	const { ok, text } = await deleteVisitor(env, ref);
-	const res = await fetch(responseUrl, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(
-			ok
-				? { replace_original: true, text }
-				: { replace_original: false, response_type: "ephemeral", text },
-		),
-	});
-	if (!res.ok) console.log(`response_url post failed: HTTP ${res.status}`);
+	try {
+		const res = await fetch(responseUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(
+				ok
+					? { replace_original: true, text }
+					: { replace_original: false, response_type: "ephemeral", text },
+			),
+		});
+		if (!res.ok) console.log(`response_url post failed: HTTP ${res.status}`);
+	} catch (err) {
+		console.log(`response_url post threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +678,17 @@ export default {
 		}
 		if (request.method !== "POST") {
 			return new Response("Method not allowed", { status: 405 });
+		}
+
+		// Per-IP flood insurance, checked before the HMAC work (wrangler.jsonc
+		// `ratelimits`). Slack retries a 429ed event, so a burst degrades
+		// gracefully. Fail open — losing the limiter must not down the endpoint.
+		try {
+			const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+			const { success } = await env.RATE_LIMITER.limit({ key: ip });
+			if (!success) return new Response("Rate limited", { status: 429 });
+		} catch {
+			// limiter unavailable — let the request through
 		}
 
 		// Read the raw bytes (needed verbatim for the HMAC). Decoding via
@@ -613,8 +713,9 @@ export default {
 		}
 
 		if (path === "/slack/events") {
-			// Events API (application/json). A DM to the bot → reply with a button
-			// that opens the modal. Ack fast; post in the background.
+			// Events API (application/json). The only subscribed event is
+			// app_home_opened → (re)publish the Home tab. DMs to the bot are
+			// deliberately not an entry point. Ack fast; publish in the background.
 			let event: { type?: string; challenge?: string; event?: Record<string, unknown> };
 			try {
 				event = JSON.parse(rawBody);
@@ -625,15 +726,9 @@ export default {
 				return new Response(event.challenge ?? "", { status: 200 });
 			}
 			const e = event.event ?? {};
-			// Only a real user's DM message — ignore the bot's own posts and edits.
-			if (e.type === "message" && e.channel_type === "im" && !e.bot_id && !e.subtype && e.channel) {
-				ctx.waitUntil(
-					slackApi(env, "chat.postMessage", {
-						channel: e.channel,
-						text: "Register a visitor",
-						blocks: formPromptBlocks(),
-					}),
-				);
+			// tab === "home" only — the event also fires for the Messages tab.
+			if (e.type === "app_home_opened" && e.tab === "home" && typeof e.user === "string") {
+				ctx.waitUntil(publishHome(env, e.user));
 			}
 			return new Response("", { status: 200 });
 		}
@@ -697,12 +792,15 @@ export default {
 		// Acking with an empty 200 closes the modal.
 		if (userId) {
 			ctx.waitUntil(
-				registerVisitor(env, input).then(async ({ ok, message, blocks }) => {
+				(async () => {
+					// Upgrade the username to the profile's full name when we can.
+					input.submittedBy = (await fetchFullName(env, userId)) ?? input.submittedBy;
+					const { ok, message, blocks } = await registerVisitor(env, input);
 					await postMessage(env, userId, message, blocks);
 					// Successes also go to the visitors channel — the human-readable
 					// log of registrations. Failures stay in the submitter's DM.
 					if (ok && env.VISITOR_CHANNEL) await postMessage(env, env.VISITOR_CHANNEL, message, blocks);
-				}),
+				})(),
 			);
 		}
 		return new Response("", { status: 200 });
