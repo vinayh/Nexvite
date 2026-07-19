@@ -1,10 +1,7 @@
-# Copy to `.dev.vars` (gitignored) and fill in real values. Production uses
-# `wrangler secret put <NAME>`; non-secret config lives in wrangler.jsonc `vars`.
-
-# Nexudus token seed (NOT the account password) — generate with scripts/nexudus-token.sh.
-NEXUDUS_USERNAME="service-account@example.com"  # account email, used as client_id on refresh
-NEXUDUS_ACCESS_TOKEN="change-me"
-NEXUDUS_REFRESH_TOKEN="change-me"
+# Copy to `.dev.vars` (gitignored) only if you run `wrangler dev` against the
+# real Slack app. Production uses `wrangler secret put <NAME>`; non-secret
+# config lives in wrangler.jsonc `vars`; the Nexudus auth record lives in KV
+# (seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh).
 
 # Slack app credentials — see README.md, "Slack app setup".
 SLACK_SIGNING_SECRET="change-me"

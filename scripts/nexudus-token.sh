@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# Fetch Nexudus API tokens and print them as KEY=value lines.
+# Fetch Nexudus API tokens and print the auth seed as KEY=value lines.
 #
-# Run it, copy the two lines it prints, and hand them over to set the Worker
-# secrets (scripts/nexudus-set-secrets.sh). Prompts for the account username +
-# password (or reads NEXUDUS_USERNAME / NEXUDUS_PASSWORD from the environment);
-# the subdomain defaults to the value in wrangler.jsonc.
+# Pipe the output into scripts/nexudus-seed.sh to write the auth record to KV
+# (or copy the lines and `pbpaste | scripts/nexudus-seed.sh` later). Prompts
+# for the account username + password (or reads NEXUDUS_USERNAME /
+# NEXUDUS_PASSWORD from the environment); the subdomain defaults to the value
+# in wrangler.jsonc.
 #
-# Only the two generated tokens go to stdout. NEXUDUS_USERNAME (the stable
-# account email) is set once, separately: wrangler secret put NEXUDUS_USERNAME
+# Exactly three KEY=value lines go to stdout (nothing else), so the output can
+# be copied verbatim or piped straight into scripts/nexudus-seed.sh.
 #
 # The token request must be application/x-www-form-urlencoded (a JSON body
 # returns unsupported_grant_type).
@@ -32,8 +33,6 @@ RESP="$(curl -sS -X POST "https://$SUBDOMAIN.spaces.nexudus.com/api/token" \
 	--data-urlencode "username=$USERNAME" \
 	--data-urlencode "password=$PASSWORD")"
 
-# Print exactly two KEY=value lines to stdout (nothing else), so the output
-# can be copied verbatim or piped straight into scripts/nexudus-set-secrets.sh.
 printf '%s' "$RESP" | node -e '
 let s = "";
 process.stdin.on("data", (d) => (s += d)).on("end", () => {
@@ -43,7 +42,8 @@ process.stdin.on("data", (d) => (s += d)).on("end", () => {
 		console.error("Token request failed:", j.error || s.slice(0, 200));
 		process.exit(1);
 	}
+	console.log("NEXUDUS_USERNAME=" + process.argv[1]);
 	console.log("NEXUDUS_ACCESS_TOKEN=" + j.access_token);
 	console.log("NEXUDUS_REFRESH_TOKEN=" + j.refresh_token);
 });
-'
+' "$USERNAME"

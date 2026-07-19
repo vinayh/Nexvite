@@ -63,7 +63,7 @@ Member-provided text is escaped for mrkdwn before it reaches any Slack message, 
 
 ### Delete flow
 
-The create response returns **no visitor Id** (verified: `200`, empty body, no id-bearing header), so the ✅ message's Delete button carries `{email, ExpectedArrival-as-sent}` and the Id is looked up at click time via [`GET /api/public/visitors/my?showUpcoming=true`](https://learn.nexudus.com/api/endpoints/visitors/list-visitors) — the authenticated account's own registrations, which under the single-account model is exactly the set this Worker creates. Matching is **strict**: email plus the exact visit instant, with deliberately **no email-only fallback** — deleting a best guess is how the *wrong* duplicate would vanish unnoticed. If nothing matches exactly, nothing is deleted and the clicker is told to contact the Nexudus account email (`NEXUDUS_USERNAME`) — registrations live under the service account, so members can't remove them from their own portal login. Among exact duplicates (double-submit), the newest `Id` wins — any copy is the right one to remove there.
+The create response returns **no visitor Id** (verified: `200`, empty body, no id-bearing header), so the ✅ message's Delete button carries `{email, ExpectedArrival-as-sent}` and the Id is looked up at click time via [`GET /api/public/visitors/my?showUpcoming=true`](https://learn.nexudus.com/api/endpoints/visitors/list-visitors) — the authenticated account's own registrations, which under the single-account model is exactly the set this Worker creates. Matching is **strict**: email plus the exact visit instant, with deliberately **no email-only fallback** — deleting a best guess is how the *wrong* duplicate would vanish unnoticed. If nothing matches exactly, nothing is deleted and the clicker is told to contact the Nexudus account email (from the KV auth record) — registrations live under the service account, so members can't remove them from their own portal login. Among exact duplicates (double-submit), the newest `Id` wins — any copy is the right one to remove there.
 
 On success the clicked message is **replaced** (via the payload's `response_url`) with a `🗑️` summary built from **the record Nexudus actually deleted** — never from the clicked message's text — ending with the Nexudus `Id`, the one unambiguous identifier between duplicates. On failure the clicker gets an **ephemeral** note with the same contact fallback. The other copy of the message (DM vs channel) is not updated — clicking its button later reports "may already be deleted". Accepted at this scale.
 
@@ -79,8 +79,8 @@ Anyone who can see a ✅ message — the submitter in their DM, or any member of
 - The space is single-site, so `NEXUDUS_BUSINESS_ID` is one fixed value (read once from `GET /api/public/businesses/all`).
 - **Email is required for this space** — a visitor with no email is rejected `400 "not valid"`. **And it must be a real domain**: `@example.com` returns `400 "Invalid Email Address"`; normal member emails are accepted. Any 400 is surfaced to the member as a ❌ DM.
 - **Arrival timezone.** Nexudus stores the naive `ExpectedArrival` as **UTC** and *displays* it in the space's local timezone in the portal. The Worker therefore sends the UTC wall-clock (no `Z`/offset) and separately renders the space-local time in messages — so the portal and Slack agree. Do **not** send space-local wall-clock; it only looks right while the space is on GMT.
-- **Token auth, not password.** The Worker never holds the account password — just an access token (valid ~14 days) with the live `{access_token, refresh_token}` pair in KV, seeded from the `NEXUDUS_*` secrets. Refresh uses `grant_type=refresh_token` with the account email as a `client_id` **header**.
-- **Refresh tokens are single-use and rotate on every exchange** — which is why the pair persists in KV rather than a static secret. If KV is cleared or the chain breaks, re-seed with `scripts/nexudus-token.sh` (a fresh `grant_type=password` exchange; requires the account to have no 2FA).
+- **Token auth, not password.** The Worker never holds the account password — the auth record `{username, access_token, refresh_token}` lives in KV (the access token is valid ~14 days; `username` is the account email). Refresh uses `grant_type=refresh_token` with `username` as a `client_id` **header**.
+- **Refresh tokens are single-use and rotate on every exchange** — which is why the auth record lives in KV rather than static config. The `TOKENS` namespace is **shared with the Nexroom Worker**, so both rotate one record and a single seeding covers both. If KV is cleared or the chain breaks, re-seed with `scripts/nexudus-token.sh | scripts/nexudus-seed.sh` (a fresh `grant_type=password` exchange; requires the account to have no 2FA).
 - **`POST /api/public/visitors` returns `200` with an empty body and no id-bearing header.** The visitors *collection* is create-only: `GET` on it, `/all`, and `/upcoming` all return `405`, and the admin `/api/spaces/visitors` API rejects portal bearer tokens. The only read route is `GET /api/public/visitors/my` — hence the delete flow's click-time lookup.
 - Public API rate limit is 10 requests / 5 s. A submission is normally one Nexudus call (up to three when a token refresh intervenes), so a burst of near-simultaneous submissions could 429; that surfaces as a ❌ DM and the member retries.
 
@@ -103,19 +103,16 @@ Two upgrade paths, neither of which changes the rest of the design: move the tok
 | `SPACE_TIMEZONE` | IANA timezone of the space; used to *display* arrival times in messages (`ExpectedArrival` itself is sent as UTC) |
 | `VISITOR_CHANNEL` | Channel id or `#name` that successful registrations are logged to; the bot must be invited to it |
 
-**KV binding** — `TOKENS`: holds the live `{ access_token, refresh_token }` pair, which the Worker rotates on refresh. Create it once with `wrangler kv namespace create TOKENS`.
+**KV binding** — `TOKENS`: holds the auth record `{ username, access_token, refresh_token }`, which the Worker rotates on refresh. Create it once with `wrangler kv namespace create TOKENS` and seed it with `scripts/nexudus-token.sh | scripts/nexudus-seed.sh`. The namespace is shared with the Nexroom Worker.
 
-**Secrets** — `.dev.vars` locally (gitignored; template in [`.dev.vars.example`](.dev.vars.example)), `wrangler secret put <NAME>` in production:
+**Secrets** — production only, set with `wrangler secret put <NAME>`. There is no local secrets file by default — if you ever run `wrangler dev` against the real APIs, create `.dev.vars` from [`.dev.vars.example`](.dev.vars.example) (gitignored):
 
 | Name | Purpose |
 |---|---|
-| `NEXUDUS_USERNAME` | Nexudus account email; sent as the `client_id` header when refreshing (not the password) |
-| `NEXUDUS_ACCESS_TOKEN` | Seed access token; used until the first refresh writes the live pair to KV |
-| `NEXUDUS_REFRESH_TOKEN` | Seed refresh token; exchanged for a new pair when the access token expires |
 | `SLACK_SIGNING_SECRET` | Verifies the HMAC on inbound Slack requests (Basic Information → Signing Secret) |
 | `SLACK_BOT_TOKEN` | `xoxb-…` bot token; opens the modal and DMs the result (OAuth & Permissions) |
 
-The `NEXUDUS_*` token seed is generated by `scripts/nexudus-token.sh` and applied with `scripts/nexudus-set-secrets.sh` (which also clears the KV cache so the new seed takes effect). The TypeScript `Env` type is generated by `npm run cf-typegen` into `worker-configuration.d.ts` — rerun it after any config change.
+The Nexudus auth seed is generated by `scripts/nexudus-token.sh` and written to KV with `scripts/nexudus-seed.sh`. The TypeScript `Env` type is generated by `npm run cf-typegen` into `worker-configuration.d.ts` — rerun it after any config change. The secret keys are typed by hand in [`src/env.d.ts`](src/env.d.ts) (committed), since `wrangler types` cannot see production secrets.
 
 **Rotation:** regenerate the signing secret — or reinstall the app for a new bot token — in the Slack dashboard, then `wrangler secret put` the new value. Rotate the bot token if it leaks (it can post as the app).
 
@@ -127,12 +124,11 @@ npm run check        # typecheck src/ and test/
 npm test             # vitest (one-shot; npm run test:watch to watch)
 ```
 
-Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts): routing, rate limiting and signature rejection; slash command → modal; registration (happy path including the outbound Nexudus body, KV vs seed token, refresh-on-401 rotation, refresh failure, Nexudus rejection, missing fields, mrkdwn escaping); App Home → button → modal; and the delete flow.
+Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts): routing, rate limiting and signature rejection; slash command → modal; registration (happy path including the outbound Nexudus body, the KV auth record, refresh-on-401 rotation, refresh failure, unseeded KV, Nexudus rejection, missing fields, mrkdwn escaping); App Home → button → modal; and the delete flow.
 
 ## Deploying
 
 ```bash
-cp .dev.vars.example .dev.vars    # fill in real values (gitignored)
 npm run cf-typegen && npm run check && npm test
 
 wrangler login
@@ -140,8 +136,7 @@ wrangler kv namespace create TOKENS   # paste the printed id into wrangler.jsonc
 wrangler deploy
 # → note the printed workers.dev URL for the Slack app request URLs below
 
-wrangler secret put NEXUDUS_USERNAME  # the account email (stable — set once)
-scripts/nexudus-token.sh | scripts/nexudus-set-secrets.sh   # the token seed
+scripts/nexudus-token.sh | scripts/nexudus-seed.sh   # seed the Nexudus auth record in KV
 wrangler secret put SLACK_SIGNING_SECRET
 wrangler secret put SLACK_BOT_TOKEN
 ```

@@ -4,19 +4,20 @@ import {
 	waitOnExecutionContext,
 	fetchMock,
 } from "cloudflare:test";
-import { describe, it, expect, beforeAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import worker, { TOKEN_KEY } from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
 
 const testEnv = {
 	...env,
-	NEXUDUS_USERNAME: "svc@example.com",
-	NEXUDUS_ACCESS_TOKEN: "seed-access",
-	NEXUDUS_REFRESH_TOKEN: "seed-refresh",
 	SLACK_SIGNING_SECRET: SIGNING_SECRET,
 	SLACK_BOT_TOKEN: "xoxb-test",
 } satisfies Env;
+
+// The seeded KV auth record the Nexudus-touching tests start from.
+const AUTH = { username: "svc@example.com", access_token: "kv-access", refresh_token: "kv-refresh" };
+const seed = () => env.TOKENS.put(TOKEN_KEY, JSON.stringify(AUTH));
 
 const NEXUDUS_BASE = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 const SLACK_BASE = "https://slack.com";
@@ -283,7 +284,9 @@ describe("slash command → open modal", () => {
 });
 
 describe("view_submission → register + DM", () => {
-	it("registers with the seed access token, DMs success, and logs to the channel (KV empty)", async () => {
+	beforeEach(seed);
+
+	it("registers with the KV access token, DMs success, and logs to the channel", async () => {
 		let visitor: Captured | undefined;
 		const posts: any[] = [];
 		mockUserInfo();
@@ -295,9 +298,9 @@ describe("view_submission → register + DM", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("");
 
-		// Used the seed token; no refresh happened, KV stays empty.
-		expect(visitor?.auth).toBe("Bearer seed-access");
-		expect(await env.TOKENS.get(TOKEN_KEY)).toBeNull();
+		// Used the KV access token; no refresh happened, the record is unchanged.
+		expect(visitor?.auth).toBe("Bearer kv-access");
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(AUTH);
 
 		const body = JSON.parse(visitor!.body!);
 		expect(body).toHaveLength(1);
@@ -327,17 +330,19 @@ describe("view_submission → register + DM", () => {
 		}
 	});
 
-	it("uses the KV token pair when present, not the seed", async () => {
-		await env.TOKENS.put(TOKEN_KEY, JSON.stringify({ access_token: "kv-access", refresh_token: "kv-refresh" }));
-		let visitor: Captured | undefined;
+	it("DMs a friendly failure with a generic contact when KV is unseeded (nothing reaches Nexudus)", async () => {
+		await env.TOKENS.delete(TOKEN_KEY); // undo the describe-level seed
+		let dm: any;
 		mockUserInfo();
-		mockVisitors((c) => (visitor = c));
-		mockSlack("chat.postMessage"); // DM
-		mockSlack("chat.postMessage"); // channel log
+		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(visitor?.auth).toBe("Bearer kv-access");
+		expect(dm.channel).toBe("U1");
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("couldn't connect to the visitor system");
+		expect(dm.text).toContain("contact the space team"); // no account email to name
+		expect(dm.text).not.toContain("token"); // ops hints stay out of the DM
 	});
 
 	it("refreshes on 401, persists the rotated pair to KV, retries, and DMs success", async () => {
@@ -354,14 +359,15 @@ describe("view_submission → register + DM", () => {
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
 
-		// Refresh used the seed refresh token + client_id = the account email.
+		// Refresh used the KV refresh token + client_id = the account email.
 		expect(refresh?.clientId).toBe("svc@example.com");
 		expect(refresh?.body).toContain("grant_type=refresh_token");
-		expect(refresh?.body).toContain("refresh_token=seed-refresh");
+		expect(refresh?.body).toContain("refresh_token=kv-refresh");
 
-		// Retry used the new access token, and KV now holds the rotated pair.
+		// Retry used the new access token; KV keeps the username with the new pair.
 		expect(retried?.auth).toBe("Bearer new-access");
 		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual({
+			username: "svc@example.com",
 			access_token: "new-access",
 			refresh_token: "new-refresh",
 		});
@@ -388,7 +394,7 @@ describe("view_submission → register + DM", () => {
 		expect(dm.text).not.toContain("token");
 		expect(dm.text).not.toContain("admin");
 		// KV untouched because the refresh failed.
-		expect(await env.TOKENS.get(TOKEN_KEY)).toBeNull();
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(AUTH);
 	});
 
 	it("DMs the friendly failure with the contact email when the network call itself fails", async () => {
@@ -422,17 +428,16 @@ describe("view_submission → register + DM", () => {
 		expect(posts[1].channel).toBe(env.VISITOR_CHANNEL);
 	});
 
-	it("falls back to the seed tokens when the KV pair is corrupt", async () => {
+	it("DMs a friendly failure when the KV record is corrupt (nothing reaches Nexudus)", async () => {
 		await env.TOKENS.put(TOKEN_KEY, "not-json");
-		let visitor: Captured | undefined;
+		let dm: any;
 		mockUserInfo();
-		mockVisitors((c) => (visitor = c));
-		mockSlack("chat.postMessage"); // DM
-		mockSlack("chat.postMessage"); // channel log
+		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(visitor?.auth).toBe("Bearer seed-access");
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("contact the space team");
 	});
 
 	it("length-caps member-provided values before they reach Nexudus", async () => {
@@ -591,6 +596,8 @@ describe("App Home → button → modal", () => {
 describe("delete button → remove visitor", () => {
 	const RESPOND_BASE = "https://hooks.slack.test";
 	const REF = JSON.stringify({ e: "jane.doe@gmail.com", a: ARRIVAL_UTC });
+
+	beforeEach(seed);
 
 	function mockList(records: unknown[], envelope: (r: unknown[]) => unknown = (r) => ({ Records: r })) {
 		fetchMock

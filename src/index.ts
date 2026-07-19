@@ -248,52 +248,72 @@ function readDateTime(state: ViewState, block: string, action: string): number |
 }
 
 // ---------------------------------------------------------------------------
-// Nexudus tokens (KV-backed, auto-refreshing)
+// Nexudus auth (KV-backed, auto-refreshing)
 // ---------------------------------------------------------------------------
 //
 // Nexudus refresh tokens are single-use and rotate on every exchange, so the
-// live { access_token, refresh_token } pair lives in KV (env.TOKENS). The
-// NEXUDUS_* secrets are only the initial seed — re-seed with
-// scripts/nexudus-token.sh if the chain breaks.
+// live auth record lives in KV (env.TOKENS) — shared with the Nexroom Worker,
+// which binds the same namespace. There is no other credential source: seed
+// (or re-seed after a broken chain) with
+// scripts/nexudus-token.sh | scripts/nexudus-seed.sh.
 
 export const TOKEN_KEY = "nexudus"; // exported for the tests
 
-interface TokenPair {
+interface NexudusAuth {
+	username: string; // account email — the client_id header on refresh
 	access_token: string;
 	refresh_token: string;
 }
 
-async function readTokens(env: Env): Promise<TokenPair> {
+// Read the live auth record. Returns null when the KV key is missing or
+// malformed (including a legacy pair without `username`) — that means
+// "unseeded", not "fall back to something else".
+async function readAuth(env: Env): Promise<NexudusAuth | null> {
 	const raw = await env.TOKENS.get(TOKEN_KEY);
-	if (raw) {
-		try {
-			const parsed = JSON.parse(raw) as Partial<TokenPair>;
-			if (typeof parsed.access_token === "string" && typeof parsed.refresh_token === "string") {
-				return { access_token: parsed.access_token, refresh_token: parsed.refresh_token };
-			}
-		} catch {
-			// fall through to the seed
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw) as Partial<NexudusAuth>;
+		if (
+			typeof parsed.username === "string" &&
+			typeof parsed.access_token === "string" &&
+			typeof parsed.refresh_token === "string"
+		) {
+			return { username: parsed.username, access_token: parsed.access_token, refresh_token: parsed.refresh_token };
 		}
+	} catch {
+		// malformed — treat as unseeded
 	}
-	return { access_token: env.NEXUDUS_ACCESS_TOKEN, refresh_token: env.NEXUDUS_REFRESH_TOKEN };
+	return null;
+}
+
+// Contact address for member-facing failure messages — the Nexudus account
+// email from the KV auth record (registrations live under the service account,
+// so members can't see them in their own portal login), or a generic fallback
+// when KV itself is the problem.
+async function nexudusContact(env: Env): Promise<string> {
+	try {
+		return (await readAuth(env))?.username ?? "the space team";
+	} catch {
+		return "the space team";
+	}
 }
 
 // Exchange the (single-use) refresh token for a fresh pair. client_id is the
 // account email, sent as a header (Nexudus requirement). Returns null on any
 // failure — the caller surfaces a "re-seed" message.
-async function refreshTokens(env: Env, base: string, refreshToken: string): Promise<TokenPair | null> {
+async function refreshAuth(base: string, auth: NexudusAuth): Promise<NexudusAuth | null> {
 	const res = await fetch(`${base}/api/token`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
-			client_id: env.NEXUDUS_USERNAME,
+			client_id: auth.username,
 		},
-		body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }),
+		body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: auth.refresh_token }),
 	});
 	if (!res.ok) return null;
-	const body = (await res.json().catch(() => null)) as Partial<TokenPair> | null;
+	const body = (await res.json().catch(() => null)) as Partial<NexudusAuth> | null;
 	if (typeof body?.access_token !== "string" || typeof body?.refresh_token !== "string") return null;
-	return { access_token: body.access_token, refresh_token: body.refresh_token };
+	return { username: auth.username, access_token: body.access_token, refresh_token: body.refresh_token };
 }
 
 function nexudusBase(env: Env): string {
@@ -301,7 +321,7 @@ function nexudusBase(env: Env): string {
 }
 
 // Run an authenticated Nexudus request: current token first; on a 401 refresh
-// once (rotating the pair, persisted to KV) and retry. Never throws. Returns
+// once (rotating the record, persisted to KV) and retry. Never throws. Returns
 // null when auth couldn't be established or the network failed — the caller
 // turns that into a friendly member-facing failure, while the operational
 // detail goes to the log (it's not actionable for members).
@@ -311,12 +331,16 @@ async function nexudusFetch(
 ): Promise<Response | null> {
 	const base = nexudusBase(env);
 	try {
-		const tokens = await readTokens(env);
-		let res = await doFetch(base, tokens.access_token);
+		const auth = await readAuth(env);
+		if (!auth) {
+			console.error("nexudus auth missing from KV — seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
+			return null;
+		}
+		let res = await doFetch(base, auth.access_token);
 		if (res.status === 401) {
-			const refreshed = await refreshTokens(env, base, tokens.refresh_token);
+			const refreshed = await refreshAuth(base, auth);
 			if (!refreshed) {
-				console.error("nexudus token refresh failed — re-seed with scripts/nexudus-token.sh");
+				console.error("nexudus token refresh failed — re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
 				return null;
 			}
 			await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
@@ -466,7 +490,7 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	);
 	if (!regRes) {
 		return failed(
-			`We couldn't connect to the visitor system, so this visitor was not registered. Please try again later — if it keeps failing, contact ${env.NEXUDUS_USERNAME}.`,
+			`We couldn't connect to the visitor system, so this visitor was not registered. Please try again later — if it keeps failing, contact ${await nexudusContact(env)}.`,
 		);
 	}
 	if (!regRes.ok) {
@@ -584,10 +608,9 @@ function deletedSummary(env: Env, r: VisitorRecord): string {
 // Delete the visitor the button points at. Returns the member-facing outcome.
 // Never throws — a network failure must still produce feedback for the clicker.
 async function deleteVisitor(env: Env, ref: DeleteRef): Promise<{ ok: boolean; text: string }> {
-	// Failure fallback is the Nexudus account email, not "the portal" — these
-	// registrations live under the service account, so members can't see them
-	// in their own portal login.
-	const contact = env.NEXUDUS_USERNAME;
+	// Failure fallback is the Nexudus account email (see nexudusContact), not
+	// "the portal" — members can't see these registrations in their own login.
+	const contact = await nexudusContact(env);
 	const found = await findVisitor(env, ref);
 	if (!found) {
 		return {
