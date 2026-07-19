@@ -5,7 +5,7 @@ import {
 	fetchMock,
 } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import worker, { TOKEN_KEY } from "../src/index";
+import worker, { TOKEN_KEY, CHANNEL_KEY } from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
 
@@ -48,6 +48,7 @@ beforeAll(() => {
 afterEach(async () => {
 	fetchMock.assertNoPendingInterceptors();
 	await env.TOKENS.delete(TOKEN_KEY); // isolate KV state between tests
+	await env.TOKENS.delete(CHANNEL_KEY); // …including the admin-set log channel
 });
 
 // --- Slack signing helpers (mirror the Worker) -----------------------------
@@ -132,13 +133,19 @@ function submissionBody(
 function blockActionsBody(
 	actionId = "open_visitor_form",
 	triggerId = "trig-xyz",
-	extra: { value?: string; responseUrl?: string } = {},
+	extra: { value?: string; responseUrl?: string; selectedConversation?: string; userId?: string } = {},
 ): string {
 	const payload = {
 		type: "block_actions",
-		user: { id: "U1", name: "Vinay Hiremath" },
+		user: { id: extra.userId ?? "U1", name: "Vinay Hiremath" },
 		trigger_id: triggerId,
-		actions: [{ action_id: actionId, ...(extra.value ? { value: extra.value } : {}) }],
+		actions: [
+			{
+				action_id: actionId,
+				...(extra.value ? { value: extra.value } : {}),
+				...(extra.selectedConversation ? { selected_conversation: extra.selectedConversation } : {}),
+			},
+		],
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
@@ -155,11 +162,15 @@ function headerGet(headers: unknown, name: string): string | undefined {
 	return undefined;
 }
 
-// users.info lookup for the submitter's full name (GET, unlike the POST methods).
-function mockUserInfo(reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } }) {
+// users.info lookup — used for the submitter's full name and for the admin
+// check (is_admin/is_owner). GET, unlike the POST methods.
+function mockUserInfo(
+	reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } },
+	user = "U1",
+) {
 	fetchMock
 		.get(SLACK_BASE)
-		.intercept({ path: "/api/users.info", method: "GET", query: { user: "U1" } })
+		.intercept({ path: "/api/users.info", method: "GET", query: { user } })
 		.reply(200, JSON.stringify(reply));
 }
 
@@ -328,6 +339,20 @@ describe("view_submission → register + DM", () => {
 			expect(button.action_id).toBe("delete_visitor");
 			expect(JSON.parse(button.value)).toEqual({ e: "jane.doe@gmail.com", a: ARRIVAL_UTC });
 		}
+	});
+
+	it("logs a success to the admin-configured channel instead of the default", async () => {
+		await env.TOKENS.put(CHANNEL_KEY, "C777"); // an admin picked this channel earlier
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].channel).toBe("U1"); // DM unchanged
+		expect(posts[1].channel).toBe("C777"); // the KV override, not env.VISITOR_CHANNEL
 	});
 
 	it("DMs a friendly failure with a generic contact when KV is unseeded (nothing reaches Nexudus)", async () => {
@@ -548,6 +573,7 @@ describe("App Home → button → modal", () => {
 
 	it("publishes the Home tab with the register button on app_home_opened", async () => {
 		let publish: any;
+		mockUserInfo(); // a non-admin, non-owner user (no is_admin/is_owner fields)
 		mockSlack("views.publish", (b) => (publish = b));
 
 		const res = await run(
@@ -558,6 +584,8 @@ describe("App Home → button → modal", () => {
 		expect(publish.view.type).toBe("home");
 		const actions = publish.view.blocks.find((b: any) => b.type === "actions");
 		expect(actions.elements[0].action_id).toBe("open_visitor_form");
+		// A normal member sees no admin settings — the channel picker is absent.
+		expect(JSON.stringify(publish.view.blocks)).not.toContain("set_visitor_channel");
 	});
 
 	it("ignores app_home_opened for the Messages tab (no outbound calls)", async () => {
@@ -590,6 +618,85 @@ describe("App Home → button → modal", () => {
 	it("acks and ignores block_actions for an unknown action_id (no outbound calls)", async () => {
 		const res = await run(await slackRequest("/slack/interactivity", blockActionsBody("some_other_action")));
 		expect(res.status).toBe(200);
+	});
+});
+
+describe("admin config → log channel", () => {
+	function eventBody(event: Record<string, unknown>): string {
+		return JSON.stringify({ type: "event_callback", event });
+	}
+
+	// The channel picker is a conversations_select rendered as a section accessory.
+	function findPicker(view: any): any {
+		return view.blocks.find((b: any) => b.accessory?.action_id === "set_visitor_channel")?.accessory;
+	}
+
+	async function openHome(user = "U1", envOverride: Env = testEnv): Promise<any> {
+		let publish: any;
+		mockSlack("views.publish", (b) => (publish = b));
+		const res = await run(
+			await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user, tab: "home" })),
+			envOverride,
+		);
+		expect(res.status).toBe(200);
+		return publish;
+	}
+
+	it("shows the log-channel picker to a workspace admin, seeded with the default channel", async () => {
+		mockUserInfo({ ok: true, user: { is_admin: true } });
+		const publish = await openHome();
+		const picker = findPicker(publish.view);
+		expect(picker?.type).toBe("conversations_select");
+		// The default #visitor-requests is a name, not an id → no initial_conversation.
+		expect(picker.initial_conversation).toBeUndefined();
+		expect(JSON.stringify(publish.view.blocks)).toContain("Currently logging to #visitor-requests");
+	});
+
+	it("shows the picker to a workspace owner too", async () => {
+		mockUserInfo({ ok: true, user: { is_owner: true } });
+		expect(findPicker((await openHome()).view)?.action_id).toBe("set_visitor_channel");
+	});
+
+	it("shows the picker to an allowlisted user without any admin lookup", async () => {
+		// No mockUserInfo — an ADMIN_USER_IDS match short-circuits the users.info
+		// call. (Cast: wrangler types ADMIN_USER_IDS as its "" literal default.)
+		const allowlistEnv = { ...testEnv, ADMIN_USER_IDS: "U9, U1 , U2" } as unknown as Env;
+		const publish = await openHome("U1", allowlistEnv);
+		expect(findPicker(publish.view)?.action_id).toBe("set_visitor_channel");
+	});
+
+	it("stores an admin's channel choice and re-publishes with it selected", async () => {
+		let publish: any;
+		mockUserInfo({ ok: true, user: { is_admin: true } });
+		mockSlack("views.publish", (b) => (publish = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" }),
+			),
+		);
+		expect(res.status).toBe(200);
+		// Persisted to KV…
+		expect(await env.TOKENS.get(CHANNEL_KEY)).toBe("C999");
+		// …and the refreshed Home tab preselects it and mentions it as a channel link.
+		const picker = findPicker(publish.view);
+		expect(picker.initial_conversation).toBe("C999");
+		expect(JSON.stringify(publish.view.blocks)).toContain("<#C999>");
+	});
+
+	it("ignores a channel change from a non-admin, non-allowlisted user (KV untouched)", async () => {
+		mockUserInfo(); // not an admin/owner
+		mockSlack("views.publish"); // the re-publish still happens, just without the picker
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" }),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(await env.TOKENS.get(CHANNEL_KEY)).toBeNull();
 	});
 });
 

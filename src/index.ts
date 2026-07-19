@@ -15,6 +15,7 @@
 const CALLBACK_ID = "visitor_registration";
 const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
 const DELETE_ACTION = "delete_visitor"; // button on the ✅ confirmation messages
+const SET_CHANNEL_ACTION = "set_visitor_channel"; // the Home-tab admin channel picker
 
 // Modal block/action ids → how we read each value back out of view.state.values.
 const FIELDS = {
@@ -131,6 +132,73 @@ function mrkdwnEscape(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Log channel + admin config
+// ---------------------------------------------------------------------------
+//
+// The visitors log channel is admin-configurable from the App Home tab and
+// stored in KV (env.TOKENS, alongside the Nexudus auth record under its own
+// key). VISITOR_CHANNEL is the fallback default until an admin picks one.
+
+export const CHANNEL_KEY = "visitor_channel"; // exported for the tests
+
+// The effective log channel: the admin-set override in KV if present, else the
+// VISITOR_CHANNEL default. undefined means "no channel configured" — skip the
+// channel log entirely. A KV read failure falls back to the default.
+async function readLogChannel(env: Env): Promise<string | undefined> {
+	try {
+		const stored = (await env.TOKENS.get(CHANNEL_KEY))?.trim();
+		if (stored) return stored;
+	} catch {
+		// KV unavailable — fall back to the configured default
+	}
+	return env.VISITOR_CHANNEL || undefined;
+}
+
+// A Slack conversation id (public C…, private/legacy G…) vs a #name or blank.
+// initial_conversation and channel mentions need an id; a #name can't be either.
+function isChannelId(channel: string): boolean {
+	return /^[CG][A-Z0-9]+$/.test(channel);
+}
+
+// A #name default is left as typed by admins in config; an id renders as a
+// clickable <#…> mention in the Home tab.
+function channelLabel(channel: string): string {
+	return isChannelId(channel) ? `<#${channel}>` : mrkdwnEscape(channel);
+}
+
+// Slack user ids named in ADMIN_USER_IDS (comma-separated), on top of admins.
+function allowlistedIds(env: Env): string[] {
+	return (env.ADMIN_USER_IDS ?? "")
+		.split(",")
+		.map((id) => id.trim())
+		.filter(Boolean);
+}
+
+// Whether this user may change the log channel: an explicit allowlist entry, or
+// a workspace admin/owner (users.info, scope users:read). Errs closed — a
+// failed lookup for a non-allowlisted user denies access. Never throws.
+async function canConfigure(env: Env, userId: string): Promise<boolean> {
+	if (allowlistedIds(env).includes(userId)) return true;
+	try {
+		const res = await fetch(`${SLACK_API}/users.info?user=${encodeURIComponent(userId)}`, {
+			headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+		});
+		const json = (await res.json().catch(() => null)) as {
+			ok?: boolean;
+			error?: string;
+			user?: { is_admin?: boolean; is_owner?: boolean; is_primary_owner?: boolean };
+		} | null;
+		if (!json?.ok) {
+			console.warn(`users.info (admin check) failed: ${json?.error ?? "unknown"}`); // error code only, no PII
+			return false;
+		}
+		return Boolean(json.user?.is_admin || json.user?.is_owner || json.user?.is_primary_owner);
+	} catch {
+		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The modal
 // ---------------------------------------------------------------------------
 
@@ -190,39 +258,84 @@ function openModal(env: Env, triggerId: string) {
 	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal() });
 }
 
+// The admin-only settings block: a channel picker that writes the log channel
+// to KV on selection (SET_CHANNEL_ACTION). currentChannel preselects the picker
+// and is echoed in a context line; undefined means nothing's configured yet.
+function settingsBlocks(currentChannel?: string): unknown[] {
+	const select: Record<string, unknown> = {
+		type: "conversations_select",
+		action_id: SET_CHANNEL_ACTION,
+		placeholder: { type: "plain_text", text: "Select a channel" },
+		// Members can pick a private channel too; bot-DM conversations never apply.
+		filter: { include: ["public", "private"], exclude_bot_users: true },
+	};
+	// initial_conversation needs a conversation id — a #name default can't seed it.
+	if (currentChannel && isChannelId(currentChannel)) select.initial_conversation = currentChannel;
+	return [
+		{ type: "divider" },
+		{ type: "header", text: { type: "plain_text", text: "Admin settings" } },
+		{
+			type: "section",
+			text: {
+				type: "mrkdwn",
+				text: "*Visitor log channel* — successful registrations are posted here. Only admins see this. Remember to invite the app to the channel you pick (`/invite @…`).",
+			},
+			accessory: select,
+		},
+		{
+			type: "context",
+			elements: [
+				{
+					type: "mrkdwn",
+					text: currentChannel
+						? `Currently logging to ${channelLabel(currentChannel)}.`
+						: "No log channel set yet — pick one above.",
+				},
+			],
+		},
+	];
+}
+
 // The App Home tab: the button entry point, visible to every workspace user
 // who opens the app. The tab itself can't open a modal — but its button click
 // arrives as block_actions with a trigger_id, which is what views.open needs.
-function homeView() {
-	return {
-		type: "home",
-		blocks: [
-			{ type: "header", text: { type: "plain_text", text: "Visitor registration" } },
-			{
-				type: "section",
-				text: {
-					type: "mrkdwn",
-					text: "Expecting a guest? Register them so reception knows they're coming. You can also run `/visitor` from any channel.",
+// `config` is present only for users who may configure the log channel; it adds
+// the admin settings block.
+function homeView(config?: { currentChannel?: string }) {
+	const blocks: unknown[] = [
+		{ type: "header", text: { type: "plain_text", text: "Visitor registration" } },
+		{
+			type: "section",
+			text: {
+				type: "mrkdwn",
+				text: "Expecting a guest? Register them so reception knows they're coming. You can also run `/visitor` from any channel.",
+			},
+		},
+		{
+			type: "actions",
+			elements: [
+				{
+					type: "button",
+					text: { type: "plain_text", text: "Register a visitor" },
+					style: "primary",
+					action_id: OPEN_ACTION,
 				},
-			},
-			{
-				type: "actions",
-				elements: [
-					{
-						type: "button",
-						text: { type: "plain_text", text: "Register a visitor" },
-						style: "primary",
-						action_id: OPEN_ACTION,
-					},
-				],
-			},
-		],
-	};
+			],
+		},
+	];
+	if (config) blocks.push(...settingsBlocks(config.currentChannel));
+	return { type: "home", blocks };
 }
 
-// (Re)publish the Home tab for one user — done on every app_home_opened.
-async function publishHome(env: Env, userId: string): Promise<void> {
-	const { ok, error } = await slackApi(env, "views.publish", { user_id: userId, view: homeView() });
+// (Re)publish the Home tab for one user — done on every app_home_opened and
+// after a channel change. Admins/allowlisted users additionally get the log
+// channel picker, seeded with the currently effective channel. Pass `allowed`
+// to reuse a permission already computed for this request (avoids a second
+// users.info call); omit it to look the permission up here.
+async function publishHome(env: Env, userId: string, allowed?: boolean): Promise<void> {
+	const mayConfigure = allowed ?? (await canConfigure(env, userId));
+	const config = mayConfigure ? { currentChannel: await readLogChannel(env) } : undefined;
+	const { ok, error } = await slackApi(env, "views.publish", { user_id: userId, view: homeView(config) });
 	if (!ok) console.warn(`views.publish failed: ${error ?? "unknown"}`); // error code only, no PII
 }
 
@@ -738,7 +851,7 @@ export default {
 			user?: SlackUser;
 			trigger_id?: string;
 			response_url?: string;
-			actions?: Array<{ action_id?: string; value?: string }>;
+			actions?: Array<{ action_id?: string; value?: string; selected_conversation?: string }>;
 			view?: { callback_id?: string; state?: ViewState };
 		};
 		try {
@@ -747,14 +860,34 @@ export default {
 			return new Response("", { status: 200 });
 		}
 
-		// Button clicks: the DM prompt's "Register a visitor" opens the modal;
-		// a confirmation's "Delete registration" removes the visitor again.
+		// Button clicks: the Home/DM "Register a visitor" opens the modal; a
+		// confirmation's "Delete registration" removes the visitor again; the
+		// admin channel picker sets the log channel.
 		if (payload.type === "block_actions") {
 			const clickedOpen = (payload.actions ?? []).some((a) => a.action_id === OPEN_ACTION);
 			const clickedDelete = (payload.actions ?? []).find((a) => a.action_id === DELETE_ACTION);
+			const setChannel = (payload.actions ?? []).find((a) => a.action_id === SET_CHANNEL_ACTION);
 			if (clickedOpen && payload.trigger_id) {
 				const { ok, error } = await openModal(env, payload.trigger_id);
 				if (!ok) console.warn(`views.open failed: ${error ?? "unknown"}`);
+			} else if (setChannel && payload.user?.id) {
+				// Re-verify server-side: only a configurer may change the channel,
+				// no matter who the picker was rendered for. Store + re-publish so
+				// the Home tab reflects the new channel. Background: stays in the ack
+				// window and the picker needs no synchronous response.
+				const userId = payload.user.id;
+				const selected = setChannel.selected_conversation;
+				ctx.waitUntil(
+					(async () => {
+						const allowed = await canConfigure(env, userId);
+						if (allowed && typeof selected === "string" && selected) {
+							await env.TOKENS.put(CHANNEL_KEY, selected);
+						} else if (selected) {
+							console.warn("non-configurer channel change ignored"); // no PII
+						}
+						await publishHome(env, userId, allowed);
+					})(),
+				);
 			} else if (clickedDelete?.value && payload.response_url) {
 				let ref: DeleteRef | null = null;
 				try {
@@ -796,8 +929,10 @@ export default {
 					const { ok, message, blocks } = await registerVisitor(env, input);
 					await postMessage(env, userId, message, blocks);
 					// Successes also go to the visitors channel — the human-readable
-					// log of registrations. Failures stay in the submitter's DM.
-					if (ok && env.VISITOR_CHANNEL) await postMessage(env, env.VISITOR_CHANNEL, message, blocks);
+					// log of registrations (admin-set in KV, else the VISITOR_CHANNEL
+					// default). Failures stay in the submitter's DM.
+					const logChannel = await readLogChannel(env);
+					if (ok && logChannel) await postMessage(env, logChannel, message, blocks);
 				})(),
 			);
 		}

@@ -23,7 +23,7 @@ POST /slack/interactivity ──► Worker
         2. ack 200 within 3s (closes the modal)
         3. [background] Nexudus POST /api/public/visitors (refresh token on 401)
         4. Slack chat.postMessage → DM the member ✅/❌; on ✅ also post
-           the summary to VISITOR_CHANNEL (the registration log)
+           the summary to the visitors log channel (the registration log)
 ```
 
 Three moving parts:
@@ -57,9 +57,17 @@ Every request passes two gates before any handling:
 
 ### Registration
 
-On a valid `view_submission`, the Worker trims and length-caps each value, acks immediately with an empty `200` (Slack requires a response within 3 seconds; the ack closes the modal), and continues in the background (`ctx.waitUntil`): convert the arrival to **UTC wall-clock** (see the timezone note below), create the visitor with `POST /api/public/visitors` (`BusinessId` from config **only**; token refreshed on a `401`), then DM the submitter a ✅/❌ mrkdwn summary of what was submitted, with a readable reason on failure. Successes are also posted to `VISITOR_CHANNEL` — the human-readable registration log — and carry a **Delete registration** button; failures go only to the submitter. The submitter, host and notes reach Nexudus as `CustomerNotes` lines (`Submitted via Slack by …` / `Visiting: …`) — reception's only view of who is expecting the visitor.
+On a valid `view_submission`, the Worker trims and length-caps each value, acks immediately with an empty `200` (Slack requires a response within 3 seconds; the ack closes the modal), and continues in the background (`ctx.waitUntil`): convert the arrival to **UTC wall-clock** (see the timezone note below), create the visitor with `POST /api/public/visitors` (`BusinessId` from config **only**; token refreshed on a `401`), then DM the submitter a ✅/❌ mrkdwn summary of what was submitted, with a readable reason on failure. Successes are also posted to the **visitors log channel** (see [Log channel](#log-channel)) — the human-readable registration log — and carry a **Delete registration** button; failures go only to the submitter. The submitter, host and notes reach Nexudus as `CustomerNotes` lines (`Submitted via Slack by …` / `Visiting: …`) — reception's only view of who is expecting the visitor.
 
 Member-provided text is escaped for mrkdwn before it reaches any Slack message, so a visitor name or note can't smuggle in a mention like `<!channel>`.
+
+### Log channel
+
+Where successes are logged is resolved at post time: an admin-set override in KV if present, otherwise the `VISITOR_CHANNEL` default from config. Admins configure it **in Slack** — no redeploy. The app's Home tab renders an extra **Admin settings** block with a channel picker (`conversations_select`) to users who may configure it; picking a channel fires a `block_actions` interaction that stores the chosen conversation id under the `visitor_channel` key in the `TOKENS` KV namespace, and the Home tab re-publishes to show the new selection.
+
+Who sees and uses the picker: **workspace admins/owners** (detected via `users.info` — the same `users:read` scope used for the full-name lookup — reading `is_admin`/`is_owner`/`is_primary_owner`), **plus** any Slack user ids listed in the optional `ADMIN_USER_IDS` var. The `SET_CHANNEL_ACTION` handler **re-checks** this permission server-side before writing, so the gate never relies on the picker merely being hidden. The permission lookup errs closed: a failed `users.info` for a non-allowlisted user denies access.
+
+The bot must be a member of whatever channel is chosen (`chat.postMessage` fails `not_in_channel` otherwise) — the picker's help text reminds admins to invite it.
 
 ### Delete flow
 
@@ -67,7 +75,7 @@ The create response returns **no visitor Id** (verified: `200`, empty body, no i
 
 On success the clicked message is **replaced** (via the payload's `response_url`) with a `🗑️` summary built from **the record Nexudus actually deleted** — never from the clicked message's text — ending with the Nexudus `Id`, the one unambiguous identifier between duplicates. On failure the clicker gets an **ephemeral** note with the same contact fallback. The other copy of the message (DM vs channel) is not updated — clicking its button later reports "may already be deleted". Accepted at this scale.
 
-Anyone who can see a ✅ message — the submitter in their DM, or any member of `VISITOR_CHANNEL` — can use its Delete button. Both audiences are the same trusted member group, and the confirm dialog guards against slips.
+Anyone who can see a ✅ message — the submitter in their DM, or any member of the visitors log channel — can use its Delete button. Both audiences are the same trusted member group, and the confirm dialog guards against slips.
 
 ### Logging
 
@@ -101,9 +109,10 @@ Two upgrade paths, neither of which changes the rest of the design: move the tok
 | `NEXUDUS_SUBDOMAIN` | Space subdomain → `https://{sub}.spaces.nexudus.com` |
 | `NEXUDUS_BUSINESS_ID` | The space's location id |
 | `SPACE_TIMEZONE` | IANA timezone of the space; used to *display* arrival times in messages (`ExpectedArrival` itself is sent as UTC) |
-| `VISITOR_CHANNEL` | Channel id or `#name` that successful registrations are logged to; the bot must be invited to it |
+| `VISITOR_CHANNEL` | **Default** channel id or `#name` that successful registrations are logged to; admins can override it from the Home tab (stored in KV under `visitor_channel`). The bot must be invited to whichever channel is in effect |
+| `ADMIN_USER_IDS` | Optional, comma-separated Slack **user ids** (e.g. `U012ABC3,U045DEF6`) allowed to change the log channel, on top of workspace admins/owners. Leave empty for admins only |
 
-**KV binding** — `TOKENS`: holds the auth record `{ username, access_token, refresh_token }`, which the Worker rotates on refresh. Create it once with `wrangler kv namespace create TOKENS` and seed it with `scripts/nexudus-token.sh | scripts/nexudus-seed.sh`. The namespace is shared with the Nexroom Worker.
+**KV binding** — `TOKENS`: holds the auth record `{ username, access_token, refresh_token }` (under the `nexudus` key), which the Worker rotates on refresh, and the admin-set log channel (under the `visitor_channel` key, written by the Home-tab picker). Create it once with `wrangler kv namespace create TOKENS` and seed the auth record with `scripts/nexudus-token.sh | scripts/nexudus-seed.sh`. The namespace is shared with the Nexroom Worker; the keys don't collide.
 
 **Secrets** — production only, set with `wrangler secret put <NAME>`. There is no local secrets file by default — if you ever run `wrangler dev` against the real APIs, create `.dev.vars` from [`.dev.vars.example`](.dev.vars.example) (gitignored):
 
@@ -147,6 +156,8 @@ The app config is [`slack-manifest.yaml`](slack-manifest.yaml) — the scopes, t
 
 1. [Create the app from the manifest](https://api.slack.com/apps?new_app=1) in the workspace — or paste it into an existing app's **App Manifest** page. Reinstall after any scope or event change.
 2. **Install to Workspace**, then set the two secrets: the **Bot User OAuth Token** (`xoxb-…`, OAuth & Permissions) → `wrangler secret put SLACK_BOT_TOKEN`, and the **Signing Secret** (Basic Information) → `wrangler secret put SLACK_SIGNING_SECRET`.
-3. **Invite the bot to `VISITOR_CHANNEL`** (`/invite @<bot name>` in the channel) — without this, channel logging fails with `not_in_channel`.
+3. **Invite the bot to the log channel** (`/invite @<bot name>` in whichever channel is in effect — the `VISITOR_CHANNEL` default or an admin's Home-tab choice) — without this, channel logging fails with `not_in_channel`.
+
+To change the log channel later, an admin (or anyone in `ADMIN_USER_IDS`) opens the app's **Home tab** and picks a channel under **Admin settings** — no redeploy. See [Log channel](#log-channel).
 
 Add `im:write` to the scopes if the result DMs ever fail to deliver. Keep `token_rotation_enabled: false` — the Worker assumes a static bot token.
