@@ -34,18 +34,9 @@ Three moving parts:
 
 ## The modal
 
-The `/visitor` command — or the Home-tab button — opens a Block Kit modal (`callback_id: visitor_registration`):
+The `/visitor` command — or the Home-tab button — opens a Block Kit modal (`callback_id: visitor_registration`) with the fields defined in `FIELDS` in [`src/index.ts`](src/index.ts): full name, email and expected arrival required, phone / host / notes optional. Required inputs are enforced by Slack **before** submission, so most bad input never reaches the Worker; the email must also be a real domain or Nexudus rejects it (see [Nexudus API notes](#nexudus-api-notes-verified-live)).
 
-| Block id | Label | Element | Required |
-|---|---|---|---|
-| `full_name` | Full name | `plain_text_input` | Yes |
-| `email` | Email | `email_text_input` | Yes — this space rejects visitors without one; the element enforces email format client-side |
-| `phone` | Phone | `plain_text_input` | No |
-| `arrival` | Expected arrival | `datetimepicker` | Yes |
-| `host` | Who are they visiting? | `plain_text_input` | No |
-| `notes` | Notes | `plain_text_input` (multiline) | No |
-
-Required inputs are enforced by Slack **before** submission, so most bad input never reaches the Worker. The submitter's identity comes from the `view_submission` payload's `user` field — not a form field — so every registration is attributable even though all requests reach Nexudus through a single account (see [Nexudus API notes](#nexudus-api-notes-verified-live)). The payload only carries the *username*, so the Worker resolves the profile's **full name** via `users.info` (scope `users:read`) in the background, falling back to the username if the lookup fails.
+The submitter's identity comes from the `view_submission` payload's `user` field — not a form field — so every registration is attributable even though all requests reach Nexudus through a single account (see [Accepted trade-offs](#accepted-trade-offs)). The payload only carries the *username*, so the Worker resolves the profile's **full name** via `users.info` (scope `users:read`) in the background, falling back to the username if the lookup fails.
 
 `datetimepicker` returns `selected_date_time` as **Unix epoch seconds** — the instant of the wall-clock time the member picked in their Slack timezone, which is exactly what the arrival conversion consumes.
 
@@ -66,31 +57,15 @@ Every request passes two gates before any handling:
 
 ### Registration
 
-On a valid `view_submission`, the Worker trims and length-caps each value (FullName 200, Email 320, PhoneNumber 50, Host 200, Notes 1000), acks immediately with an empty `200` (Slack requires a response within 3 seconds; the ack closes the modal), and continues in the background (`ctx.waitUntil`):
-
-1. Convert arrival to **UTC wall-clock** with no `Z`/offset (see the timezone note below).
-2. Read the access token (from KV `TOKENS`, else the seed secret) and `POST /api/public/visitors` with `Authorization: Bearer {token}` and a JSON **array** of one visitor — `BusinessId` from config **only**. On a `401` the access token has expired: `POST /api/token` (form-urlencoded `grant_type=refresh_token`, header `client_id: {NEXUDUS_USERNAME}`), write the rotated `{access_token, refresh_token}` pair back to KV, and retry once. If the refresh fails, the member gets a friendly "couldn't connect to the visitor system" ❌ and the (PII-free) re-seed hint goes to the Worker log.
-3. DM the submitter the result: a mrkdwn summary of the submission (`*Name:*`, `*Email:*`, `*Phone:*`, `*Arrival:* {space-local, minute precision} ({SPACE_TIMEZONE})`, `*Visiting:*`, `*Notes:*`, `*Submitted by:*` — blank optionals omitted) under `✅ *Visitor registered*` or `❌ *Registration failed*` plus a readable reason. Successes are also posted to `VISITOR_CHANNEL` — the human-readable registration log; failures go only to the submitter. Success messages carry a **Delete registration** button (`danger` style, with a confirm dialog).
+On a valid `view_submission`, the Worker trims and length-caps each value, acks immediately with an empty `200` (Slack requires a response within 3 seconds; the ack closes the modal), and continues in the background (`ctx.waitUntil`): convert the arrival to **UTC wall-clock** (see the timezone note below), create the visitor with `POST /api/public/visitors` (`BusinessId` from config **only**; token refreshed on a `401`), then DM the submitter a ✅/❌ mrkdwn summary of what was submitted, with a readable reason on failure. Successes are also posted to `VISITOR_CHANNEL` — the human-readable registration log — and carry a **Delete registration** button; failures go only to the submitter. The submitter, host and notes reach Nexudus as `CustomerNotes` lines (`Submitted via Slack by …` / `Visiting: …`) — reception's only view of who is expecting the visitor.
 
 Member-provided text is escaped for mrkdwn before it reaches any Slack message, so a visitor name or note can't smuggle in a mention like `<!channel>`.
 
-| Modal field | Nexudus field | Notes |
-|---|---|---|
-| — | `BusinessId` | From `NEXUDUS_BUSINESS_ID` only |
-| Full name | `FullName` | Required |
-| Email | `Email` | Required; must be a real domain |
-| Phone | `PhoneNumber` | Optional |
-| Expected arrival | `ExpectedArrival` | Epoch seconds → **UTC** wall-clock, no offset |
-| Submitter (full name via `users.info`, else username), Host, Notes | `CustomerNotes` | Lines: `Submitted via Slack by {SubmittedBy}` · `Visiting: {Host}` · `{Notes}` |
-
 ### Delete flow
 
-The create response returns **no visitor Id** (verified: `200`, empty body, no id-bearing header), so the Delete button can't carry one. Instead its `value` holds `{e: email, a: ExpectedArrival-as-sent}` and the Id is looked up at click time via the [documented list endpoint](https://learn.nexudus.com/api/endpoints/visitors/list-visitors):
+The create response returns **no visitor Id** (verified: `200`, empty body, no id-bearing header), so the ✅ message's Delete button carries `{email, ExpectedArrival-as-sent}` and the Id is looked up at click time via [`GET /api/public/visitors/my?showUpcoming=true`](https://learn.nexudus.com/api/endpoints/visitors/list-visitors) — the authenticated account's own registrations, which under the single-account model is exactly the set this Worker creates. Matching is **strict**: email plus the exact visit instant, with deliberately **no email-only fallback** — deleting a best guess is how the *wrong* duplicate would vanish unnoticed. If nothing matches exactly, nothing is deleted and the clicker is told to contact the Nexudus account email (`NEXUDUS_USERNAME`) — registrations live under the service account, so members can't remove them from their own portal login. Among exact duplicates (double-submit), the newest `Id` wins — any copy is the right one to remove there.
 
-1. `GET /api/public/visitors/my?showUpcoming=true` (same bearer-token + refresh-on-401 helper as the create) — the authenticated account's own registrations, which under the single-account model is exactly the set this Worker creates. `showUpcoming` keeps the payload bounded; a visitor whose arrival has passed can no longer be looked up (deleting would be moot). The body may be a bare array or a `Records`-style envelope — both tolerated.
-2. Match records **strictly**: email equal (case-insensitive) AND `UtcExpectedArrival` or `ExpectedArrival` denoting the same instant as sent (ISO and legacy `/Date(ms)/` forms tolerated). There is deliberately **no email-only fallback** — deleting a best guess is how the *wrong* duplicate would vanish unnoticed; if email matches exist but none has this visit time, nothing is deleted and the clicker is told to use the portal. Among exact duplicates (double-submit), the newest `Id` wins — any copy is the right one to remove there.
-3. [`DELETE /api/public/visitors/{Id}`](https://learn.nexudus.com/api/endpoints/visitors/delete-visitor).
-4. Report via the payload's `response_url`: on success **replace** the clicked message with `🗑️ *Registration deleted*` + **the deleted record's own fields**, mirroring the ✅ summary's lines and ending with the Nexudus `Id` — the one unambiguous identifier between duplicates. The confirmation reflects what Nexudus actually removed, never what the clicked message claimed. On failure, post an **ephemeral** note to the clicker pointing at the portal as fallback. The other copy of the message (DM vs channel) is not updated — clicking its button later reports "may already be deleted". Accepted at this scale.
+On success the clicked message is **replaced** (via the payload's `response_url`) with a `🗑️` summary built from **the record Nexudus actually deleted** — never from the clicked message's text — ending with the Nexudus `Id`, the one unambiguous identifier between duplicates. On failure the clicker gets an **ephemeral** note with the same contact fallback. The other copy of the message (DM vs channel) is not updated — clicking its button later reports "may already be deleted". Accepted at this scale.
 
 Anyone who can see a ✅ message — the submitter in their DM, or any member of `VISITOR_CHANNEL` — can use its Delete button. Both audiences are the same trusted member group, and the confirm dialog guards against slips.
 
@@ -142,6 +117,8 @@ Two upgrade paths, neither of which changes the rest of the design: move the tok
 
 The `NEXUDUS_*` token seed is generated by `scripts/nexudus-token.sh` and applied with `scripts/nexudus-set-secrets.sh` (which also clears the KV cache so the new seed takes effect). The TypeScript `Env` type is generated by `npm run cf-typegen` into `worker-configuration.d.ts` — rerun it after any config change.
 
+**Rotation:** regenerate the signing secret — or reinstall the app for a new bot token — in the Slack dashboard, then `wrangler secret put` the new value. Rotate the bot token if it leaks (it can post as the app).
+
 ## Development
 
 ```bash
@@ -182,10 +159,3 @@ Done once in the [Slack app dashboard](https://api.slack.com/apps). The Worker m
 7. **Install to Workspace** (reinstall after any scope/event change). Copy the **Bot User OAuth Token** (`xoxb-…`) → `SLACK_BOT_TOKEN`; from **Basic Information**, copy the **Signing Secret** → `SLACK_SIGNING_SECRET`.
 8. Set both as Worker secrets (`wrangler secret put …`).
 9. **Invite the bot to `VISITOR_CHANNEL`** (`/invite @<bot name>` in the channel) — without this, channel logging fails with `not_in_channel`.
-
-## Security model
-
-- Slack request signing is the only authentication gate: constant-time HMAC comparison, 5-minute replay window. Keep `SLACK_SIGNING_SECRET` and `SLACK_BOT_TOKEN` as Wrangler secrets — never in code.
-- **Rotation:** regenerate the signing secret or reinstall for a new bot token in the Slack dashboard, then `wrangler secret put` the new value. Rotate the bot token if it leaks (it can post as the app).
-- Per-IP rate limiting runs before any crypto work.
-- No visitor PII, credentials, or tokens are ever logged.

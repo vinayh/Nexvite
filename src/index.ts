@@ -1,19 +1,11 @@
 /**
  * Slack → Nexudus visitor registration — custom Slack app backend.
  *
- * There is no native "send a web request" step in Slack Workflow Builder, so
- * instead of Slack POSTing a form to us, this Worker *is* the Slack app:
- *
- *   /visitor slash command  → POST /slack/command      → open a modal (views.open)
- *   App Home opened          → POST /slack/events       → publish the Home tab; its
- *                              "Register a visitor" button (block_actions, which
- *                              carries a trigger_id) opens the same modal
- *   member submits the modal → POST /slack/interactivity → verify signature, ack,
- *                              then (in the background) register the visitor in
- *                              Nexudus and DM the member ✅/❌.
- *
- * Auth is Slack's request signature (SLACK_SIGNING_SECRET), not a shared secret.
- * The bot token (SLACK_BOT_TOKEN) is used to open the modal and DM the result.
+ * This Worker *is* the Slack app (Workflow Builder has no outbound-HTTP step):
+ * /slack/command opens the modal, /slack/events publishes the App Home tab
+ * (whose button also opens the modal), and /slack/interactivity verifies the
+ * signature, acks, then registers the visitor in Nexudus and DMs the result.
+ * Flow diagram and design rationale: README.md.
  *
  * Never log the modal values, visitor fields, tokens, or Nexudus/Slack response
  * bodies — visitor PII must not reach Workers Logs. Slack/Nexudus error *codes*
@@ -105,7 +97,7 @@ async function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: 
 // is optional Block Kit; `text` remains the notification fallback.
 async function postMessage(env: Env, channel: string, text: string, blocks?: unknown[]): Promise<void> {
 	const { ok, error } = await slackApi(env, "chat.postMessage", { channel, text, ...(blocks && { blocks }) });
-	if (!ok) console.log(`chat.postMessage failed: ${error ?? "unknown"}`); // error code only, no PII
+	if (!ok) console.warn(`chat.postMessage failed: ${error ?? "unknown"}`); // error code only, no PII
 }
 
 // The interactivity payload only carries the submitter's *username* — the
@@ -122,7 +114,7 @@ async function fetchFullName(env: Env, userId: string): Promise<string | null> {
 			user?: { real_name?: string; profile?: { real_name?: string } };
 		} | null;
 		if (!json?.ok) {
-			console.log(`users.info failed: ${json?.error ?? "unknown"}`); // error code only, no PII
+			console.warn(`users.info failed: ${json?.error ?? "unknown"}`); // error code only, no PII
 			return null;
 		}
 		return json.user?.profile?.real_name || json.user?.real_name || null;
@@ -231,7 +223,7 @@ function homeView() {
 // (Re)publish the Home tab for one user — done on every app_home_opened.
 async function publishHome(env: Env, userId: string): Promise<void> {
 	const { ok, error } = await slackApi(env, "views.publish", { user_id: userId, view: homeView() });
-	if (!ok) console.log(`views.publish failed: ${error ?? "unknown"}`); // error code only, no PII
+	if (!ok) console.warn(`views.publish failed: ${error ?? "unknown"}`); // error code only, no PII
 }
 
 // ---------------------------------------------------------------------------
@@ -259,16 +251,12 @@ function readDateTime(state: ViewState, block: string, action: string): number |
 // Nexudus tokens (KV-backed, auto-refreshing)
 // ---------------------------------------------------------------------------
 //
-// The account password never reaches the Worker. It authenticates with an
-// access token that lasts ~14 days. When that token 401s we exchange the
-// refresh token for a new pair (client_id = the account email) — but Nexudus
-// refresh tokens are single-use and rotate on every exchange, so the live pair
-// is kept in KV (env.TOKENS) and the new refresh token is written back. The
-// NEXUDUS_ACCESS_TOKEN / NEXUDUS_REFRESH_TOKEN secrets are only the initial
-// seed, used until the first refresh populates KV; re-seed with
-// scripts/nexudus-token.sh if KV is ever cleared.
+// Nexudus refresh tokens are single-use and rotate on every exchange, so the
+// live { access_token, refresh_token } pair lives in KV (env.TOKENS). The
+// NEXUDUS_* secrets are only the initial seed — re-seed with
+// scripts/nexudus-token.sh if the chain breaks.
 
-const TOKEN_KEY = "nexudus";
+export const TOKEN_KEY = "nexudus"; // exported for the tests
 
 interface TokenPair {
 	access_token: string;
@@ -308,27 +296,37 @@ async function refreshTokens(env: Env, base: string, refreshToken: string): Prom
 	return { access_token: body.access_token, refresh_token: body.refresh_token };
 }
 
+function nexudusBase(env: Env): string {
+	return `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
+}
+
 // Run an authenticated Nexudus request: current token first; on a 401 refresh
-// once (rotating the pair, persisted to KV) and retry. Returns null only when
-// auth couldn't be established (the refresh failed) — the re-seed hint goes to
-// the log, never to a member (it's not actionable for them).
+// once (rotating the pair, persisted to KV) and retry. Never throws. Returns
+// null when auth couldn't be established or the network failed — the caller
+// turns that into a friendly member-facing failure, while the operational
+// detail goes to the log (it's not actionable for members).
 async function nexudusFetch(
 	env: Env,
-	base: string,
-	doFetch: (accessToken: string) => Promise<Response>,
+	doFetch: (base: string, accessToken: string) => Promise<Response>,
 ): Promise<Response | null> {
-	const tokens = await readTokens(env);
-	let res = await doFetch(tokens.access_token);
-	if (res.status === 401) {
-		const refreshed = await refreshTokens(env, base, tokens.refresh_token);
-		if (!refreshed) {
-			console.log("nexudus token refresh failed — re-seed with scripts/nexudus-token.sh");
-			return null;
+	const base = nexudusBase(env);
+	try {
+		const tokens = await readTokens(env);
+		let res = await doFetch(base, tokens.access_token);
+		if (res.status === 401) {
+			const refreshed = await refreshTokens(env, base, tokens.refresh_token);
+			if (!refreshed) {
+				console.error("nexudus token refresh failed — re-seed with scripts/nexudus-token.sh");
+				return null;
+			}
+			await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
+			res = await doFetch(base, refreshed.access_token);
 		}
-		await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
-		res = await doFetch(refreshed.access_token);
+		return res;
+	} catch (err) {
+		console.error(`nexudus request threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
+		return null;
 	}
-	return res;
 }
 
 // ---------------------------------------------------------------------------
@@ -443,8 +441,6 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	// summary echoes the space-local time, matching what the portal shows).
 	const arrivalUtc = toWallClock(input.arrivalEpoch, "UTC");
 
-	const base = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
-
 	// All registrations go through one account, so CustomerNotes is reception's
 	// only view of who submitted and who the visitor is for.
 	const noteLines: string[] = [`${NOTE_SUBMITTED}${input.submittedBy}`];
@@ -461,26 +457,16 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	};
 	const body = JSON.stringify([visitor]); // body is an array of visitors
 
-	let regRes: Response | null;
-	try {
-		regRes = await nexudusFetch(env, base, (accessToken) =>
-			fetch(`${base}/api/public/visitors`, {
-				method: "POST",
-				headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-				body,
-			}),
-		);
-	} catch (err) {
-		// Network failure — without this the member would get no DM at all.
-		console.log(`nexudus create threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
-		regRes = null;
-	}
-
+	const regRes = await nexudusFetch(env, (base, accessToken) =>
+		fetch(`${base}/api/public/visitors`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+			body,
+		}),
+	);
 	if (!regRes) {
-		// Auth couldn't be renewed — the member can't fix that, so keep it friendly
-		// (the operational hint is already in the log, from nexudusFetch).
 		return failed(
-			"We couldn't connect to the visitor system, so this visitor was not registered. Please try again later — if it keeps failing, let an admin know.",
+			`We couldn't connect to the visitor system, so this visitor was not registered. Please try again later — if it keeps failing, contact ${env.NEXUDUS_USERNAME}.`,
 		);
 	}
 	if (!regRes.ok) {
@@ -499,8 +485,8 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 // The create response carries no visitor Id, so deletion is a click-time
 // lookup via GET /api/public/visitors/my — the authenticated customer's own
 // registrations, which (single-account model, see README) is exactly the set this
-// Worker creates. Match on email (and arrival, when recognizable), DELETE the
-// newest match. Docs: learn.nexudus.com/api/endpoints/visitors/list-visitors.
+// Worker creates. Match strictly on email + visit instant, DELETE the newest
+// match. Docs: learn.nexudus.com/api/endpoints/visitors/list-visitors.
 
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
 // (naive ones are treated as UTC — matching what we send) and the legacy
@@ -512,13 +498,6 @@ function parseNexudusInstant(value: unknown): number | null {
 	const iso = /[Zz]$|[+-]\d\d:?\d\d$/.test(value) ? value : `${value}Z`;
 	const ms = Date.parse(iso);
 	return Number.isFinite(ms) ? ms : null;
-}
-
-// True when a listed record's date denotes the same instant as the naive-UTC
-// string we sent.
-function arrivalMatches(recordValue: unknown, sentUtc: string): boolean {
-	const recordMs = parseNexudusInstant(recordValue);
-	return recordMs != null && recordMs === Date.parse(`${sentUtc}Z`);
 }
 
 // The list body may be a bare array or an envelope; { Records: [...] } is the
@@ -552,10 +531,9 @@ interface VisitorRecord {
 // passed can't be looked up (deleting would be moot).
 async function findVisitor(
 	env: Env,
-	base: string,
 	ref: DeleteRef,
 ): Promise<{ match: VisitorRecord | null; emailMatches: number } | null> {
-	const res = await nexudusFetch(env, base, (accessToken) =>
+	const res = await nexudusFetch(env, (base, accessToken) =>
 		fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
 			headers: { Authorization: `Bearer ${accessToken}` },
 		}),
@@ -568,8 +546,13 @@ async function findVisitor(
 			typeof (r as { Email?: unknown })?.Email === "string" &&
 			(r as { Email: string }).Email.toLowerCase() === ref.e.toLowerCase(),
 	);
+	// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
+	// space-local, so consulting it alongside the UTC field would let a visit
+	// one offset-hour away match by string coincidence. It's the fallback only
+	// when no UTC field is usable.
+	const sentMs = Date.parse(`${ref.a}Z`);
 	const exact = byEmail.filter(
-		(r) => arrivalMatches(r.UtcExpectedArrival, ref.a) || arrivalMatches(r.ExpectedArrival, ref.a),
+		(r) => (parseNexudusInstant(r.UtcExpectedArrival) ?? parseNexudusInstant(r.ExpectedArrival)) === sentMs,
 	);
 	const match = exact.length > 0 ? exact.reduce((a, b) => (b.Id > a.Id ? b : a)) : null;
 	return { match, emailMatches: byEmail.length };
@@ -601,46 +584,38 @@ function deletedSummary(env: Env, r: VisitorRecord): string {
 // Delete the visitor the button points at. Returns the member-facing outcome.
 // Never throws — a network failure must still produce feedback for the clicker.
 async function deleteVisitor(env: Env, ref: DeleteRef): Promise<{ ok: boolean; text: string }> {
-	const base = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
-	let found: Awaited<ReturnType<typeof findVisitor>>;
-	try {
-		found = await findVisitor(env, base, ref);
-	} catch (err) {
-		console.log(`visitor lookup threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
-		found = null;
-	}
+	// Failure fallback is the Nexudus account email, not "the portal" — these
+	// registrations live under the service account, so members can't see them
+	// in their own portal login.
+	const contact = env.NEXUDUS_USERNAME;
+	const found = await findVisitor(env, ref);
 	if (!found) {
 		return {
 			ok: false,
-			text: "⚠️ Couldn't check the visitor list just now — nothing was deleted. Please try again, or remove the visitor in the Nexudus portal.",
+			text: `⚠️ Couldn't check the visitor list just now — nothing was deleted. Please try again — if it keeps failing, contact ${contact}.`,
 		};
 	}
-	if (!found.match) {
+	const { match } = found;
+	if (!match) {
 		return {
 			ok: false,
 			text:
 				found.emailMatches > 0
-					? "⚠️ There are upcoming registrations for this email, but none with this exact visit time — so nothing was deleted. Please remove the right one in the Nexudus portal."
-					: "⚠️ Couldn't find this registration in Nexudus — it may already be deleted, or the visit time has passed. If it still shows in the portal, remove it there.",
+					? `⚠️ There are upcoming registrations for this email, but none with this exact visit time — so nothing was deleted. Contact ${contact} to remove the right one.`
+					: `⚠️ Couldn't find this registration — it may already be deleted, or the visit time has passed. If it still needs removing, contact ${contact}.`,
 		};
 	}
-	let res: Response | null;
-	try {
-		res = await nexudusFetch(env, base, (accessToken) =>
-			fetch(`${base}/api/public/visitors/${found.match!.Id}`, {
-				method: "DELETE",
-				headers: { Authorization: `Bearer ${accessToken}` },
-			}),
-		);
-	} catch (err) {
-		console.log(`visitor delete threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
-		res = null;
-	}
+	const res = await nexudusFetch(env, (base, accessToken) =>
+		fetch(`${base}/api/public/visitors/${match.Id}`, {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${accessToken}` },
+		}),
+	);
 	if (!res?.ok) {
-		if (res) console.log(`visitor delete failed: HTTP ${res.status}`); // status only, no PII
-		return { ok: false, text: "⚠️ Deleting failed — please remove the visitor in the Nexudus portal." };
+		if (res) console.warn(`visitor delete failed: HTTP ${res.status}`); // status only, no PII
+		return { ok: false, text: `⚠️ Deleting failed — please contact ${contact} to remove the visitor.` };
 	}
-	return { ok: true, text: deletedSummary(env, found.match) };
+	return { ok: true, text: deletedSummary(env, match) };
 }
 
 // Handle a Delete click: delete in Nexudus, then report via the clicked
@@ -658,9 +633,9 @@ async function handleDeleteClick(env: Env, ref: DeleteRef, responseUrl: string):
 					: { replace_original: false, response_type: "ephemeral", text },
 			),
 		});
-		if (!res.ok) console.log(`response_url post failed: HTTP ${res.status}`);
+		if (!res.ok) console.warn(`response_url post failed: HTTP ${res.status}`);
 	} catch (err) {
-		console.log(`response_url post threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
+		console.warn(`response_url post threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
 	}
 }
 
@@ -706,7 +681,7 @@ export default {
 
 			const { ok, error } = await openModal(env, triggerId);
 			if (!ok) {
-				console.log(`views.open failed: ${error ?? "unknown"}`);
+				console.warn(`views.open failed: ${error ?? "unknown"}`);
 				return new Response("Couldn't open the visitor form — please try again.", { status: 200 });
 			}
 			return new Response("", { status: 200 });
@@ -756,7 +731,7 @@ export default {
 			const clickedDelete = (payload.actions ?? []).find((a) => a.action_id === DELETE_ACTION);
 			if (clickedOpen && payload.trigger_id) {
 				const { ok, error } = await openModal(env, payload.trigger_id);
-				if (!ok) console.log(`views.open failed: ${error ?? "unknown"}`);
+				if (!ok) console.warn(`views.open failed: ${error ?? "unknown"}`);
 			} else if (clickedDelete?.value && payload.response_url) {
 				let ref: DeleteRef | null = null;
 				try {

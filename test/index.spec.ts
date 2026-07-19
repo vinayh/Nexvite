@@ -5,10 +5,9 @@ import {
 	fetchMock,
 } from "cloudflare:test";
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
-import worker from "../src/index";
+import worker, { TOKEN_KEY } from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
-const TOKEN_KEY = "nexudus"; // must match src/index.ts
 
 const testEnv = {
 	...env,
@@ -87,9 +86,12 @@ async function slackRequest(
 	return new IncomingRequest(`https://worker.example${path}`, { method: "POST", headers, body: rawBody });
 }
 
-async function run(request: Request<unknown, IncomingRequestCfProperties>): Promise<Response> {
+async function run(
+	request: Request<unknown, IncomingRequestCfProperties>,
+	envOverride: Env = testEnv,
+): Promise<Response> {
 	const ctx = createExecutionContext();
-	const response = await worker.fetch(request, testEnv, ctx);
+	const response = await worker.fetch(request, envOverride, ctx);
 	await waitOnExecutionContext(ctx); // settle ctx.waitUntil() background work
 	return response;
 }
@@ -225,6 +227,19 @@ describe("rate limiting", () => {
 		}
 		expect(statuses[0]).toBe(401);
 		expect(statuses[20]).toBe(429);
+	});
+
+	it("fails open (request still handled) when the limiter itself errors", async () => {
+		let viewsOpen: any;
+		mockSlack("views.open", (b) => (viewsOpen = b));
+
+		const broken: Env = {
+			...testEnv,
+			RATE_LIMITER: { limit: () => Promise.reject(new Error("limiter down")) } as RateLimit,
+		};
+		const res = await run(await slackRequest("/slack/command", COMMAND_BODY), broken);
+		expect(res.status).toBe(200); // not 500, not 429 — the request went through
+		expect(viewsOpen.trigger_id).toBe("trigger-123");
 	});
 });
 
@@ -366,12 +381,75 @@ describe("view_submission → register + DM", () => {
 		expect(dm.channel).toBe("U1");
 		expect(dm.text).toContain("❌ *Registration failed*");
 		expect(dm.text).toContain("couldn't connect to the visitor system");
+		expect(dm.text).toContain("contact svc@example.com"); // the Nexudus account, not "an admin"
 		expect(dm.text).toContain("*Name:* Jane Doe"); // summary included on failure too
 		// The operational hint stays out of the member-facing message.
 		expect(dm.text).not.toContain("re-seed");
 		expect(dm.text).not.toContain("token");
+		expect(dm.text).not.toContain("admin");
 		// KV untouched because the refresh failed.
 		expect(await env.TOKENS.get(TOKEN_KEY)).toBeNull();
+	});
+
+	it("DMs the friendly failure with the contact email when the network call itself fails", async () => {
+		let dm: any;
+		mockUserInfo();
+		fetchMock
+			.get(NEXUDUS_BASE)
+			.intercept({ path: "/api/public/visitors", method: "POST" })
+			.replyWithError(new Error("connection refused"));
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.channel).toBe("U1");
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("couldn't connect to the visitor system");
+		expect(dm.text).toContain("contact svc@example.com");
+	});
+
+	it("still posts the channel log when the DM fails", async () => {
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors();
+		mockSlack("chat.postMessage", (b) => posts.push(b), { ok: false, error: "cannot_dm_user" }); // DM fails
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log still goes out
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(2);
+		expect(posts[0].channel).toBe("U1");
+		expect(posts[1].channel).toBe(env.VISITOR_CHANNEL);
+	});
+
+	it("falls back to the seed tokens when the KV pair is corrupt", async () => {
+		await env.TOKENS.put(TOKEN_KEY, "not-json");
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		mockSlack("chat.postMessage"); // DM
+		mockSlack("chat.postMessage"); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(visitor?.auth).toBe("Bearer seed-access");
+	});
+
+	it("length-caps member-provided values before they reach Nexudus", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		mockSlack("chat.postMessage"); // DM
+		mockSlack("chat.postMessage"); // channel log
+
+		const values = {
+			full_name: { value: { type: "plain_text_input", value: "N".repeat(250) } },
+			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+			arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(visitor!.body!)[0].FullName).toBe("N".repeat(200)); // FIELDS.fullName.cap
 	});
 
 	it("DMs the Nexudus rejection detail on a 400; nothing to the channel", async () => {
@@ -551,9 +629,10 @@ describe("delete button → remove visitor", () => {
 	}
 
 	it("deletes the newest exact email+arrival match and confirms with the DELETED RECORD's details", async () => {
-		// Id 9 matches by ISO ExpectedArrival, Id 12 via UtcExpectedArrival in the
-		// legacy /Date(ms)/ form (its space-local ExpectedArrival doesn't match);
-		// Id 20 is newer but a different visit, so the exact pool {9, 12} wins.
+		// Id 9 matches by ISO ExpectedArrival (no UTC field), Id 12 via
+		// UtcExpectedArrival in the legacy /Date(ms)/ form (its space-local
+		// ExpectedArrival is ignored — the UTC field wins); Id 20 is newer but a
+		// different visit, so the exact pool {9, 12} wins.
 		mockList([
 			{ Id: 7, Email: "other@example.net", ExpectedArrival: ARRIVAL_UTC },
 			{ Id: 9, Email: "jane.doe@gmail.com", FullName: "Jane Doe", ExpectedArrival: ARRIVAL_UTC },
@@ -590,6 +669,28 @@ describe("delete button → remove visitor", () => {
 		);
 	});
 
+	it("ignores a space-local ExpectedArrival coincidence when UtcExpectedArrival parses (no DELETE call)", async () => {
+		// The record's real instant (UtcExpectedArrival) is an hour earlier — its
+		// naive ExpectedArrival string only *looks* like the sent UTC value.
+		// Trusting it would delete a different visit for the same email.
+		mockList([
+			{
+				Id: 14,
+				Email: "jane.doe@gmail.com",
+				ExpectedArrival: ARRIVAL_UTC,
+				UtcExpectedArrival: `/Date(${(ARRIVAL_EPOCH - 3600) * 1000})/`,
+			},
+		]);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("nothing was deleted");
+	});
+
 	it("refuses to delete when the email matches but no arrival does (no DELETE call)", async () => {
 		mockList([
 			{ Id: 3, Email: "jane.doe@gmail.com", ExpectedArrival: "2026-01-01T00:00:00" },
@@ -603,7 +704,7 @@ describe("delete button → remove visitor", () => {
 		expect(respond.replace_original).toBe(false);
 		expect(respond.response_type).toBe("ephemeral");
 		expect(respond.text).toContain("nothing was deleted");
-		expect(respond.text).toContain("Nexudus portal");
+		expect(respond.text).toContain("svc@example.com");
 	});
 
 	it("handles a bare-array list body (no Records envelope)", async () => {
@@ -616,6 +717,38 @@ describe("delete button → remove visitor", () => {
 		expect(res.status).toBe(200);
 		expect(respond.text).toContain("🗑️ *Registration deleted*");
 		expect(respond.text).toContain("*Nexudus ID:* 9");
+	});
+
+	it("mirrors every ✅ summary line in the 🗑️ confirmation, parsed back from CustomerNotes", async () => {
+		mockList([
+			{
+				Id: 31,
+				Email: "jane.doe@gmail.com",
+				FullName: "Jane Doe",
+				PhoneNumber: "+44 7700 900123",
+				ExpectedArrival: ARRIVAL_UTC,
+				CustomerNotes: "Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access",
+			},
+		]);
+		mockDelete(31);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDelete();
+		expect(res.status).toBe(200);
+		expect(respond.text).toBe(
+			[
+				"🗑️ *Registration deleted*",
+				"*Name:* Jane Doe",
+				"*Email:* jane.doe@gmail.com",
+				"*Phone:* +44 7700 900123",
+				`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
+				"*Visiting:* Sam",
+				"*Notes:* Needs step-free access",
+				"*Submitted by:* Vinay Hiremath",
+				"*Nexudus ID:* 31",
+			].join("\n"),
+		);
 	});
 
 	it("reports already-deleted (ephemeral) when no record matches; no DELETE call", async () => {
@@ -640,7 +773,7 @@ describe("delete button → remove visitor", () => {
 		expect(res.status).toBe(200);
 		expect(respond.replace_original).toBe(false);
 		expect(respond.response_type).toBe("ephemeral");
-		expect(respond.text).toContain("remove the visitor in the Nexudus portal");
+		expect(respond.text).toContain("svc@example.com");
 	});
 
 	it("ignores a delete click with a malformed value (no outbound calls)", async () => {

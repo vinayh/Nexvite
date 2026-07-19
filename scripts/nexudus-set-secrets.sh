@@ -34,8 +34,17 @@ fi
 printf '%s' "$ACCESS" | npx wrangler secret put NEXUDUS_ACCESS_TOKEN
 printf '%s' "$REFRESH" | npx wrangler secret put NEXUDUS_REFRESH_TOKEN
 
-# Drop the cached token pair so the Worker re-seeds from the new secrets
-# (a no-op on first setup, before any KV entry exists).
-npx wrangler kv key delete --binding TOKENS nexudus 2>/dev/null || true
-
-echo "✅ Nexudus secrets set and KV token cache cleared." >&2
+# Drop the cached token pair so the Worker re-seeds from the new secrets.
+# "Key not found" (first setup) is fine; any other failure means the Worker
+# keeps using the stale cached pair — never report success for that.
+if OUT="$(npx wrangler kv key delete --binding TOKENS nexudus 2>&1)"; then
+	echo "✅ Nexudus secrets set and KV token cache cleared." >&2
+elif printf '%s' "$OUT" | grep -qi "not found"; then
+	echo "✅ Nexudus secrets set (no cached KV pair to clear)." >&2
+else
+	printf '%s\n' "$OUT" >&2
+	echo "⚠️  Secrets set, but clearing the KV token cache FAILED — the Worker will keep" >&2
+	echo "   using the old cached pair. Clear it manually:" >&2
+	echo "   npx wrangler kv key delete --binding TOKENS nexudus" >&2
+	exit 1
+fi
