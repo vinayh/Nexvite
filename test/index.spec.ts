@@ -30,6 +30,7 @@ const ARRIVAL_LOCAL = "2026-07-20 15:30"; // shown in messages (Europe/London, B
 // What the default submissionBody() produces as a success message.
 const SUCCESS_TEXT = [
 	"✅ *Visitor registered*",
+	"_The visitor should receive an invite from the Nexudus platform shortly at the email below._",
 	"*Name:* Jane Doe",
 	"*Email:* jane.doe@gmail.com",
 	"*Phone:* +44 7700 900123",
@@ -133,7 +134,13 @@ function submissionBody(
 function blockActionsBody(
 	actionId = "open_visitor_form",
 	triggerId = "trig-xyz",
-	extra: { value?: string; responseUrl?: string; selectedConversation?: string; userId?: string } = {},
+	extra: {
+		value?: string;
+		responseUrl?: string;
+		selectedConversation?: string;
+		userId?: string;
+		messageText?: string;
+	} = {},
 ): string {
 	const payload = {
 		type: "block_actions",
@@ -147,6 +154,7 @@ function blockActionsBody(
 			},
 		],
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
+		...(extra.messageText != null ? { message: { text: extra.messageText } } : {}),
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
 }
@@ -194,6 +202,16 @@ function mockVisitors(capture?: (c: Captured) => void, status = 200, data = "") 
 			if (capture) capture({ body: opts.body as string, auth: headerGet(opts.headers, "authorization") });
 			return { statusCode: status, data };
 		});
+}
+
+// GET /api/public/visitors/my?showUpcoming=true — the account's own upcoming
+// registrations (the only Nexudus read route). Each call registers one reply,
+// consumed in order, so multiple calls model successive lookups (e.g. a retry).
+function mockMyList(records: unknown[]) {
+	fetchMock
+		.get(NEXUDUS_BASE)
+		.intercept({ path: "/api/public/visitors/my", method: "GET", query: { showUpcoming: "true" } })
+		.reply(200, JSON.stringify({ Records: records }));
 }
 
 function mockRefresh(
@@ -297,11 +315,14 @@ describe("slash command → open modal", () => {
 describe("view_submission → register + DM", () => {
 	beforeEach(seed);
 
-	it("registers with the KV access token, DMs success, and logs to the channel", async () => {
+	it("registers with the KV access token, DMs success with the looked-up Nexudus Id, and logs to the channel", async () => {
 		let visitor: Captured | undefined;
 		const posts: any[] = [];
 		mockUserInfo();
-		mockVisitors((c) => (visitor = c), 200, JSON.stringify([{ Id: 1 }]));
+		mockVisitors((c) => (visitor = c), 200, JSON.stringify([{ Id: 1 }])); // create returns no usable Id
+		// The Id comes from the follow-up /my lookup (42 ≠ the create-body's 1),
+		// matched on email + the arrival exactly as sent.
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM to the submitter
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
@@ -324,21 +345,59 @@ describe("view_submission → register + DM", () => {
 			"Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access",
 		);
 
-		// DM first, then the same summary to the visitors channel.
+		// The message ends with the Nexudus Id line; DM first, then the same
+		// summary to the visitors channel.
+		const successWithId = `${SUCCESS_TEXT}\n*Nexudus ID:* 42`;
 		expect(posts).toHaveLength(2);
 		expect(posts[0].channel).toBe("U1");
-		expect(posts[0].text).toBe(SUCCESS_TEXT);
+		expect(posts[0].text).toBe(successWithId);
 		expect(posts[1].channel).toBe(env.VISITOR_CHANNEL);
-		expect(posts[1].text).toBe(SUCCESS_TEXT);
+		expect(posts[1].text).toBe(successWithId);
 
-		// Both carry the summary + a Delete button holding the lookup reference
-		// (email + the arrival exactly as sent), since Nexudus returns no Id.
+		// Both carry the summary + a Delete button holding just the captured Id.
 		for (const post of posts) {
-			expect(post.blocks[0].text.text).toBe(SUCCESS_TEXT);
+			expect(post.blocks[0].text.text).toBe(successWithId);
 			const button = post.blocks.find((b: any) => b.type === "actions").elements[0];
 			expect(button.action_id).toBe("delete_visitor");
-			expect(JSON.parse(button.value)).toEqual({ e: "jane.doe@gmail.com", a: ARRIVAL_UTC });
+			expect(JSON.parse(button.value)).toEqual({ id: 42 });
 		}
+	});
+
+	it("retries the Id lookup once when the record isn't visible yet, then shows it", async () => {
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
+		mockMyList([]); // first lookup: created record not replicated into /my yet
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]); // retry: now there
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toBe(`${SUCCESS_TEXT}\n*Nexudus ID:* 42`);
+		expect(JSON.parse(posts[0].blocks.find((b: any) => b.type === "actions").elements[0].value)).toEqual({ id: 42 });
+	});
+
+	it("DMs a soft warning (nothing to the channel) when the registration can't be confirmed in the visitor system", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
+		// The create returned 200 but the record never appears in /my (even after the
+		// retry). The POST may still have gone through, so warn softly (DM only, no
+		// channel log) and steer away from a blind retry rather than cry failure.
+		mockMyList([]); // first lookup: not there
+		mockMyList([]); // retry: still not there
+		mockSlack("chat.postMessage", (b) => (dm = b)); // DM only — no channel post
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.channel).toBe("U1");
+		expect(dm.text).toContain("⚠️ *Registration submitted — but not confirmed*");
+		expect(dm.text).toContain("couldn't confirm it went through");
+		expect(dm.text).toContain("check with svc@example.com to avoid a duplicate");
+		expect(dm.text).not.toContain("❌"); // not framed as an outright failure
+		expect(dm.text).toContain("*Name:* Jane Doe"); // still echoes what was submitted
+		expect(dm.text).not.toContain("*Nexudus ID:*");
 	});
 
 	it("logs a success to the admin-configured channel instead of the default", async () => {
@@ -346,6 +405,7 @@ describe("view_submission → register + DM", () => {
 		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
@@ -378,6 +438,7 @@ describe("view_submission → register + DM", () => {
 		mockVisitors(undefined, 401); // first attempt: access token expired
 		mockRefresh((c) => (refresh = c)); // → new-access / new-refresh
 		mockVisitors((c) => (retried = c), 200); // retry with the fresh token
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]); // Id lookup (new token)
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
@@ -397,7 +458,7 @@ describe("view_submission → register + DM", () => {
 			refresh_token: "new-refresh",
 		});
 
-		expect(posts[0].text).toBe(SUCCESS_TEXT);
+		expect(posts[0].text).toBe(`${SUCCESS_TEXT}\n*Nexudus ID:* 42`);
 	});
 
 	it("DMs a friendly failure (no jargon) when the refresh itself fails; nothing to the channel", async () => {
@@ -443,6 +504,7 @@ describe("view_submission → register + DM", () => {
 		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors();
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
 		mockSlack("chat.postMessage", (b) => posts.push(b), { ok: false, error: "cannot_dm_user" }); // DM fails
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log still goes out
 
@@ -469,6 +531,7 @@ describe("view_submission → register + DM", () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
 		mockSlack("chat.postMessage"); // DM
 		mockSlack("chat.postMessage"); // channel log
 
@@ -517,6 +580,7 @@ describe("view_submission → register + DM", () => {
 		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
@@ -542,6 +606,7 @@ describe("view_submission → register + DM", () => {
 		const posts: any[] = [];
 		mockUserInfo({ ok: false, error: "missing_scope" });
 		mockVisitors((c) => (visitor = c));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
@@ -702,16 +767,8 @@ describe("admin config → log channel", () => {
 
 describe("delete button → remove visitor", () => {
 	const RESPOND_BASE = "https://hooks.slack.test";
-	const REF = JSON.stringify({ e: "jane.doe@gmail.com", a: ARRIVAL_UTC });
 
 	beforeEach(seed);
-
-	function mockList(records: unknown[], envelope: (r: unknown[]) => unknown = (r) => ({ Records: r })) {
-		fetchMock
-			.get(NEXUDUS_BASE)
-			.intercept({ path: "/api/public/visitors/my", method: "GET", query: { showUpcoming: "true" } })
-			.reply(200, JSON.stringify(envelope(records)));
-	}
 
 	function mockDelete(id: number, status = 200) {
 		fetchMock
@@ -730,163 +787,76 @@ describe("delete button → remove visitor", () => {
 			});
 	}
 
-	async function clickDelete(): Promise<Response> {
+	// The button carries just the Nexudus Id captured at registration.
+	async function clickDeleteById(id: number, messageText: string): Promise<Response> {
 		return run(
 			await slackRequest(
 				"/slack/interactivity",
 				blockActionsBody("delete_visitor", "trig-del", {
-					value: REF,
+					value: JSON.stringify({ id }),
 					responseUrl: `${RESPOND_BASE}/respond`,
+					messageText,
 				}),
 			),
 		);
 	}
 
-	it("deletes the newest exact email+arrival match and confirms with the DELETED RECORD's details", async () => {
-		// Id 9 matches by ISO ExpectedArrival (no UTC field), Id 12 via
-		// UtcExpectedArrival in the legacy /Date(ms)/ form (its space-local
-		// ExpectedArrival is ignored — the UTC field wins); Id 20 is newer but a
-		// different visit, so the exact pool {9, 12} wins.
-		mockList([
-			{ Id: 7, Email: "other@example.net", ExpectedArrival: ARRIVAL_UTC },
-			{ Id: 9, Email: "jane.doe@gmail.com", FullName: "Jane Doe", ExpectedArrival: ARRIVAL_UTC },
-			{
-				Id: 12,
-				Email: "Jane.Doe@gmail.com",
-				FullName: "Jane Doe",
-				ExpectedArrival: "2026-07-20T15:30:00",
-				UtcExpectedArrival: `/Date(${ARRIVAL_EPOCH * 1000})/`,
-				CustomerNotes: "Submitted via Slack by Vinay Hiremath",
-			},
-			{ Id: 20, Email: "jane.doe@gmail.com", FullName: "Jane Doe", ExpectedArrival: "2026-08-01T09:00:00" },
-		]);
-		mockDelete(12);
+	it("deletes by the captured Id (no /my lookup) and confirms by restyling the clicked message", async () => {
+		// The button carries the exact Nexudus Id, so deletion is a direct DELETE by
+		// Id and the 🗑️ confirmation is the ✅ message restyled — the only place the
+		// Notes / Submitted-by lines survive (the list API omits them). No mockList:
+		// asserting no /my call is made on this path.
+		const clicked = SUCCESS_TEXT + "\n*Nexudus ID:* 42"; // exactly what the ✅ posts
+		mockDelete(42);
 		let respond: any;
 		mockRespond((b) => (respond = b));
 
-		const res = await clickDelete();
+		const res = await clickDeleteById(42, clicked);
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("");
 		expect(respond.replace_original).toBe(true);
-		// The confirmation is built from record 12 itself — including its ID — not
-		// from the clicked message's text. The "Submitted via Slack by" note line
-		// is parsed back into a Submitted-by line, with the Nexudus ID below it.
+		// Header swapped, the three identifying lines struck, the invite note dropped
+		// (it no longer applies), everything else — including Notes and Submitted by
+		// — carried through verbatim.
 		expect(respond.text).toBe(
 			[
 				"🗑️ *Registration deleted*",
-				"*Name:* Jane Doe",
-				"*Email:* Jane.Doe@gmail.com",
-				`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
-				"*Submitted by:* Vinay Hiremath",
-				"*Nexudus ID:* 12",
-			].join("\n"),
-		);
-	});
-
-	it("ignores a space-local ExpectedArrival coincidence when UtcExpectedArrival parses (no DELETE call)", async () => {
-		// The record's real instant (UtcExpectedArrival) is an hour earlier — its
-		// naive ExpectedArrival string only *looks* like the sent UTC value.
-		// Trusting it would delete a different visit for the same email.
-		mockList([
-			{
-				Id: 14,
-				Email: "jane.doe@gmail.com",
-				ExpectedArrival: ARRIVAL_UTC,
-				UtcExpectedArrival: `/Date(${(ARRIVAL_EPOCH - 3600) * 1000})/`,
-			},
-		]);
-		let respond: any;
-		mockRespond((b) => (respond = b));
-
-		const res = await clickDelete();
-		expect(res.status).toBe(200);
-		expect(respond.replace_original).toBe(false);
-		expect(respond.response_type).toBe("ephemeral");
-		expect(respond.text).toContain("nothing was deleted");
-	});
-
-	it("refuses to delete when the email matches but no arrival does (no DELETE call)", async () => {
-		mockList([
-			{ Id: 3, Email: "jane.doe@gmail.com", ExpectedArrival: "2026-01-01T00:00:00" },
-			{ Id: 5, Email: "jane.doe@gmail.com", ExpectedArrival: "not-a-date" },
-		]);
-		let respond: any;
-		mockRespond((b) => (respond = b));
-
-		const res = await clickDelete();
-		expect(res.status).toBe(200);
-		expect(respond.replace_original).toBe(false);
-		expect(respond.response_type).toBe("ephemeral");
-		expect(respond.text).toContain("nothing was deleted");
-		expect(respond.text).toContain("svc@example.com");
-	});
-
-	it("handles a bare-array list body (no Records envelope)", async () => {
-		mockList([{ Id: 9, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }], (r) => r);
-		mockDelete(9);
-		let respond: any;
-		mockRespond((b) => (respond = b));
-
-		const res = await clickDelete();
-		expect(res.status).toBe(200);
-		expect(respond.text).toContain("🗑️ *Registration deleted*");
-		expect(respond.text).toContain("*Nexudus ID:* 9");
-	});
-
-	it("mirrors every ✅ summary line in the 🗑️ confirmation, parsed back from CustomerNotes", async () => {
-		mockList([
-			{
-				Id: 31,
-				Email: "jane.doe@gmail.com",
-				FullName: "Jane Doe",
-				PhoneNumber: "+44 7700 900123",
-				ExpectedArrival: ARRIVAL_UTC,
-				CustomerNotes: "Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access",
-			},
-		]);
-		mockDelete(31);
-		let respond: any;
-		mockRespond((b) => (respond = b));
-
-		const res = await clickDelete();
-		expect(res.status).toBe(200);
-		expect(respond.text).toBe(
-			[
-				"🗑️ *Registration deleted*",
-				"*Name:* Jane Doe",
-				"*Email:* jane.doe@gmail.com",
+				"~*Name:* Jane Doe~",
+				"~*Email:* jane.doe@gmail.com~",
 				"*Phone:* +44 7700 900123",
-				`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
+				`~*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)~`,
 				"*Visiting:* Sam",
 				"*Notes:* Needs step-free access",
 				"*Submitted by:* Vinay Hiremath",
-				"*Nexudus ID:* 31",
+				"*Nexudus ID:* 42",
 			].join("\n"),
 		);
+		expect(respond.text).not.toContain("receive an invite"); // note gone
 	});
 
-	it("reports already-deleted (ephemeral) when no record matches; no DELETE call", async () => {
-		mockList([{ Id: 7, Email: "other@example.net", ExpectedArrival: ARRIVAL_UTC }]);
+	it("reports 'may already be deleted' (ephemeral) when the Id delete 404s", async () => {
+		mockDelete(42, 404); // the other copy (DM vs channel) already removed it
 		let respond: any;
 		mockRespond((b) => (respond = b));
 
-		const res = await clickDelete();
+		const res = await clickDeleteById(42, "✅ *Visitor registered*\n*Nexudus ID:* 42");
 		expect(res.status).toBe(200);
 		expect(respond.replace_original).toBe(false);
 		expect(respond.response_type).toBe("ephemeral");
 		expect(respond.text).toContain("may already be deleted");
+		expect(respond.text).toContain("contact svc@example.com");
 	});
 
 	it("reports a delete failure (ephemeral) when the DELETE call errors", async () => {
-		mockList([{ Id: 9, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockDelete(9, 500);
+		mockDelete(42, 500);
 		let respond: any;
 		mockRespond((b) => (respond = b));
 
-		const res = await clickDelete();
+		const res = await clickDeleteById(42, "✅ *Visitor registered*\n*Nexudus ID:* 42");
 		expect(res.status).toBe(200);
 		expect(respond.replace_original).toBe(false);
 		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("Deleting failed");
 		expect(respond.text).toContain("svc@example.com");
 	});
 

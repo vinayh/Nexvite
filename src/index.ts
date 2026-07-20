@@ -296,11 +296,10 @@ function settingsBlocks(currentChannel?: string): unknown[] {
 	];
 }
 
-// The App Home tab: the button entry point, visible to every workspace user
-// who opens the app. The tab itself can't open a modal — but its button click
-// arrives as block_actions with a trigger_id, which is what views.open needs.
-// `config` is present only for users who may configure the log channel; it adds
-// the admin settings block.
+// The App Home tab: the button entry point for every workspace user. The tab
+// can't open a modal itself, but its button click arrives as block_actions with
+// a trigger_id (what views.open needs). `config` adds the admin settings block
+// for users who may configure the log channel.
 function homeView(config?: { currentChannel?: string }) {
 	const blocks: unknown[] = [
 		{ type: "header", text: { type: "plain_text", text: "Visitor registration" } },
@@ -327,11 +326,10 @@ function homeView(config?: { currentChannel?: string }) {
 	return { type: "home", blocks };
 }
 
-// (Re)publish the Home tab for one user — done on every app_home_opened and
-// after a channel change. Admins/allowlisted users additionally get the log
-// channel picker, seeded with the currently effective channel. Pass `allowed`
-// to reuse a permission already computed for this request (avoids a second
-// users.info call); omit it to look the permission up here.
+// (Re)publish the Home tab for one user, on app_home_opened and after a channel
+// change. Configurers also get the channel picker, seeded with the effective
+// channel. Pass `allowed` to reuse an already-computed permission, else it's
+// looked up here.
 async function publishHome(env: Env, userId: string, allowed?: boolean): Promise<void> {
 	const mayConfigure = allowed ?? (await canConfigure(env, userId));
 	const config = mayConfigure ? { currentChannel: await readLogChannel(env) } : undefined;
@@ -434,10 +432,8 @@ function nexudusBase(env: Env): string {
 }
 
 // Run an authenticated Nexudus request: current token first; on a 401 refresh
-// once (rotating the record, persisted to KV) and retry. Never throws. Returns
-// null when auth couldn't be established or the network failed — the caller
-// turns that into a friendly member-facing failure, while the operational
-// detail goes to the log (it's not actionable for members).
+// once (rotating the KV record) and retry. Never throws — returns null on an
+// auth/network failure, which the caller turns into a member-facing message.
 async function nexudusFetch(
 	env: Env,
 	doFetch: (base: string, accessToken: string) => Promise<Response>,
@@ -502,14 +498,13 @@ interface VisitorInput {
 	submittedBy: string;
 }
 
-// CustomerNotes line prefixes — written by registerVisitor, parsed back out
-// by deletedSummary so the 🗑️ message can mirror the ✅ summary's lines.
+// CustomerNotes line prefixes written by registerVisitor — reception's view, in
+// the portal, of who submitted the visitor and who they're visiting.
 const NOTE_SUBMITTED = "Submitted via Slack by ";
 const NOTE_VISITING = "Visiting: ";
 
-// mrkdwn summary of what was submitted, shown under both the ✅ and ❌ headers
-// (and in the channel log). Blank optional fields are omitted; arrival is
-// space-local, matching what the portal displays.
+// mrkdwn summary of what was submitted, shown under every result header (and in
+// the channel log). Blank optional fields are omitted; arrival is space-local.
 function submissionSummary(env: Env, input: VisitorInput): string {
 	const lines: string[] = [];
 	if (input.fullName) lines.push(`*Name:* ${mrkdwnEscape(input.fullName)}`);
@@ -522,12 +517,13 @@ function submissionSummary(env: Env, input: VisitorInput): string {
 	return lines.join("\n");
 }
 
-// What the delete button needs to find the visitor again at click time: the
-// create response has no Id, so the button carries the identifying fields and
-// the click handler looks the Id up in the visitor list (README, delete flow).
+// Top line of the ✅ confirmation; dropped from the 🗑️ message on deletion.
+const INVITE_NOTE = "_The visitor should receive an invite from the Nexudus platform shortly at the email below._";
+
+// The delete button's payload: the Nexudus Id captured at registration, which
+// the click handler deletes directly (README, delete flow).
 interface DeleteRef {
-	e: string; // email
-	a: string; // ExpectedArrival exactly as sent to Nexudus (naive UTC)
+	id: number;
 }
 
 // Success message blocks: the summary plus a Delete button (with a Slack-side
@@ -573,9 +569,8 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	if (!input.fullName || !input.email || input.arrivalEpoch == null) {
 		return failed("Full name, email and expected arrival are all required.");
 	}
-	// Nexudus interprets the naive ExpectedArrival as UTC and shows it in the
-	// space's local timezone in the portal, so send the UTC wall-clock (the
-	// summary echoes the space-local time, matching what the portal shows).
+	// Nexudus reads the naive ExpectedArrival as UTC (shown space-local in the
+	// portal), so send UTC wall-clock; the summary echoes the space-local time.
 	const arrivalUtc = toWallClock(input.arrivalEpoch, "UTC");
 
 	// All registrations go through one account, so CustomerNotes is reception's
@@ -611,19 +606,65 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 		return failed(`Nexudus rejected the registration: ${detail ? mrkdwnEscape(detail) : `HTTP ${regRes.status}`}`);
 	}
 
-	const message = `✅ *Visitor registered*\n${summary}`;
-	return { ok: true, message, blocks: successBlocks(message, { e: input.email, a: arrivalUtc }) };
+	// The create returns no Id (README), so confirm by finding the record in the
+	// account's own list — that also yields the Id the Delete button needs. If it
+	// can't be found the POST may still have landed, so warn softly (DM only, no
+	// channel log) and steer away from a blind retry rather than claim success.
+	const id = await lookupVisitorId(env, input.email, arrivalUtc);
+	if (id == null) {
+		console.warn("registration unconfirmed — visitor Id lookup found no match"); // no PII
+		return {
+			ok: false,
+			message:
+				`⚠️ *Registration submitted — but not confirmed*\n` +
+				`We sent this to the visitor system but couldn't confirm it went through. It may already be registered — before submitting again, please check with ${await nexudusContact(env)} to avoid a duplicate.\n${summary}`,
+		};
+	}
+
+	const message = `✅ *Visitor registered*\n${INVITE_NOTE}\n${summary}\n*Nexudus ID:* ${id}`;
+	return { ok: true, message, blocks: successBlocks(message, { id }) };
+}
+
+// Delay before the single retry below; it runs in the background, so it's free.
+const LOOKUP_RETRY_MS = 1000;
+
+// Resolve the new registration's Id from the account's own list (the only read
+// route — README), matching on email + exact visit instant, newest wins. Retries
+// once for replication lag; null if still not found.
+async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Promise<number | null> {
+	const sentMs = Date.parse(`${arrivalUtc}Z`);
+	const attempt = async (): Promise<number | null> => {
+		const res = await nexudusFetch(env, (base, accessToken) =>
+			fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
+				headers: { Authorization: `Bearer ${accessToken}` },
+			}),
+		);
+		if (!res?.ok) return null;
+		// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
+		// space-local, so a visit one offset-hour away could match by coincidence.
+		const matches = listRecords(await res.json().catch(() => null)).filter(
+			(r): r is VisitorRecord =>
+				typeof (r as { Id?: unknown })?.Id === "number" &&
+				typeof (r as { Email?: unknown })?.Email === "string" &&
+				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase() &&
+				(parseNexudusInstant((r as VisitorRecord).UtcExpectedArrival) ??
+					parseNexudusInstant((r as VisitorRecord).ExpectedArrival)) === sentMs,
+		);
+		return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
+	};
+	const id = await attempt();
+	if (id != null) return id;
+	await new Promise((resolve) => setTimeout(resolve, LOOKUP_RETRY_MS));
+	return attempt();
 }
 
 // ---------------------------------------------------------------------------
 // Deletion (the ✅ message's Delete button)
 // ---------------------------------------------------------------------------
 //
-// The create response carries no visitor Id, so deletion is a click-time
-// lookup via GET /api/public/visitors/my — the authenticated customer's own
-// registrations, which (single-account model, see README) is exactly the set this
-// Worker creates. Match strictly on email + visit instant, DELETE the newest
-// match. Docs: learn.nexudus.com/api/endpoints/visitors/list-visitors.
+// The button carries the Nexudus Id captured at registration, so a click is a
+// direct DELETE /api/public/visitors/{id} — no lookup, no duplicate ambiguity.
+// The shared parsing below also backs the registration-time Id lookup.
 
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
 // (naive ones are treated as UTC — matching what we send) and the legacy
@@ -652,113 +693,62 @@ function listRecords(body: unknown): unknown[] {
 interface VisitorRecord {
 	Id: number;
 	Email: string;
-	FullName?: unknown;
-	PhoneNumber?: unknown;
 	ExpectedArrival?: unknown;
 	UtcExpectedArrival?: unknown;
-	CustomerNotes?: unknown;
 }
 
-// Look up the visitor to delete among the account's own registrations. Returns
-// null when the list itself couldn't be fetched. Only exact email+arrival
-// matches qualify — deleting a best guess is how the *wrong* duplicate would
-// vanish without the member noticing. Among exact duplicates (double-submit),
-// the newest Id wins; any copy is the right one to remove there.
-// showUpcoming keeps the payload bounded — a visitor whose arrival already
-// passed can't be looked up (deleting would be moot).
-async function findVisitor(
-	env: Env,
-	ref: DeleteRef,
-): Promise<{ match: VisitorRecord | null; emailMatches: number } | null> {
-	const res = await nexudusFetch(env, (base, accessToken) =>
-		fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
-			headers: { Authorization: `Bearer ${accessToken}` },
-		}),
-	);
-	if (!res?.ok) return null;
-	const records = listRecords(await res.json().catch(() => null));
-	const byEmail = records.filter(
-		(r): r is VisitorRecord =>
-			typeof (r as { Id?: unknown })?.Id === "number" &&
-			typeof (r as { Email?: unknown })?.Email === "string" &&
-			(r as { Email: string }).Email.toLowerCase() === ref.e.toLowerCase(),
-	);
-	// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
-	// space-local, so consulting it alongside the UTC field would let a visit
-	// one offset-hour away match by string coincidence. It's the fallback only
-	// when no UTC field is usable.
-	const sentMs = Date.parse(`${ref.a}Z`);
-	const exact = byEmail.filter(
-		(r) => (parseNexudusInstant(r.UtcExpectedArrival) ?? parseNexudusInstant(r.ExpectedArrival)) === sentMs,
-	);
-	const match = exact.length > 0 ? exact.reduce((a, b) => (b.Id > a.Id ? b : a)) : null;
-	return { match, emailMatches: byEmail.length };
+// The 🗑️ confirmation: the clicked ✅ message restyled — header swapped,
+// identifying lines struck, invite note dropped. Reusing it keeps the Notes /
+// Submitted-by lines the list API omits (safe because delete-by-Id matched this
+// exact record). Empty/foreign text → bare header.
+function deletedFromMessage(messageText: string | undefined): string {
+	if (!messageText) return "🗑️ *Registration deleted*";
+	return messageText
+		.split("\n")
+		.filter((line) => line !== INVITE_NOTE) // the invite no longer applies
+		.map((line) => {
+			if (line === "✅ *Visitor registered*") return "🗑️ *Registration deleted*";
+			return /^\*(Name|Email|Arrival):\*/.test(line) ? `~${line}~` : line;
+		})
+		.join("\n");
 }
 
-// The 🗑️ confirmation is built from the record Nexudus actually deleted — not
-// from the clicked message — so a mismatch could never pass unnoticed. It
-// mirrors the ✅ summary's lines (CustomerNotes parsed back into Visiting /
-// Notes / Submitted by), with the Nexudus ID added as the one unambiguous
-// identifier between duplicates.
-function deletedSummary(env: Env, r: VisitorRecord): string {
-	const lines = ["🗑️ *Registration deleted*"];
-	if (typeof r.FullName === "string" && r.FullName) lines.push(`*Name:* ${mrkdwnEscape(r.FullName)}`);
-	lines.push(`*Email:* ${mrkdwnEscape(r.Email)}`);
-	if (typeof r.PhoneNumber === "string" && r.PhoneNumber) lines.push(`*Phone:* ${mrkdwnEscape(r.PhoneNumber)}`);
-	const ms = parseNexudusInstant(r.UtcExpectedArrival) ?? parseNexudusInstant(r.ExpectedArrival);
-	if (ms != null) lines.push(arrivalLine(env, ms / 1000));
-	const noteLines = typeof r.CustomerNotes === "string" ? r.CustomerNotes.split("\n") : [];
-	const submittedBy = noteLines.find((l) => l.startsWith(NOTE_SUBMITTED))?.slice(NOTE_SUBMITTED.length);
-	const visiting = noteLines.find((l) => l.startsWith(NOTE_VISITING))?.slice(NOTE_VISITING.length);
-	const rest = noteLines.filter((l) => !l.startsWith(NOTE_SUBMITTED) && !l.startsWith(NOTE_VISITING)).join("\n");
-	if (visiting) lines.push(`*Visiting:* ${mrkdwnEscape(visiting)}`);
-	if (rest) lines.push(`*Notes:* ${mrkdwnEscape(rest)}`);
-	if (submittedBy) lines.push(`*Submitted by:* ${mrkdwnEscape(submittedBy)}`);
-	lines.push(`*Nexudus ID:* ${r.Id}`);
-	return lines.join("\n");
-}
-
-// Delete the visitor the button points at. Returns the member-facing outcome.
-// Never throws — a network failure must still produce feedback for the clicker.
-async function deleteVisitor(env: Env, ref: DeleteRef): Promise<{ ok: boolean; text: string }> {
+// Delete the registration by its Id and return the member-facing outcome. Never
+// throws — the clicker always gets feedback. messageText is the clicked ✅
+// message, restyled into the 🗑️ confirmation (see deletedFromMessage).
+async function deleteVisitor(env: Env, id: number, messageText?: string): Promise<{ ok: boolean; text: string }> {
 	// Failure fallback is the Nexudus account email (see nexudusContact), not
 	// "the portal" — members can't see these registrations in their own login.
 	const contact = await nexudusContact(env);
-	const found = await findVisitor(env, ref);
-	if (!found) {
-		return {
-			ok: false,
-			text: `⚠️ Couldn't check the visitor list just now — nothing was deleted. Please try again — if it keeps failing, contact ${contact}.`,
-		};
-	}
-	const { match } = found;
-	if (!match) {
-		return {
-			ok: false,
-			text:
-				found.emailMatches > 0
-					? `⚠️ There are upcoming registrations for this email, but none with this exact visit time — so nothing was deleted. Contact ${contact} to remove the right one.`
-					: `⚠️ Couldn't find this registration — it may already be deleted, or the visit time has passed. If it still needs removing, contact ${contact}.`,
-		};
-	}
 	const res = await nexudusFetch(env, (base, accessToken) =>
-		fetch(`${base}/api/public/visitors/${match.Id}`, {
+		fetch(`${base}/api/public/visitors/${id}`, {
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${accessToken}` },
 		}),
 	);
 	if (!res?.ok) {
+		if (res && (res.status === 404 || res.status === 410)) {
+			return {
+				ok: false,
+				text: `⚠️ Couldn't find this registration — it may already be deleted. If it still needs removing, contact ${contact}.`,
+			};
+		}
 		if (res) console.warn(`visitor delete failed: HTTP ${res.status}`); // status only, no PII
 		return { ok: false, text: `⚠️ Deleting failed — please contact ${contact} to remove the visitor.` };
 	}
-	return { ok: true, text: deletedSummary(env, match) };
+	return { ok: true, text: deletedFromMessage(messageText) };
 }
 
 // Handle a Delete click: delete in Nexudus, then report via the clicked
-// message's response_url — replacing it with the deleted record's own details
+// message's response_url — replacing it with the deleted registration's details
 // on success, or an ephemeral note to the clicker on failure.
-async function handleDeleteClick(env: Env, ref: DeleteRef, responseUrl: string): Promise<void> {
-	const { ok, text } = await deleteVisitor(env, ref);
+async function handleDeleteClick(
+	env: Env,
+	id: number,
+	responseUrl: string,
+	messageText?: string,
+): Promise<void> {
+	const { ok, text } = await deleteVisitor(env, id, messageText);
 	try {
 		const res = await fetch(responseUrl, {
 			method: "POST",
@@ -852,6 +842,7 @@ export default {
 			trigger_id?: string;
 			response_url?: string;
 			actions?: Array<{ action_id?: string; value?: string; selected_conversation?: string }>;
+			message?: { text?: string }; // present on block_actions from a message (delete-by-Id)
 			view?: { callback_id?: string; state?: ViewState };
 		};
 		try {
@@ -889,15 +880,15 @@ export default {
 					})(),
 				);
 			} else if (clickedDelete?.value && payload.response_url) {
-				let ref: DeleteRef | null = null;
+				let id: number | null = null;
 				try {
-					const parsed = JSON.parse(clickedDelete.value) as Partial<DeleteRef>;
-					if (typeof parsed.e === "string" && typeof parsed.a === "string") ref = { e: parsed.e, a: parsed.a };
+					const parsed = JSON.parse(clickedDelete.value) as { id?: unknown };
+					if (typeof parsed.id === "number") id = parsed.id;
 				} catch {
 					// stale/foreign button value — ignore
 				}
-				if (ref) {
-					ctx.waitUntil(handleDeleteClick(env, ref, payload.response_url));
+				if (id != null) {
+					ctx.waitUntil(handleDeleteClick(env, id, payload.response_url, payload.message?.text));
 				}
 			}
 			return new Response("", { status: 200 });
