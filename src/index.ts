@@ -691,18 +691,20 @@ interface VisitorRecord {
 	UtcExpectedArrival?: unknown;
 }
 
-// The 🗑️ confirmation: the clicked ✅ message restyled — header swapped,
-// identifying lines struck, invite note dropped. Reusing it keeps the Notes /
-// Submitted-by lines the list API omits (safe because delete-by-Id matched this
-// exact record). Empty/foreign text → bare header.
+// The 🗑️ confirmation: the clicked ✅ message restyled — header swapped, the
+// visitor's own fields struck, invite note dropped. Reusing it keeps the
+// Submitted-by / Nexudus ID lines (and any the list API omits) — safe because
+// delete-by-Id matched this exact record. Empty/foreign text → bare header.
 function deletedFromMessage(messageText: string | undefined): string {
 	if (!messageText) return "🗑️ *Registration deleted*";
 	return messageText
 		.split("\n")
 		.filter((line) => line !== INVITE_NOTE) // the invite no longer applies
 		.map((line) => {
-			if (line === "✅ *Visitor registered*") return "🗑️ *Registration deleted*";
-			return /^\*(Name|Email|Arrival):\*/.test(line) ? `~${line}~` : line;
+			// Match the header text, not the leading ✅ — Slack fully-qualifies the
+			// emoji on round-trip (appends a variation selector), so === would miss.
+			if (line.includes("*Visitor registered*")) return "🗑️ *Registration deleted*";
+			return /^\*(Name|Email|Phone|Arrival|Visiting|Notes):\*/.test(line) ? `~${line}~` : line;
 		})
 		.join("\n");
 }

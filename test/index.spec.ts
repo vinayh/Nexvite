@@ -130,6 +130,21 @@ function blockActionsBody(
 		messageText?: string;
 	} = {},
 ): string {
+	// As Slack delivers the clicked message: verbatim content in `blocks`, a `text`
+	// fallback with newlines collapsed to spaces, and the ✅ (U+2705) fully-qualified
+	// with a trailing variation selector (U+FE0F). The newline collapse and emoji
+	// requalification are exactly what naive restyling trips on — this shape guards both.
+	let message: object | undefined;
+	if (extra.messageText != null) {
+		const returned = extra.messageText.replace(/✅/g, "✅️");
+		message = {
+			text: returned.replace(/\n/g, " "),
+			blocks: [
+				{ type: "section", text: { type: "mrkdwn", text: returned } },
+				{ type: "actions", elements: [{ type: "button", action_id: "delete_visitor" }] },
+			],
+		};
+	}
 	const payload = {
 		type: "block_actions",
 		user: { id: extra.userId ?? "U1", name: "Vinay Hiremath" },
@@ -142,19 +157,7 @@ function blockActionsBody(
 			},
 		],
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
-		// As Slack delivers it: verbatim content in `blocks`, and a `text` fallback
-		// with newlines collapsed to spaces (restyling that is the bug guarded here).
-		...(extra.messageText != null
-			? {
-					message: {
-						text: extra.messageText.replace(/\n/g, " "),
-						blocks: [
-							{ type: "section", text: { type: "mrkdwn", text: extra.messageText } },
-							{ type: "actions", elements: [{ type: "button", action_id: "delete_visitor" }] },
-						],
-					},
-				}
-			: {}),
+		...(message ? { message } : {}),
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
 }
@@ -834,17 +837,17 @@ describe("delete button → remove visitor", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("");
 		expect(respond.replace_original).toBe(true);
-		// Header swapped, Name/Email/Arrival struck, invite note dropped, the rest
-		// verbatim with line breaks intact — sourced from blocks, not the collapsed
-		// fallback text (see blockActionsBody).
+		// Header swapped (matched by text — Slack requalifies the ✅), every visitor
+		// field struck, invite note dropped, Submitted-by + ID kept. Line breaks
+		// intact because it's sourced from blocks, not the collapsed fallback text.
 		const deletedText = [
 			"🗑️ *Registration deleted*",
 			"~*Name:* Jane Doe~",
 			"~*Email:* jane.doe@gmail.com~",
-			"*Phone:* +44 7700 900123",
+			"~*Phone:* +44 7700 900123~",
 			`~*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)~`,
-			"*Visiting:* Sam",
-			"*Notes:* Needs step-free access",
+			"~*Visiting:* Sam~",
+			"~*Notes:* Needs step-free access~",
 			"*Submitted by:* Vinay Hiremath",
 			"*Nexudus ID:* 42",
 		].join("\n");
