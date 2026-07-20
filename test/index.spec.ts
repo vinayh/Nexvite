@@ -142,7 +142,19 @@ function blockActionsBody(
 			},
 		],
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
-		...(extra.messageText != null ? { message: { text: extra.messageText } } : {}),
+		// As Slack delivers it: verbatim content in `blocks`, and a `text` fallback
+		// with newlines collapsed to spaces (restyling that is the bug guarded here).
+		...(extra.messageText != null
+			? {
+					message: {
+						text: extra.messageText.replace(/\n/g, " "),
+						blocks: [
+							{ type: "section", text: { type: "mrkdwn", text: extra.messageText } },
+							{ type: "actions", elements: [{ type: "button", action_id: "delete_visitor" }] },
+						],
+					},
+				}
+			: {}),
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
 }
@@ -822,22 +834,26 @@ describe("delete button → remove visitor", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("");
 		expect(respond.replace_original).toBe(true);
-		// Header swapped, the three identifying lines struck, the invite note dropped
-		// (it no longer applies), everything else — including Notes and Submitted by
-		// — carried through verbatim.
-		expect(respond.text).toBe(
-			[
-				"🗑️ *Registration deleted*",
-				"~*Name:* Jane Doe~",
-				"~*Email:* jane.doe@gmail.com~",
-				"*Phone:* +44 7700 900123",
-				`~*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)~`,
-				"*Visiting:* Sam",
-				"*Notes:* Needs step-free access",
-				"*Submitted by:* Vinay Hiremath",
-				"*Nexudus ID:* 42",
-			].join("\n"),
-		);
+		// Header swapped, Name/Email/Arrival struck, invite note dropped, the rest
+		// verbatim with line breaks intact — sourced from blocks, not the collapsed
+		// fallback text (see blockActionsBody).
+		const deletedText = [
+			"🗑️ *Registration deleted*",
+			"~*Name:* Jane Doe~",
+			"~*Email:* jane.doe@gmail.com~",
+			"*Phone:* +44 7700 900123",
+			`~*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)~`,
+			"*Visiting:* Sam",
+			"*Notes:* Needs step-free access",
+			"*Submitted by:* Vinay Hiremath",
+			"*Nexudus ID:* 42",
+		].join("\n");
+		// Replacement renders via blocks (the restyled section), Delete button gone.
+		expect(respond.blocks).toHaveLength(1);
+		expect(respond.blocks[0].type).toBe("section");
+		expect(respond.blocks[0].text.text).toBe(deletedText);
+		expect(JSON.stringify(respond.blocks)).not.toContain("delete_visitor"); // button dropped
+		expect(respond.text).toBe(deletedText); // notification fallback
 		expect(respond.text).not.toContain("receive an invite"); // note gone
 	});
 

@@ -733,16 +733,32 @@ async function deleteVisitor(env: Env, id: number, messageText?: string): Promis
 	return { ok: true, text: deletedFromMessage(messageText) };
 }
 
-// Handle a Delete click: delete in Nexudus, then report via the clicked
-// message's response_url — replacing it with the deleted registration's details
-// on success, or an ephemeral note to the clicker on failure.
-async function handleDeleteClick(env: Env, id: number, responseUrl: string, messageText?: string): Promise<void> {
-	const { ok, text } = await deleteVisitor(env, id, messageText);
+type SlackMessage = { text?: string; blocks?: unknown[] };
+
+// The clicked message's content, from its first section block — verbatim mrkdwn,
+// newlines intact. message.text is only the notification fallback (newlines
+// collapsed), so it can't be restyled line-by-line; used only if blocks absent.
+function messageSectionText(message?: SlackMessage): string | undefined {
+	for (const block of message?.blocks ?? []) {
+		const section = block as { type?: string; text?: { text?: unknown } };
+		if (section.type === "section" && typeof section.text?.text === "string") return section.text.text;
+	}
+	return message?.text;
+}
+
+// Handle a Delete click: delete in Nexudus, then report via the clicked message's
+// response_url — on success replace it with the restyled section (Delete button
+// dropped), on failure send the clicker an ephemeral note.
+async function handleDeleteClick(env: Env, id: number, responseUrl: string, message?: SlackMessage): Promise<void> {
+	const { ok, text } = await deleteVisitor(env, id, messageSectionText(message));
 	try {
+		const body = ok
+			? { replace_original: true, text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }
+			: { replace_original: false, response_type: "ephemeral", text };
 		const res = await fetch(responseUrl, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(ok ? { replace_original: true, text } : { replace_original: false, response_type: "ephemeral", text }),
+			body: JSON.stringify(body),
 		});
 		if (!res.ok) console.warn(`response_url post failed: HTTP ${res.status}`);
 	} catch (err) {
@@ -836,7 +852,7 @@ export default {
 			trigger_id?: string;
 			response_url?: string;
 			actions?: Array<{ action_id?: string; value?: string; selected_conversation?: string }>;
-			message?: { text?: string }; // present on block_actions from a message (delete-by-Id)
+			message?: SlackMessage; // present on block_actions from a message (delete-by-Id)
 			view?: { id?: string; callback_id?: string; state?: ViewState };
 		};
 		try {
@@ -882,7 +898,7 @@ export default {
 					// stale/foreign button value — ignore
 				}
 				if (id != null) {
-					ctx.waitUntil(handleDeleteClick(env, id, payload.response_url, payload.message?.text));
+					ctx.waitUntil(handleDeleteClick(env, id, payload.response_url, payload.message));
 				}
 			}
 			return new Response("", { status: 200 });
