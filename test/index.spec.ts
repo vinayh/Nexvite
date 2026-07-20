@@ -1,9 +1,4 @@
-import {
-	env,
-	createExecutionContext,
-	waitOnExecutionContext,
-	fetchMock,
-} from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import worker, { TOKEN_KEY, CHANNEL_KEY } from "../src/index";
 
@@ -59,13 +54,9 @@ function hex(buffer: ArrayBuffer): string {
 }
 
 async function sign(rawBody: string, timestamp: string): Promise<string> {
-	const key = await crypto.subtle.importKey(
-		"raw",
-		new TextEncoder().encode(SIGNING_SECRET),
-		{ name: "HMAC", hash: "SHA-256" },
-		false,
-		["sign"],
-	);
+	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(SIGNING_SECRET), { name: "HMAC", hash: "SHA-256" }, false, [
+		"sign",
+	]);
 	const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`v0:${timestamp}:${rawBody}`));
 	return `v0=${hex(mac)}`;
 }
@@ -89,10 +80,7 @@ async function slackRequest(
 	return new IncomingRequest(`https://worker.example${path}`, { method: "POST", headers, body: rawBody });
 }
 
-async function run(
-	request: Request<unknown, IncomingRequestCfProperties>,
-	envOverride: Env = testEnv,
-): Promise<Response> {
+async function run(request: Request<unknown, IncomingRequestCfProperties>, envOverride: Env = testEnv): Promise<Response> {
 	const ctx = createExecutionContext();
 	const response = await worker.fetch(request, envOverride, ctx);
 	await waitOnExecutionContext(ctx); // settle ctx.waitUntil() background work
@@ -108,10 +96,7 @@ const COMMAND_BODY = new URLSearchParams({
 	user_name: "vinay",
 }).toString();
 
-function submissionBody(
-	values?: Record<string, unknown>,
-	over: { type?: string; callback_id?: string } = {},
-): string {
+function submissionBody(values?: Record<string, unknown>, over: { type?: string; callback_id?: string; viewId?: string } = {}): string {
 	const defaults = {
 		full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
 		email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
@@ -124,6 +109,9 @@ function submissionBody(
 		type: over.type ?? "view_submission",
 		user: { id: "U1", name: "vinay" }, // `name` is the *username*; the full name comes from users.info
 		view: {
+			// `id` is present on a real submission; omit it to model the modal
+			// already being gone (then no views.update is attempted).
+			...(over.viewId ? { id: over.viewId } : {}),
 			callback_id: over.callback_id ?? "visitor_registration",
 			state: { values: values ?? defaults },
 		},
@@ -172,14 +160,8 @@ function headerGet(headers: unknown, name: string): string | undefined {
 
 // users.info lookup — used for the submitter's full name and for the admin
 // check (is_admin/is_owner). GET, unlike the POST methods.
-function mockUserInfo(
-	reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } },
-	user = "U1",
-) {
-	fetchMock
-		.get(SLACK_BASE)
-		.intercept({ path: "/api/users.info", method: "GET", query: { user } })
-		.reply(200, JSON.stringify(reply));
+function mockUserInfo(reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } }, user = "U1") {
+	fetchMock.get(SLACK_BASE).intercept({ path: "/api/users.info", method: "GET", query: { user } }).reply(200, JSON.stringify(reply));
 }
 
 function mockSlack(method: string, capture?: (body: any) => void, reply: object = { ok: true }) {
@@ -250,9 +232,7 @@ describe("rate limiting", () => {
 		// and the 21st is cut off with 429 (no outbound calls either way).
 		const statuses: number[] = [];
 		for (let i = 0; i < 21; i++) {
-			const res = await run(
-				await slackRequest("/slack/command", COMMAND_BODY, { omitSignature: true, ip: "203.0.113.9" }),
-			);
+			const res = await run(await slackRequest("/slack/command", COMMAND_BODY, { omitSignature: true, ip: "203.0.113.9" }));
 			statuses.push(res.status);
 		}
 		expect(statuses[0]).toBe(401);
@@ -328,7 +308,10 @@ describe("view_submission → register + DM", () => {
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
-		expect(await res.text()).toBe("");
+		// The ack swaps the modal for the "⏳ registering" placeholder in place.
+		const ack = JSON.parse(await res.text());
+		expect(ack.response_action).toBe("update");
+		expect(ack.view.blocks[0].text.text).toContain("Registering your visitor");
 
 		// Used the KV access token; no refresh happened, the record is unchanged.
 		expect(visitor?.auth).toBe("Bearer kv-access");
@@ -341,9 +324,7 @@ describe("view_submission → register + DM", () => {
 		expect(body[0].Email).toBe("jane.doe@gmail.com");
 		expect(body[0].PhoneNumber).toBe("+44 7700 900123");
 		expect(body[0].ExpectedArrival).toBe(ARRIVAL_UTC); // UTC, not space-local
-		expect(body[0].CustomerNotes).toBe(
-			"Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access",
-		);
+		expect(body[0].CustomerNotes).toBe("Submitted via Slack by Vinay Hiremath\nVisiting: Sam\nNeeds step-free access");
 
 		// The message ends with the Nexudus Id line; DM first, then the same
 		// summary to the visitors channel.
@@ -486,10 +467,7 @@ describe("view_submission → register + DM", () => {
 	it("DMs the friendly failure with the contact email when the network call itself fails", async () => {
 		let dm: any;
 		mockUserInfo();
-		fetchMock
-			.get(NEXUDUS_BASE)
-			.intercept({ path: "/api/public/visitors", method: "POST" })
-			.replyWithError(new Error("connection refused"));
+		fetchMock.get(NEXUDUS_BASE).intercept({ path: "/api/public/visitors", method: "POST" }).replyWithError(new Error("connection refused"));
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
@@ -617,10 +595,55 @@ describe("view_submission → register + DM", () => {
 	});
 
 	it("acks and ignores a submission with a foreign callback_id (no outbound calls)", async () => {
-		const res = await run(
-			await slackRequest("/slack/interactivity", submissionBody(undefined, { callback_id: "something_else" })),
-		);
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { callback_id: "something_else" })));
 		expect(res.status).toBe(200);
+	});
+
+	it("updates the open modal with the success result, on the same view id, when the submission carries one", async () => {
+		let update: any;
+		mockUserInfo();
+		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockSlack("views.update", (b) => (update = b));
+		mockSlack("chat.postMessage"); // DM
+		mockSlack("chat.postMessage"); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { viewId: "V123" })));
+		expect(res.status).toBe(200);
+		// The ack immediately swaps the modal for the "registering" placeholder…
+		expect(JSON.parse(await res.text()).response_action).toBe("update");
+		// …then the background work updates that same view to the ✅ result (no
+		// Delete button in the modal — that lives on the durable DM/channel message).
+		expect(update.view_id).toBe("V123");
+		expect(update.view.blocks[0].text.text).toBe(`${SUCCESS_TEXT}\n*Nexudus ID:* 42`);
+		expect(JSON.stringify(update.view.blocks)).not.toContain("delete_visitor");
+	});
+
+	it("updates the modal with the failure message too", async () => {
+		await env.TOKENS.delete(TOKEN_KEY); // undo the describe-level seed → connect failure before Nexudus
+		let update: any;
+		mockUserInfo();
+		mockSlack("views.update", (b) => (update = b));
+		mockSlack("chat.postMessage"); // DM only — no channel log on failure
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { viewId: "V123" })));
+		expect(res.status).toBe(200);
+		expect(update.view_id).toBe("V123");
+		expect(update.view.blocks[0].text.text).toContain("❌ *Registration failed*");
+	});
+
+	it("skips the modal update (still DMs) when the submission carries no view id", async () => {
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		// No mockSlack("views.update") — afterEach asserts none was attempted.
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(2);
 	});
 });
 
@@ -641,9 +664,7 @@ describe("App Home → button → modal", () => {
 		mockUserInfo(); // a non-admin, non-owner user (no is_admin/is_owner fields)
 		mockSlack("views.publish", (b) => (publish = b));
 
-		const res = await run(
-			await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "home" })),
-		);
+		const res = await run(await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "home" })));
 		expect(res.status).toBe(200);
 		expect(publish.user_id).toBe("U1");
 		expect(publish.view.type).toBe("home");
@@ -654,18 +675,13 @@ describe("App Home → button → modal", () => {
 	});
 
 	it("ignores app_home_opened for the Messages tab (no outbound calls)", async () => {
-		const res = await run(
-			await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "messages" })),
-		);
+		const res = await run(await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "messages" })));
 		expect(res.status).toBe(200); // afterEach asserts no views.publish happened
 	});
 
 	it("ignores a DM to the bot — the DM entry point is disabled (no outbound calls)", async () => {
 		const res = await run(
-			await slackRequest(
-				"/slack/events",
-				eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", text: "hi" }),
-			),
+			await slackRequest("/slack/events", eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", text: "hi" })),
 		);
 		expect(res.status).toBe(200);
 	});
@@ -699,10 +715,7 @@ describe("admin config → log channel", () => {
 	async function openHome(user = "U1", envOverride: Env = testEnv): Promise<any> {
 		let publish: any;
 		mockSlack("views.publish", (b) => (publish = b));
-		const res = await run(
-			await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user, tab: "home" })),
-			envOverride,
-		);
+		const res = await run(await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user, tab: "home" })), envOverride);
 		expect(res.status).toBe(200);
 		return publish;
 	}
@@ -736,10 +749,7 @@ describe("admin config → log channel", () => {
 		mockSlack("views.publish", (b) => (publish = b));
 
 		const res = await run(
-			await slackRequest(
-				"/slack/interactivity",
-				blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" }),
-			),
+			await slackRequest("/slack/interactivity", blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" })),
 		);
 		expect(res.status).toBe(200);
 		// Persisted to KV…
@@ -755,10 +765,7 @@ describe("admin config → log channel", () => {
 		mockSlack("views.publish"); // the re-publish still happens, just without the picker
 
 		const res = await run(
-			await slackRequest(
-				"/slack/interactivity",
-				blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" }),
-			),
+			await slackRequest("/slack/interactivity", blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" })),
 		);
 		expect(res.status).toBe(200);
 		expect(await env.TOKENS.get(CHANNEL_KEY)).toBeNull();

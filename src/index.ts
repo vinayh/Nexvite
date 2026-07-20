@@ -4,7 +4,9 @@
  * This Worker *is* the Slack app (Workflow Builder has no outbound-HTTP step):
  * /slack/command opens the modal, /slack/events publishes the App Home tab
  * (whose button also opens the modal), and /slack/interactivity verifies the
- * signature, acks, then registers the visitor in Nexudus and DMs the result.
+ * signature, then acks the submission by swapping the modal for a "registering"
+ * placeholder while it registers the visitor in Nexudus in the background — then
+ * updates that modal with the result and DMs it (the DM is the durable record).
  * Flow diagram and design rationale: README.md.
  *
  * Never log the modal values, visitor fields, tokens, or Nexudus/Slack response
@@ -47,11 +49,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 // Verify `v0=HMAC-SHA256(signing_secret, "v0:{ts}:{body}")` and reject stale
 // timestamps (replay protection). `rawBody` must be the exact bytes received.
-async function verifySlackSignature(
-	request: Request,
-	rawBody: string,
-	signingSecret: string,
-): Promise<boolean> {
+async function verifySlackSignature(request: Request, rawBody: string, signingSecret: string): Promise<boolean> {
 	const timestamp = request.headers.get("X-Slack-Request-Timestamp");
 	const signature = request.headers.get("X-Slack-Signature");
 	if (!timestamp || !signature) return false;
@@ -59,13 +57,9 @@ async function verifySlackSignature(
 	const age = Math.abs(Date.now() / 1000 - Number(timestamp));
 	if (!Number.isFinite(age) || age > 60 * 5) return false;
 
-	const key = await crypto.subtle.importKey(
-		"raw",
-		new TextEncoder().encode(signingSecret),
-		{ name: "HMAC", hash: "SHA-256" },
-		false,
-		["sign"],
-	);
+	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(signingSecret), { name: "HMAC", hash: "SHA-256" }, false, [
+		"sign",
+	]);
 	const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`v0:${timestamp}:${rawBody}`));
 	return constantTimeEqual(`v0=${hex(mac)}`, signature);
 }
@@ -202,13 +196,7 @@ async function canConfigure(env: Env, userId: string): Promise<boolean> {
 // The modal
 // ---------------------------------------------------------------------------
 
-function inputBlock(
-	block: string,
-	action: string,
-	label: string,
-	element: Record<string, unknown>,
-	optional = false,
-) {
+function inputBlock(block: string, action: string, label: string, element: Record<string, unknown>, optional = false) {
 	return {
 		type: "input",
 		block_id: block,
@@ -235,20 +223,8 @@ function visitorModal() {
 			inputBlock(FIELDS.arrival.block, FIELDS.arrival.action, "Expected arrival", {
 				type: "datetimepicker",
 			}),
-			inputBlock(
-				FIELDS.host.block,
-				FIELDS.host.action,
-				"Who are they visiting?",
-				{ type: "plain_text_input" },
-				true,
-			),
-			inputBlock(
-				FIELDS.notes.block,
-				FIELDS.notes.action,
-				"Notes",
-				{ type: "plain_text_input", multiline: true },
-				true,
-			),
+			inputBlock(FIELDS.host.block, FIELDS.host.action, "Who are they visiting?", { type: "plain_text_input" }, true),
+			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, true),
 		],
 	};
 }
@@ -256,6 +232,33 @@ function visitorModal() {
 // Open the modal from a trigger_id (slash command or the DM button click).
 function openModal(env: Env, triggerId: string) {
 	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal() });
+}
+
+// The post-submission modal: a single-message view, no inputs. Shown first as a
+// "⏳ registering" placeholder (returned inline via response_action:update on the
+// submission), then swapped for the ✅/❌/⚠️ result via views.update once Nexudus
+// responds. It's live feedback only — the DM (and its Delete button) is the
+// durable record, so the submitter can just close this window.
+function statusModal(text: string) {
+	return {
+		type: "modal",
+		title: { type: "plain_text", text: "Visitor registration" }, // ≤24 chars
+		close: { type: "plain_text", text: "Close" },
+		blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+	};
+}
+
+// The placeholder shown the instant the form is submitted, while registration
+// runs in the background. Names the DM so it's clear closing this loses nothing.
+const REGISTERING_TEXT =
+	"⏳ *Registering your visitor…*\nThis usually takes a few seconds. You'll get a direct message with the result — you can close this window any time.";
+
+// Swap the post-submission placeholder for the result, if the submitter still
+// has the modal open. A closed/expired view makes this a harmless no-op (the DM
+// already carries the same outcome), so a failure here is only logged.
+async function updateStatusModal(env: Env, viewId: string, text: string): Promise<void> {
+	const { ok, error } = await slackApi(env, "views.update", { view_id: viewId, view: statusModal(text) });
+	if (!ok) console.warn(`views.update failed: ${error ?? "unknown"}`); // error code only, no PII
 }
 
 // The admin-only settings block: a channel picker that writes the log channel
@@ -287,9 +290,7 @@ function settingsBlocks(currentChannel?: string): unknown[] {
 			elements: [
 				{
 					type: "mrkdwn",
-					text: currentChannel
-						? `Currently logging to ${channelLabel(currentChannel)}.`
-						: "No log channel set yet — pick one above.",
+					text: currentChannel ? `Currently logging to ${channelLabel(currentChannel)}.` : "No log channel set yet — pick one above.",
 				},
 			],
 		},
@@ -384,11 +385,7 @@ async function readAuth(env: Env): Promise<NexudusAuth | null> {
 	if (!raw) return null;
 	try {
 		const parsed = JSON.parse(raw) as Partial<NexudusAuth>;
-		if (
-			typeof parsed.username === "string" &&
-			typeof parsed.access_token === "string" &&
-			typeof parsed.refresh_token === "string"
-		) {
+		if (typeof parsed.username === "string" && typeof parsed.access_token === "string" && typeof parsed.refresh_token === "string") {
 			return { username: parsed.username, access_token: parsed.access_token, refresh_token: parsed.refresh_token };
 		}
 	} catch {
@@ -434,10 +431,7 @@ function nexudusBase(env: Env): string {
 // Run an authenticated Nexudus request: current token first; on a 401 refresh
 // once (rotating the KV record) and retry. Never throws — returns null on an
 // auth/network failure, which the caller turns into a member-facing message.
-async function nexudusFetch(
-	env: Env,
-	doFetch: (base: string, accessToken: string) => Promise<Response>,
-): Promise<Response | null> {
+async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: string) => Promise<Response>): Promise<Response | null> {
 	const base = nexudusBase(env);
 	try {
 		const auth = await readAuth(env);
@@ -647,8 +641,8 @@ async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Pro
 				typeof (r as { Id?: unknown })?.Id === "number" &&
 				typeof (r as { Email?: unknown })?.Email === "string" &&
 				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase() &&
-				(parseNexudusInstant((r as VisitorRecord).UtcExpectedArrival) ??
-					parseNexudusInstant((r as VisitorRecord).ExpectedArrival)) === sentMs,
+				(parseNexudusInstant((r as VisitorRecord).UtcExpectedArrival) ?? parseNexudusInstant((r as VisitorRecord).ExpectedArrival)) ===
+					sentMs,
 		);
 		return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
 	};
@@ -742,22 +736,13 @@ async function deleteVisitor(env: Env, id: number, messageText?: string): Promis
 // Handle a Delete click: delete in Nexudus, then report via the clicked
 // message's response_url — replacing it with the deleted registration's details
 // on success, or an ephemeral note to the clicker on failure.
-async function handleDeleteClick(
-	env: Env,
-	id: number,
-	responseUrl: string,
-	messageText?: string,
-): Promise<void> {
+async function handleDeleteClick(env: Env, id: number, responseUrl: string, messageText?: string): Promise<void> {
 	const { ok, text } = await deleteVisitor(env, id, messageText);
 	try {
 		const res = await fetch(responseUrl, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(
-				ok
-					? { replace_original: true, text }
-					: { replace_original: false, response_type: "ephemeral", text },
-			),
+			body: JSON.stringify(ok ? { replace_original: true, text } : { replace_original: false, response_type: "ephemeral", text }),
 		});
 		if (!res.ok) console.warn(`response_url post failed: HTTP ${res.status}`);
 	} catch (err) {
@@ -770,6 +755,15 @@ async function handleDeleteClick(
 // ---------------------------------------------------------------------------
 
 type SlackUser = { id?: string; name?: string; username?: string };
+
+// A JSON 200 — the shape Slack's interactivity endpoint expects for a
+// response_action (here, updating the modal in place on submission).
+function jsonResponse(body: unknown): Response {
+	return new Response(JSON.stringify(body), {
+		status: 200,
+		headers: { "Content-Type": "application/json; charset=utf-8" },
+	});
+}
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -843,7 +837,7 @@ export default {
 			response_url?: string;
 			actions?: Array<{ action_id?: string; value?: string; selected_conversation?: string }>;
 			message?: { text?: string }; // present on block_actions from a message (delete-by-Id)
-			view?: { callback_id?: string; state?: ViewState };
+			view?: { id?: string; callback_id?: string; state?: ViewState };
 		};
 		try {
 			payload = JSON.parse(payloadRaw ?? "");
@@ -911,13 +905,18 @@ export default {
 		};
 
 		// Register + notify in the background so we ack within Slack's 3s window.
-		// Acking with an empty 200 closes the modal.
+		// The ack itself swaps the modal for a "⏳ registering" placeholder
+		// (response_action:update); the background work then updates that same view
+		// to the result. The DM remains the durable record if the user closes it.
 		if (userId) {
+			const viewId = payload.view?.id;
 			ctx.waitUntil(
 				(async () => {
 					// Upgrade the username to the profile's full name when we can.
 					input.submittedBy = (await fetchFullName(env, userId)) ?? input.submittedBy;
 					const { ok, message, blocks } = await registerVisitor(env, input);
+					// Update the open modal first — it's what the submitter is watching.
+					if (viewId) await updateStatusModal(env, viewId, message);
 					await postMessage(env, userId, message, blocks);
 					// Successes also go to the visitors channel — the human-readable
 					// log of registrations (admin-set in KV, else the VISITOR_CHANNEL
@@ -926,7 +925,9 @@ export default {
 					if (ok && logChannel) await postMessage(env, logChannel, message, blocks);
 				})(),
 			);
+			return jsonResponse({ response_action: "update", view: statusModal(REGISTERING_TEXT) });
 		}
+		// No user id (shouldn't happen for a real submission) — just close the modal.
 		return new Response("", { status: 200 });
 	},
 } satisfies ExportedHandler<Env>;
