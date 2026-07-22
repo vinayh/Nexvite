@@ -1,5 +1,7 @@
 # Nexvite
 
+[![codecov](https://codecov.io/github/vinayh/Nexvite/graph/badge.svg?token=V4SKXXZR7I)](https://codecov.io/github/vinayh/Nexvite)
+
 **Slack → Nexudus visitor registration, in one Cloudflare Worker.**
 
 A member runs `/visitor` in Slack, or clicks **Register a visitor** on the app's Home tab, fills in a short modal and submits. The Worker verifies the request came from Slack, registers the visitor in [Nexudus](https://learn.nexudus.com/), DMs the member the result, and logs successes to a visitors channel. One slash command, one modal, one Worker. No dashboards, no database, no per-member login.
