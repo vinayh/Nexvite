@@ -1,6 +1,6 @@
 import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import worker, { TOKEN_KEY, CHANNEL_KEY } from "../src/index";
+import worker, { TOKEN_KEY, CHANNEL_KEY, lookupRetry } from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
 
@@ -17,10 +17,11 @@ const seed = () => env.TOKENS.put(TOKEN_KEY, JSON.stringify(AUTH));
 const NEXUDUS_BASE = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 const SLACK_BASE = "https://slack.com";
 
-// 2026-07-20 14:30:00 UTC → 15:30 in Europe/London (BST, UTC+1).
-const ARRIVAL_EPOCH = Date.UTC(2026, 6, 20, 14, 30, 0) / 1000;
-const ARRIVAL_UTC = "2026-07-20T14:30:00"; // sent to Nexudus (naive UTC)
-const ARRIVAL_LOCAL = "2026-07-20 15:30"; // shown in messages (Europe/London, BST)
+// 2030-07-20 14:30:00 UTC → 15:30 in Europe/London (BST, UTC+1). Must stay in
+// the future: past arrivals are rejected inline; summer exercises the offset.
+const ARRIVAL_EPOCH = Date.UTC(2030, 6, 20, 14, 30, 0) / 1000;
+const ARRIVAL_UTC = "2030-07-20T14:30:00"; // sent to Nexudus (naive UTC)
+const ARRIVAL_LOCAL = "2030-07-20 15:30"; // shown in messages (Europe/London, BST)
 
 // What the default submissionBody() produces as a success message.
 const SUCCESS_TEXT = [
@@ -40,6 +41,7 @@ const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 beforeAll(() => {
 	fetchMock.activate();
 	fetchMock.disableNetConnect();
+	lookupRetry.ms = 0; // don't really sleep between Id-lookup attempts
 });
 afterEach(async () => {
 	fetchMock.assertNoPendingInterceptors();
@@ -119,6 +121,10 @@ function submissionBody(values?: Record<string, unknown>, over: { type?: string;
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
 }
 
+function eventBody(event: Record<string, unknown>): string {
+	return JSON.stringify({ type: "event_callback", event });
+}
+
 function blockActionsBody(
 	actionId = "open_visitor_form",
 	triggerId = "trig-xyz",
@@ -173,8 +179,7 @@ function headerGet(headers: unknown, name: string): string | undefined {
 	return undefined;
 }
 
-// users.info lookup — used for the submitter's full name and for the admin
-// check (is_admin/is_owner). GET, unlike the POST methods.
+// users.info lookup — the submitter's full name. GET, unlike the POST methods.
 function mockUserInfo(reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } }, user = "U1") {
 	fetchMock.get(SLACK_BASE).intercept({ path: "/api/users.info", method: "GET", query: { user } }).reply(200, JSON.stringify(reply));
 }
@@ -286,7 +291,7 @@ describe("signature verification", () => {
 	});
 });
 
-describe("slash command → open modal", () => {
+describe("slash command -> open modal", () => {
 	it("opens the visitor modal with the trigger_id and acks 200", async () => {
 		let viewsOpen: any;
 		mockSlack("views.open", (b) => (viewsOpen = b));
@@ -307,7 +312,7 @@ describe("slash command → open modal", () => {
 	});
 });
 
-describe("view_submission → register + DM", () => {
+describe("view_submission -> register + DM", () => {
 	beforeEach(seed);
 
 	it("registers with the KV access token, DMs success with the looked-up Nexudus Id, and logs to the channel", async () => {
@@ -568,6 +573,19 @@ describe("view_submission → register + DM", () => {
 		expect(dm.text).toContain("required");
 	});
 
+	it("rejects a past arrival with an inline field error (no outbound calls)", async () => {
+		const values = {
+			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
+			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+			arrival: { value: { type: "datetimepicker", selected_date_time: Math.floor(Date.now() / 1000) - 3600 } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		const ack = JSON.parse(await res.text());
+		expect(ack.response_action).toBe("errors");
+		expect(ack.errors.arrival).toContain("in the past");
+	});
+
 	it("escapes mrkdwn control characters in member-provided fields (Slack only, not Nexudus)", async () => {
 		let visitor: Captured | undefined;
 		const posts: any[] = [];
@@ -662,11 +680,7 @@ describe("view_submission → register + DM", () => {
 	});
 });
 
-describe("App Home → button → modal", () => {
-	function eventBody(event: Record<string, unknown>): string {
-		return JSON.stringify({ type: "event_callback", event });
-	}
-
+describe("App Home -> button -> modal", () => {
 	it("echoes the url_verification challenge", async () => {
 		const body = JSON.stringify({ type: "url_verification", challenge: "chal-123" });
 		const res = await run(await slackRequest("/slack/events", body));
@@ -676,7 +690,6 @@ describe("App Home → button → modal", () => {
 
 	it("publishes the Home tab with the register button on app_home_opened", async () => {
 		let publish: any;
-		mockUserInfo(); // a non-admin, non-owner user (no is_admin/is_owner fields)
 		mockSlack("views.publish", (b) => (publish = b));
 
 		const res = await run(await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "home" })));
@@ -685,7 +698,7 @@ describe("App Home → button → modal", () => {
 		expect(publish.view.type).toBe("home");
 		const actions = publish.view.blocks.find((b: any) => b.type === "actions");
 		expect(actions.elements[0].action_id).toBe("open_visitor_form");
-		// A normal member sees no admin settings — the channel picker is absent.
+		// Not on the ADMIN_USER_IDS allowlist — the channel picker is absent.
 		expect(JSON.stringify(publish.view.blocks)).not.toContain("set_visitor_channel");
 	});
 
@@ -717,10 +730,10 @@ describe("App Home → button → modal", () => {
 	});
 });
 
-describe("admin config → log channel", () => {
-	function eventBody(event: Record<string, unknown>): string {
-		return JSON.stringify({ type: "event_callback", event });
-	}
+describe("admin config -> log channel", () => {
+	// U1 is allowlisted here; testEnv's own ADMIN_USER_IDS (from wrangler.jsonc)
+	// contains none of the test users. (Cast: wrangler types the var's literal.)
+	const allowlistEnv = { ...testEnv, ADMIN_USER_IDS: "U9, U1 , U2" } as unknown as Env;
 
 	// The channel picker is a conversations_select rendered as a section accessory.
 	function findPicker(view: any): any {
@@ -735,9 +748,8 @@ describe("admin config → log channel", () => {
 		return publish;
 	}
 
-	it("shows the log-channel picker to a workspace admin, seeded with the default channel", async () => {
-		mockUserInfo({ ok: true, user: { is_admin: true } });
-		const publish = await openHome();
+	it("shows the log-channel picker to an allowlisted user, seeded with the default channel", async () => {
+		const publish = await openHome("U1", allowlistEnv);
 		const picker = findPicker(publish.view);
 		expect(picker?.type).toBe("conversations_select");
 		// The default #visitor-requests is a name, not an id → no initial_conversation.
@@ -745,26 +757,17 @@ describe("admin config → log channel", () => {
 		expect(JSON.stringify(publish.view.blocks)).toContain("Currently logging to #visitor-requests");
 	});
 
-	it("shows the picker to a workspace owner too", async () => {
-		mockUserInfo({ ok: true, user: { is_owner: true } });
-		expect(findPicker((await openHome()).view)?.action_id).toBe("set_visitor_channel");
+	it("hides the picker from a user not on the allowlist", async () => {
+		expect(findPicker((await openHome()).view)).toBeUndefined();
 	});
 
-	it("shows the picker to an allowlisted user without any admin lookup", async () => {
-		// No mockUserInfo — an ADMIN_USER_IDS match short-circuits the users.info
-		// call. (Cast: wrangler types ADMIN_USER_IDS as its "" literal default.)
-		const allowlistEnv = { ...testEnv, ADMIN_USER_IDS: "U9, U1 , U2" } as unknown as Env;
-		const publish = await openHome("U1", allowlistEnv);
-		expect(findPicker(publish.view)?.action_id).toBe("set_visitor_channel");
-	});
-
-	it("stores an admin's channel choice and re-publishes with it selected", async () => {
+	it("stores an allowlisted user's channel choice and re-publishes with it selected", async () => {
 		let publish: any;
-		mockUserInfo({ ok: true, user: { is_admin: true } });
 		mockSlack("views.publish", (b) => (publish = b));
 
 		const res = await run(
 			await slackRequest("/slack/interactivity", blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" })),
+			allowlistEnv,
 		);
 		expect(res.status).toBe(200);
 		// Persisted to KV…
@@ -775,8 +778,7 @@ describe("admin config → log channel", () => {
 		expect(JSON.stringify(publish.view.blocks)).toContain("<#C999>");
 	});
 
-	it("ignores a channel change from a non-admin, non-allowlisted user (KV untouched)", async () => {
-		mockUserInfo(); // not an admin/owner
+	it("ignores a channel change from a user not on the allowlist (KV untouched)", async () => {
 		mockSlack("views.publish"); // the re-publish still happens, just without the picker
 
 		const res = await run(
@@ -785,9 +787,23 @@ describe("admin config → log channel", () => {
 		expect(res.status).toBe(200);
 		expect(await env.TOKENS.get(CHANNEL_KEY)).toBeNull();
 	});
+
+	it("ignores a selection that isn't a conversation id, even from an allowlisted user (KV untouched)", async () => {
+		mockSlack("views.publish");
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "#typed-name" }),
+			),
+			allowlistEnv,
+		);
+		expect(res.status).toBe(200);
+		expect(await env.TOKENS.get(CHANNEL_KEY)).toBeNull();
+	});
 });
 
-describe("delete button → remove visitor", () => {
+describe("delete button -> remove visitor", () => {
 	const RESPOND_BASE = "https://hooks.slack.test";
 
 	beforeEach(seed);

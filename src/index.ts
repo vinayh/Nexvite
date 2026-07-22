@@ -160,36 +160,10 @@ function channelLabel(channel: string): string {
 	return isChannelId(channel) ? `<#${channel}>` : mrkdwnEscape(channel);
 }
 
-// Slack user ids named in ADMIN_USER_IDS (comma-separated), on top of admins.
-function allowlistedIds(env: Env): string[] {
-	return (env.ADMIN_USER_IDS ?? "")
-		.split(",")
-		.map((id) => id.trim())
-		.filter(Boolean);
-}
-
-// Whether this user may change the log channel: an explicit allowlist entry, or
-// a workspace admin/owner (users.info, scope users:read). Errs closed — a
-// failed lookup for a non-allowlisted user denies access. Never throws.
-async function canConfigure(env: Env, userId: string): Promise<boolean> {
-	if (allowlistedIds(env).includes(userId)) return true;
-	try {
-		const res = await fetch(`${SLACK_API}/users.info?user=${encodeURIComponent(userId)}`, {
-			headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-		});
-		const json = (await res.json().catch(() => null)) as {
-			ok?: boolean;
-			error?: string;
-			user?: { is_admin?: boolean; is_owner?: boolean; is_primary_owner?: boolean };
-		} | null;
-		if (!json?.ok) {
-			console.warn(`users.info (admin check) failed: ${json?.error ?? "unknown"}`); // error code only, no PII
-			return false;
-		}
-		return Boolean(json.user?.is_admin || json.user?.is_owner || json.user?.is_primary_owner);
-	} catch {
-		return false;
-	}
+// May this user change the log channel? Config-only allowlist (ADMIN_USER_IDS,
+// comma-separated) — not tied to Slack admin status. Empty = nobody.
+function canConfigure(env: Env, userId: string): boolean {
+	return (env.ADMIN_USER_IDS ?? "").split(",").some((id) => id.trim() === userId);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +255,7 @@ function settingsBlocks(currentChannel?: string): unknown[] {
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: "*Visitor log channel* — successful registrations are posted here. Only admins see this. Remember to invite the app to the channel you pick (`/invite @…`).",
+				text: "*Visitor log channel* — successful registrations are posted here. Only app admins see this. Remember to invite the app to the channel you pick (`/invite @…`).",
 			},
 			accessory: select,
 		},
@@ -328,12 +302,10 @@ function homeView(config?: { currentChannel?: string }) {
 }
 
 // (Re)publish the Home tab for one user, on app_home_opened and after a channel
-// change. Configurers also get the channel picker, seeded with the effective
-// channel. Pass `allowed` to reuse an already-computed permission, else it's
-// looked up here.
-async function publishHome(env: Env, userId: string, allowed?: boolean): Promise<void> {
-	const mayConfigure = allowed ?? (await canConfigure(env, userId));
-	const config = mayConfigure ? { currentChannel: await readLogChannel(env) } : undefined;
+// change. Allowlisted users also get the channel picker, seeded with the
+// effective channel.
+async function publishHome(env: Env, userId: string): Promise<void> {
+	const config = canConfigure(env, userId) ? { currentChannel: await readLogChannel(env) } : undefined;
 	const { ok, error } = await slackApi(env, "views.publish", { user_id: userId, view: homeView(config) });
 	if (!ok) console.warn(`views.publish failed: ${error ?? "unknown"}`); // error code only, no PII
 }
@@ -351,13 +323,21 @@ function readText(state: ViewState, block: string, action: string, cap: number):
 	const raw = state.values?.[block]?.[action]?.value;
 	if (typeof raw !== "string") return undefined;
 	const trimmed = raw.trim();
-	return trimmed ? trimmed.slice(0, cap) : undefined;
+	if (!trimmed) return undefined;
+	// Don't let the cap split a surrogate pair (e.g. mid-emoji).
+	const capped = trimmed.slice(0, cap);
+	const last = capped.charCodeAt(capped.length - 1);
+	return last >= 0xd800 && last <= 0xdbff ? capped.slice(0, -1) : capped;
 }
 
 function readDateTime(state: ViewState, block: string, action: string): number | undefined {
 	const dt = state.values?.[block]?.[action]?.selected_date_time;
 	return typeof dt === "number" && Number.isFinite(dt) ? dt : undefined;
 }
+
+// Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
+// rejected inline — the confirming /my lookup only sees upcoming visits.
+const ARRIVAL_GRACE_S = 120;
 
 // ---------------------------------------------------------------------------
 // Nexudus auth (KV-backed, auto-refreshing)
@@ -492,11 +472,6 @@ interface VisitorInput {
 	submittedBy: string;
 }
 
-// CustomerNotes line prefixes written by registerVisitor — reception's view, in
-// the portal, of who submitted the visitor and who they're visiting.
-const NOTE_SUBMITTED = "Submitted via Slack by ";
-const NOTE_VISITING = "Visiting: ";
-
 // mrkdwn summary of what was submitted, shown under every result header (and in
 // the channel log). Blank optional fields are omitted; arrival is space-local.
 function submissionSummary(env: Env, input: VisitorInput): string {
@@ -569,8 +544,8 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 
 	// All registrations go through one account, so CustomerNotes is reception's
 	// only view of who submitted and who the visitor is for.
-	const noteLines: string[] = [`${NOTE_SUBMITTED}${input.submittedBy}`];
-	if (input.host) noteLines.push(`${NOTE_VISITING}${input.host}`);
+	const noteLines: string[] = [`Submitted via Slack by ${input.submittedBy}`];
+	if (input.host) noteLines.push(`Visiting: ${input.host}`);
 	if (input.notes) noteLines.push(input.notes);
 
 	const visitor = {
@@ -619,47 +594,6 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	return { ok: true, message, blocks: successBlocks(message, { id }) };
 }
 
-// Delay before the single retry below; it runs in the background, so it's free.
-const LOOKUP_RETRY_MS = 1000;
-
-// Resolve the new registration's Id from the account's own list (the only read
-// route — README), matching on email + exact visit instant, newest wins. Retries
-// once for replication lag; null if still not found.
-async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Promise<number | null> {
-	const sentMs = Date.parse(`${arrivalUtc}Z`);
-	const attempt = async (): Promise<number | null> => {
-		const res = await nexudusFetch(env, (base, accessToken) =>
-			fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
-				headers: { Authorization: `Bearer ${accessToken}` },
-			}),
-		);
-		if (!res?.ok) return null;
-		// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
-		// space-local, so a visit one offset-hour away could match by coincidence.
-		const matches = listRecords(await res.json().catch(() => null)).filter(
-			(r): r is VisitorRecord =>
-				typeof (r as { Id?: unknown })?.Id === "number" &&
-				typeof (r as { Email?: unknown })?.Email === "string" &&
-				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase() &&
-				(parseNexudusInstant((r as VisitorRecord).UtcExpectedArrival) ?? parseNexudusInstant((r as VisitorRecord).ExpectedArrival)) ===
-					sentMs,
-		);
-		return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
-	};
-	const id = await attempt();
-	if (id != null) return id;
-	await new Promise((resolve) => setTimeout(resolve, LOOKUP_RETRY_MS));
-	return attempt();
-}
-
-// ---------------------------------------------------------------------------
-// Deletion (the ✅ message's Delete button)
-// ---------------------------------------------------------------------------
-//
-// The button carries the Nexudus Id captured at registration, so a click is a
-// direct DELETE /api/public/visitors/{id} — no lookup, no duplicate ambiguity.
-// The shared parsing below also backs the registration-time Id lookup.
-
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
 // (naive ones are treated as UTC — matching what we send) and the legacy
 // "/Date(ms)/" form. Returns null for anything unparseable.
@@ -691,10 +625,51 @@ interface VisitorRecord {
 	UtcExpectedArrival?: unknown;
 }
 
+// Delay before the single lookup retry; a box so tests can shrink it.
+export const lookupRetry = { ms: 1000 };
+
+// Resolve the new registration's Id from the account's own list (the only read
+// route — README), matching on email + exact visit instant, newest wins. Retries
+// once for replication lag; null if still not found.
+async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Promise<number | null> {
+	const sentMs = Date.parse(`${arrivalUtc}Z`);
+	const attempt = async (): Promise<number | null> => {
+		const res = await nexudusFetch(env, (base, accessToken) =>
+			fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
+				headers: { Authorization: `Bearer ${accessToken}` },
+			}),
+		);
+		if (!res?.ok) return null;
+		// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
+		// space-local, so a visit one offset-hour away could match by coincidence.
+		const matches = listRecords(await res.json().catch(() => null)).filter(
+			(r): r is VisitorRecord =>
+				typeof (r as { Id?: unknown })?.Id === "number" &&
+				typeof (r as { Email?: unknown })?.Email === "string" &&
+				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase() &&
+				(parseNexudusInstant((r as VisitorRecord).UtcExpectedArrival) ?? parseNexudusInstant((r as VisitorRecord).ExpectedArrival)) ===
+					sentMs,
+		);
+		return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
+	};
+	const id = await attempt();
+	if (id != null) return id;
+	await new Promise((resolve) => setTimeout(resolve, lookupRetry.ms));
+	return attempt();
+}
+
+// ---------------------------------------------------------------------------
+// Deletion (the ✅ message's Delete button)
+// ---------------------------------------------------------------------------
+//
+// The button carries the Nexudus Id captured at registration, so a click is a
+// direct DELETE /api/public/visitors/{id} — no lookup, no duplicate ambiguity.
+
 // The 🗑️ confirmation: the clicked ✅ message restyled — header swapped, the
 // visitor's own fields struck, invite note dropped. Reusing it keeps the
 // Submitted-by / Nexudus ID lines (and any the list API omits) — safe because
-// delete-by-Id matched this exact record. Empty/foreign text → bare header.
+// delete-by-Id matched this exact record. Empty text → bare header;
+// unrecognized lines pass through unchanged.
 function deletedFromMessage(messageText: string | undefined): string {
 	if (!messageText) return "🗑️ *Registration deleted*";
 	return messageText
@@ -713,9 +688,6 @@ function deletedFromMessage(messageText: string | undefined): string {
 // throws — the clicker always gets feedback. messageText is the clicked ✅
 // message, restyled into the 🗑️ confirmation (see deletedFromMessage).
 async function deleteVisitor(env: Env, id: number, messageText?: string): Promise<{ ok: boolean; text: string }> {
-	// Failure fallback is the Nexudus account email (see nexudusContact), not
-	// "the portal" — members can't see these registrations in their own login.
-	const contact = await nexudusContact(env);
 	const res = await nexudusFetch(env, (base, accessToken) =>
 		fetch(`${base}/api/public/visitors/${id}`, {
 			method: "DELETE",
@@ -723,6 +695,9 @@ async function deleteVisitor(env: Env, id: number, messageText?: string): Promis
 		}),
 	);
 	if (!res?.ok) {
+		// Failure contact is the Nexudus account email (see nexudusContact), not
+		// "the portal" — members can't see these registrations in their own login.
+		const contact = await nexudusContact(env);
 		if (res && (res.status === 404 || res.status === 410)) {
 			return {
 				ok: false,
@@ -874,21 +849,19 @@ export default {
 				const { ok, error } = await openModal(env, payload.trigger_id);
 				if (!ok) console.warn(`views.open failed: ${error ?? "unknown"}`);
 			} else if (setChannel && payload.user?.id) {
-				// Re-verify server-side: only a configurer may change the channel,
-				// no matter who the picker was rendered for. Store + re-publish so
-				// the Home tab reflects the new channel. Background: stays in the ack
-				// window and the picker needs no synchronous response.
+				// Re-verify allowlist + a real conversation id server-side — never
+				// rely on the picker merely being hidden. Store + re-publish so the
+				// Home tab reflects the new channel; background to stay in the ack window.
 				const userId = payload.user.id;
 				const selected = setChannel.selected_conversation;
 				ctx.waitUntil(
 					(async () => {
-						const allowed = await canConfigure(env, userId);
-						if (allowed && typeof selected === "string" && selected) {
+						if (canConfigure(env, userId) && typeof selected === "string" && isChannelId(selected)) {
 							await env.TOKENS.put(CHANNEL_KEY, selected);
 						} else if (selected) {
-							console.warn("non-configurer channel change ignored"); // no PII
+							console.warn("channel change ignored (not allowlisted, or not a conversation id)"); // no PII
 						}
-						await publishHome(env, userId, allowed);
+						await publishHome(env, userId);
 					})(),
 				);
 			} else if (clickedDelete?.value && payload.response_url) {
@@ -921,6 +894,14 @@ export default {
 			notes: readText(state, FIELDS.notes.block, FIELDS.notes.action, FIELDS.notes.cap),
 			submittedBy: payload.user?.name ?? payload.user?.username ?? "a Slack user",
 		};
+
+		// Bounce a past arrival back onto the field (see ARRIVAL_GRACE_S).
+		if (input.arrivalEpoch != null && input.arrivalEpoch < Date.now() / 1000 - ARRIVAL_GRACE_S) {
+			return jsonResponse({
+				response_action: "errors",
+				errors: { [FIELDS.arrival.block]: "This time is in the past — pick when the visitor is expected to arrive." },
+			});
+		}
 
 		// Register + notify in the background so we ack within Slack's 3s window.
 		// The ack itself swaps the modal for a "⏳ registering" placeholder
