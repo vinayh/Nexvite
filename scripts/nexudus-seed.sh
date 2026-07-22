@@ -21,6 +21,7 @@ TARGET="--remote"
 
 USERNAME="" ACCESS="" REFRESH=""
 while IFS='=' read -r key value; do
+	value="${value%$'\r'}"
 	case "$key" in
 		NEXUDUS_USERNAME) USERNAME="$value" ;;
 		NEXUDUS_ACCESS_TOKEN) ACCESS="$value" ;;

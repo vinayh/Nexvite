@@ -125,6 +125,8 @@ wrangler deploy
 # → note the printed workers.dev URL for the Slack app request URLs below
 
 scripts/nexudus-token.sh | scripts/nexudus-seed.sh   # seed the Nexudus auth record in KV
+# on Windows, fetch the KEY=value lines with:
+#   powershell -ExecutionPolicy Bypass -File scripts\nexudus-token.ps1
 wrangler secret put SLACK_SIGNING_SECRET
 wrangler secret put SLACK_BOT_TOKEN
 ```
