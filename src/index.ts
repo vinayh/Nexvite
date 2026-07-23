@@ -1,24 +1,24 @@
 /**
- * Slack → Nexudus visitor registration — custom Slack app backend.
+ * Backend for the Nexvite Slack app: visitor registration from Slack into
+ * Nexudus.
  *
- * This Worker *is* the Slack app (Workflow Builder has no outbound-HTTP step):
- * /slack/command opens the modal, /slack/events publishes the App Home tab
- * (whose button also opens the modal), and /slack/interactivity verifies the
- * signature, then acks the submission by swapping the modal for a "registering"
- * placeholder while it registers the visitor in Nexudus in the background — then
- * updates that modal with the result and DMs it (the DM is the durable record).
- * Flow diagram and design rationale: README.md.
+ * /slack/command opens the registration modal, /slack/events publishes the
+ * App Home tab (whose button also opens the modal), and /slack/interactivity
+ * verifies the signature, acks the submission with a "registering" placeholder
+ * modal, registers the visitor in Nexudus in the background, then updates the
+ * modal and DMs the result. The DM is the durable record. Flow diagram and
+ * design rationale: README.md.
  *
- * Never log the modal values, visitor fields, tokens, or Nexudus/Slack response
- * bodies — visitor PII must not reach Workers Logs. Slack/Nexudus error *codes*
- * are safe to log.
+ * Never log modal values, visitor fields, tokens, or Nexudus/Slack response
+ * bodies; visitor PII must not reach Workers Logs. Slack and Nexudus error
+ * codes are safe to log.
  */
 
 const CALLBACK_ID = "visitor_registration";
 const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
 const DELETE_ACTION = "delete_visitor"; // button on the ✅ confirmation messages
 
-// Modal block/action ids → how we read each value back out of view.state.values.
+// Modal block/action ids, used to read each value from view.state.values.
 const FIELDS = {
 	fullName: { block: "full_name", action: "value", cap: 200 },
 	email: { block: "email", action: "value", cap: 320 },
@@ -67,7 +67,7 @@ async function verifySlackSignature(request: Request, rawBody: string, signingSe
 // Slack Web API
 // ---------------------------------------------------------------------------
 
-// Never throws — a Slack network failure must not 500 the endpoint or kill the
+// Never throws: a Slack network failure must not 500 the endpoint or stop the
 // background notify chain (a failed DM should still let the channel log post).
 async function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: boolean; error?: string }> {
 	try {
@@ -94,9 +94,9 @@ async function postMessage(env: Env, channel: string, text: string, blocks?: unk
 	if (!ok) console.warn(`chat.postMessage failed: ${error ?? "unknown"}`); // error code only, no PII
 }
 
-// The interactivity payload only carries the submitter's *username* — the
+// The interactivity payload only carries the submitter's username; the
 // profile's full name needs a users.info lookup (scope: users:read). Returns
-// null on any failure so the caller can keep the username as a fallback.
+// null on any failure so the caller can fall back to the username.
 async function fetchFullName(env: Env, userId: string): Promise<string | null> {
 	try {
 		const res = await fetch(`${SLACK_API}/users.info?user=${encodeURIComponent(userId)}`, {
@@ -169,8 +169,8 @@ function openModal(env: Env, triggerId: string) {
 // The post-submission modal: a single-message view, no inputs. Shown first as a
 // "⏳ registering" placeholder (returned inline via response_action:update on the
 // submission), then swapped for the ✅/❌/⚠️ result via views.update once Nexudus
-// responds. It's live feedback only — the DM (and its Delete button) is the
-// durable record, so the submitter can just close this window.
+// responds. It's live feedback only; the DM (and its Delete button) is the
+// durable record, so closing the window loses nothing.
 function statusModal(text: string) {
 	return {
 		type: "modal",
@@ -180,14 +180,13 @@ function statusModal(text: string) {
 	};
 }
 
-// The placeholder shown the instant the form is submitted, while registration
-// runs in the background. Names the DM so it's clear closing this loses nothing.
+// Placeholder shown on submission while registration runs in the background.
 const REGISTERING_TEXT =
 	"⏳ *Registering your visitor…*\nThis usually takes a few seconds. You'll get a direct message with the result — you can close this window any time.";
 
 // Swap the post-submission placeholder for the result, if the submitter still
-// has the modal open. A closed/expired view makes this a harmless no-op (the DM
-// already carries the same outcome), so a failure here is only logged.
+// has the modal open. A closed or expired view makes this a no-op (the DM
+// already carries the outcome), so a failure here is only logged.
 async function updateStatusModal(env: Env, viewId: string, text: string): Promise<void> {
 	const { ok, error } = await slackApi(env, "views.update", { view_id: viewId, view: statusModal(text) });
 	if (!ok) console.warn(`views.update failed: ${error ?? "unknown"}`); // error code only, no PII
@@ -253,7 +252,7 @@ function readDateTime(state: ViewState, block: string, action: string): number |
 }
 
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
-// rejected inline — the confirming /my lookup only sees upcoming visits.
+// rejected inline; the /my lookup used for confirmation only sees upcoming visits.
 const ARRIVAL_GRACE_S = 120;
 
 // ---------------------------------------------------------------------------
@@ -261,7 +260,7 @@ const ARRIVAL_GRACE_S = 120;
 // ---------------------------------------------------------------------------
 //
 // Nexudus refresh tokens are single-use and rotate on every exchange, so the
-// live auth record lives in KV (env.TOKENS) — shared with the Nexroom Worker,
+// live auth record lives in KV (env.TOKENS), shared with the Nexroom Worker,
 // which binds the same namespace. There is no other credential source: seed
 // (or re-seed after a broken chain) with
 // scripts/nexudus-token.sh | scripts/nexudus-seed.sh.
@@ -269,14 +268,14 @@ const ARRIVAL_GRACE_S = 120;
 export const TOKEN_KEY = "nexudus"; // exported for the tests
 
 interface NexudusAuth {
-	username: string; // account email — the client_id header on refresh
+	username: string; // account email, sent as the client_id header on refresh
 	access_token: string;
 	refresh_token: string;
 }
 
 // Read the live auth record. Returns null when the KV key is missing or
-// malformed (including a legacy pair without `username`) — that means
-// "unseeded", not "fall back to something else".
+// malformed (including a legacy pair without `username`), which means
+// unseeded; there is no fallback credential source.
 async function readAuth(env: Env): Promise<NexudusAuth | null> {
 	const raw = await env.TOKENS.get(TOKEN_KEY);
 	if (!raw) return null;
@@ -286,15 +285,15 @@ async function readAuth(env: Env): Promise<NexudusAuth | null> {
 			return { username: parsed.username, access_token: parsed.access_token, refresh_token: parsed.refresh_token };
 		}
 	} catch {
-		// malformed — treat as unseeded
+		// malformed, treat as unseeded
 	}
 	return null;
 }
 
-// Contact address for member-facing failure messages — the Nexudus account
+// Contact address for member-facing failure messages: the Nexudus account
 // email from the KV auth record (registrations live under the service account,
 // so members can't see them in their own portal login), or a generic fallback
-// when KV itself is the problem.
+// when KV itself is unavailable.
 async function nexudusContact(env: Env): Promise<string> {
 	try {
 		return (await readAuth(env))?.username ?? "the space team";
@@ -303,9 +302,9 @@ async function nexudusContact(env: Env): Promise<string> {
 	}
 }
 
-// Exchange the (single-use) refresh token for a fresh pair. client_id is the
+// Exchange the single-use refresh token for a fresh pair. client_id is the
 // account email, sent as a header (Nexudus requirement). Returns null on any
-// failure — the caller surfaces a "re-seed" message.
+// failure; the caller surfaces a re-seed message.
 async function refreshAuth(base: string, auth: NexudusAuth): Promise<NexudusAuth | null> {
 	const res = await fetch(`${base}/api/token`, {
 		method: "POST",
@@ -326,21 +325,21 @@ function nexudusBase(env: Env): string {
 }
 
 // Run an authenticated Nexudus request: current token first; on a 401 refresh
-// once (rotating the KV record) and retry. Never throws — returns null on an
-// auth/network failure, which the caller turns into a member-facing message.
+// once (rotating the KV record) and retry. Never throws; returns null on an
+// auth or network failure, which the caller turns into a member-facing message.
 async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: string) => Promise<Response>): Promise<Response | null> {
 	const base = nexudusBase(env);
 	try {
 		const auth = await readAuth(env);
 		if (!auth) {
-			console.error("nexudus auth missing from KV — seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
+			console.error("nexudus auth missing from KV; seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
 			return null;
 		}
 		let res = await doFetch(base, auth.access_token);
 		if (res.status === 401) {
 			const refreshed = await refreshAuth(base, auth);
 			if (!refreshed) {
-				console.error("nexudus token refresh failed — re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
+				console.error("nexudus token refresh failed; re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
 				return null;
 			}
 			await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
@@ -466,7 +465,7 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	if (input.notes) noteLines.push(input.notes);
 
 	const visitor = {
-		BusinessId: Number(env.NEXUDUS_BUSINESS_ID), // config only — never from the request
+		BusinessId: Number(env.NEXUDUS_BUSINESS_ID), // config only, never from the request
 		FullName: input.fullName,
 		Email: input.email,
 		PhoneNumber: input.phone,
@@ -493,12 +492,12 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	}
 
 	// The create returns no Id (README), so confirm by finding the record in the
-	// account's own list — that also yields the Id the Delete button needs. If it
+	// account's own list, which also yields the Id the Delete button needs. If it
 	// can't be found the POST may still have landed, so warn softly (DM only, no
 	// channel log) and steer away from a blind retry rather than claim success.
 	const id = await lookupVisitorId(env, input.email, arrivalUtc);
 	if (id == null) {
-		console.warn("registration unconfirmed — visitor Id lookup found no match"); // no PII
+		console.warn("registration unconfirmed; visitor Id lookup found no match"); // no PII
 		return {
 			ok: false,
 			message:
@@ -512,7 +511,7 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 }
 
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
-// (naive ones are treated as UTC — matching what we send) and the legacy
+// (naive ones are treated as UTC, matching what we send) and the legacy
 // "/Date(ms)/" form. Returns null for anything unparseable.
 function parseNexudusInstant(value: unknown): number | null {
 	if (typeof value !== "string") return null;
@@ -542,12 +541,12 @@ interface VisitorRecord {
 	UtcExpectedArrival?: unknown;
 }
 
-// Delay before the single lookup retry; a box so tests can shrink it.
+// Delay before the single lookup retry; mutable so tests can shrink it.
 export const lookupRetry = { ms: 1000 };
 
 // Resolve the new registration's Id from the account's own list (the only read
-// route — README), matching on email + exact visit instant, newest wins. Retries
-// once for replication lag; null if still not found.
+// route, see README), matching on email + exact visit instant, newest wins.
+// Retries once for replication lag; null if still not found.
 async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Promise<number | null> {
 	const sentMs = Date.parse(`${arrivalUtc}Z`);
 	const attempt = async (): Promise<number | null> => {
@@ -580,20 +579,20 @@ async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Pro
 // ---------------------------------------------------------------------------
 //
 // The button carries the Nexudus Id captured at registration, so a click is a
-// direct DELETE /api/public/visitors/{id} — no lookup, no duplicate ambiguity.
+// direct DELETE /api/public/visitors/{id}: no lookup, no duplicate ambiguity.
 
-// The 🗑️ confirmation: the clicked ✅ message restyled — header swapped, the
-// visitor's own fields struck, invite note dropped. Reusing it keeps the
-// Submitted-by / Nexudus ID lines (and any the list API omits) — safe because
-// delete-by-Id matched this exact record. Empty text → bare header;
-// unrecognized lines pass through unchanged.
+// The 🗑️ confirmation is the clicked ✅ message restyled: header swapped, the
+// visitor's own fields struck, invite note dropped. Reusing the message keeps
+// the Submitted-by and Nexudus ID lines (and any the list API omits), which is
+// safe because delete-by-Id matched this exact record. Empty text yields the
+// bare header; unrecognized lines pass through unchanged.
 function deletedFromMessage(messageText: string | undefined): string {
 	if (!messageText) return "🗑️ *Registration deleted*";
 	return messageText
 		.split("\n")
 		.filter((line) => line !== INVITE_NOTE) // the invite no longer applies
 		.map((line) => {
-			// Match the header text, not the leading ✅ — Slack fully-qualifies the
+			// Match on the header text, not the leading ✅: Slack fully qualifies the
 			// emoji on round-trip (appends a variation selector), so === would miss.
 			if (line.includes("*Visitor registered*")) return "🗑️ *Registration deleted*";
 			return /^\*(Name|Email|Phone|Arrival|Visiting|Notes):\*/.test(line) ? `~${line}~` : line;
@@ -602,7 +601,7 @@ function deletedFromMessage(messageText: string | undefined): string {
 }
 
 // Delete the registration by its Id and return the member-facing outcome. Never
-// throws — the clicker always gets feedback. messageText is the clicked ✅
+// throws; the clicker always gets feedback. messageText is the clicked ✅
 // message, restyled into the 🗑️ confirmation (see deletedFromMessage).
 async function deleteVisitor(env: Env, id: number, messageText?: string): Promise<{ ok: boolean; text: string }> {
 	const res = await nexudusFetch(env, (base, accessToken) =>
@@ -613,7 +612,7 @@ async function deleteVisitor(env: Env, id: number, messageText?: string): Promis
 	);
 	if (!res?.ok) {
 		// Failure contact is the Nexudus account email (see nexudusContact), not
-		// "the portal" — members can't see these registrations in their own login.
+		// the portal, since members can't see these registrations in their own login.
 		const contact = await nexudusContact(env);
 		if (res && (res.status === 404 || res.status === 410)) {
 			return {
@@ -629,9 +628,9 @@ async function deleteVisitor(env: Env, id: number, messageText?: string): Promis
 
 type SlackMessage = { text?: string; blocks?: unknown[] };
 
-// The clicked message's content, from its first section block — verbatim mrkdwn,
+// The clicked message's content, from its first section block: verbatim mrkdwn,
 // newlines intact. message.text is only the notification fallback (newlines
-// collapsed), so it can't be restyled line-by-line; used only if blocks absent.
+// collapsed), so it can't be restyled line by line; used only if blocks absent.
 function messageSectionText(message?: SlackMessage): string | undefined {
 	for (const block of message?.blocks ?? []) {
 		const section = block as { type?: string; text?: { text?: unknown } };
@@ -640,9 +639,9 @@ function messageSectionText(message?: SlackMessage): string | undefined {
 	return message?.text;
 }
 
-// Handle a Delete click: delete in Nexudus, then report via the clicked message's
-// response_url — on success replace it with the restyled section (Delete button
-// dropped), on failure send the clicker an ephemeral note.
+// Handle a Delete click: delete in Nexudus, then report via the clicked
+// message's response_url. On success replace it with the restyled section
+// (Delete button dropped), on failure send the clicker an ephemeral note.
 async function handleDeleteClick(env: Env, id: number, responseUrl: string, message?: SlackMessage): Promise<void> {
 	const { ok, text } = await deleteVisitor(env, id, messageSectionText(message));
 	try {
@@ -666,7 +665,7 @@ async function handleDeleteClick(env: Env, id: number, responseUrl: string, mess
 
 type SlackUser = { id?: string; name?: string; username?: string };
 
-// A JSON 200 — the shape Slack's interactivity endpoint expects for a
+// A JSON 200, the shape Slack's interactivity endpoint expects for a
 // response_action (here, updating the modal in place on submission).
 function jsonResponse(body: unknown): Response {
 	return new Response(JSON.stringify(body), {
@@ -685,15 +684,15 @@ export default {
 			return new Response("Method not allowed", { status: 405 });
 		}
 
-		// Per-IP flood insurance, checked before the HMAC work (wrangler.jsonc
+		// Per-IP rate limit, checked before the HMAC work (wrangler.jsonc
 		// `ratelimits`). Slack retries a 429ed event, so a burst degrades
-		// gracefully. Fail open — losing the limiter must not down the endpoint.
+		// gracefully. Fails open: losing the limiter must not down the endpoint.
 		try {
 			const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
 			const { success } = await env.RATE_LIMITER.limit({ key: ip });
 			if (!success) return new Response("Rate limited", { status: 429 });
 		} catch {
-			// limiter unavailable — let the request through
+			// limiter unavailable, let the request through
 		}
 
 		// Read the raw bytes (needed verbatim for the HMAC). Decoding via
@@ -731,7 +730,7 @@ export default {
 				return new Response(event.challenge ?? "", { status: 200 });
 			}
 			const e = event.event ?? {};
-			// tab === "home" only — the event also fires for the Messages tab.
+			// tab === "home" only; the event also fires for the Messages tab.
 			if (e.type === "app_home_opened" && e.tab === "home" && typeof e.user === "string") {
 				ctx.waitUntil(publishHome(env, e.user));
 			}
@@ -769,7 +768,7 @@ export default {
 					const parsed = JSON.parse(clickedDelete.value) as { id?: unknown };
 					if (typeof parsed.id === "number") id = parsed.id;
 				} catch {
-					// stale/foreign button value — ignore
+					// stale or foreign button value, ignore
 				}
 				if (id != null) {
 					ctx.waitUntil(handleDeleteClick(env, id, payload.response_url, payload.message));
@@ -779,7 +778,7 @@ export default {
 		}
 
 		if (payload.type !== "view_submission" || payload.view?.callback_id !== CALLBACK_ID) {
-			return new Response("", { status: 200 }); // not ours / not a submission — ack and ignore
+			return new Response("", { status: 200 }); // not ours or not a submission, ack and ignore
 		}
 
 		const state = payload.view?.state ?? {};
@@ -813,18 +812,18 @@ export default {
 					// Upgrade the username to the profile's full name when we can.
 					input.submittedBy = (await fetchFullName(env, userId)) ?? input.submittedBy;
 					const { ok, message, blocks } = await registerVisitor(env, input);
-					// Update the open modal first — it's what the submitter is watching.
+					// Update the open modal first; it's what the submitter is watching.
 					if (viewId) await updateStatusModal(env, viewId, message);
 					await postMessage(env, userId, message, blocks);
-					// Successes also go to the visitors channel — the human-readable
-					// log of registrations (VISITOR_CHANNEL; empty disables the log).
+					// Successes also go to the visitors channel, the human-readable
+					// log of registrations (VISITOR_CHANNEL; empty disables it).
 					// Failures stay in the submitter's DM.
 					if (ok && env.VISITOR_CHANNEL) await postMessage(env, env.VISITOR_CHANNEL, message, blocks);
 				})(),
 			);
 			return jsonResponse({ response_action: "update", view: statusModal(REGISTERING_TEXT) });
 		}
-		// No user id (shouldn't happen for a real submission) — just close the modal.
+		// No user id (shouldn't happen for a real submission), just close the modal.
 		return new Response("", { status: 200 });
 	},
 } satisfies ExportedHandler<Env>;

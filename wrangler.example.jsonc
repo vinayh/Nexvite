@@ -16,16 +16,16 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
-	// Non-secret config only — secrets live in .dev.vars / `wrangler secret put`.
+	// Non-secret config only; secrets live in .dev.vars / `wrangler secret put`.
 	"vars": {
 		// Space subdomain in https://{sub}.spaces.nexudus.com
 		"NEXUDUS_SUBDOMAIN": "your-space",
 		// The space's location id (GET /api/public/businesses/all)
 		"NEXUDUS_BUSINESS_ID": "1000000000",
 		// Display timezone for arrival times; ExpectedArrival is sent as UTC (README).
-		// Tests assert Europe/London rendering — leave it if you run the suite.
+		// Tests assert Europe/London rendering; leave it if you run the suite.
 		"SPACE_TIMEZONE": "Europe/London",
-		// Registration log channel (id or #name) — the bot must be invited to it.
+		// Registration log channel (id or #name); the bot must be invited to it.
 		// Change it here and redeploy; empty disables the channel log.
 		"VISITOR_CHANNEL": "#visitor-requests"
 	},
@@ -34,8 +34,8 @@
 	"kv_namespaces": [
 		{ "binding": "TOKENS", "id": "00000000000000000000000000000000" }
 	],
-	// Per-IP flood insurance ahead of the HMAC work (workers.dev has no zone, so
-	// no WAF rules). namespace_id is an arbitrary per-Worker integer.
+	// Per-IP rate limit ahead of the HMAC work (workers.dev has no zone, so no
+	// WAF rules). namespace_id is an arbitrary per-Worker integer.
 	"ratelimits": [
 		{ "name": "RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
 	]

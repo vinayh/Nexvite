@@ -2,14 +2,11 @@
 #
 # Fetch Nexudus API tokens and print the auth seed as KEY=value lines.
 #
-# Pipe the output into scripts/nexudus-seed.sh to write the auth record to KV
-# (or copy the lines and `pbpaste | scripts/nexudus-seed.sh` later). Prompts
-# for the account username + password (or reads NEXUDUS_USERNAME /
+# Prompts for the account username and password (or reads NEXUDUS_USERNAME /
 # NEXUDUS_PASSWORD from the environment); the subdomain defaults to the value
-# in wrangler.jsonc.
-#
-# Exactly three KEY=value lines go to stdout (nothing else), so the output can
-# be copied verbatim or piped straight into scripts/nexudus-seed.sh.
+# in wrangler.jsonc. Exactly three KEY=value lines go to stdout, so the output
+# can be piped straight into scripts/nexudus-seed.sh to write the auth record
+# to KV, or copied and seeded later with `pbpaste | scripts/nexudus-seed.sh`.
 #
 # The token request must be application/x-www-form-urlencoded (a JSON body
 # returns unsupported_grant_type).

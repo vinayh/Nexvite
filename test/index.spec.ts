@@ -135,9 +135,9 @@ function blockActionsBody(
 	} = {},
 ): string {
 	// As Slack delivers the clicked message: verbatim content in `blocks`, a `text`
-	// fallback with newlines collapsed to spaces, and the ✅ (U+2705) fully-qualified
+	// fallback with newlines collapsed to spaces, and the ✅ (U+2705) fully qualified
 	// with a trailing variation selector (U+FE0F). The newline collapse and emoji
-	// requalification are exactly what naive restyling trips on — this shape guards both.
+	// requalification are what naive restyling trips on; this shape guards both.
 	let message: object | undefined;
 	if (extra.messageText != null) {
 		const returned = extra.messageText.replace(/✅/g, "✅️");
@@ -176,7 +176,7 @@ function headerGet(headers: unknown, name: string): string | undefined {
 	return undefined;
 }
 
-// users.info lookup — the submitter's full name. GET, unlike the POST methods.
+// users.info lookup for the submitter's full name. GET, unlike the POST methods.
 function mockUserInfo(reply: object = { ok: true, user: { profile: { real_name: "Vinay Hiremath" } } }, user = "U1") {
 	fetchMock.get(SLACK_BASE).intercept({ path: "/api/users.info", method: "GET", query: { user } }).reply(200, JSON.stringify(reply));
 }
@@ -203,7 +203,7 @@ function mockVisitors(capture?: (c: Captured) => void, status = 200, data = "") 
 		});
 }
 
-// GET /api/public/visitors/my?showUpcoming=true — the account's own upcoming
+// GET /api/public/visitors/my?showUpcoming=true: the account's own upcoming
 // registrations (the only Nexudus read route). Each call registers one reply,
 // consumed in order, so multiple calls model successive lookups (e.g. a retry).
 function mockMyList(records: unknown[]) {
@@ -244,7 +244,7 @@ describe("routing", () => {
 
 describe("rate limiting", () => {
 	it("throttles a single IP with 429 once the per-minute limit is exceeded", async () => {
-		// Limit is 20/min (wrangler.jsonc ratelimits). Unsigned requests suffice —
+		// Limit is 20/min (wrangler.jsonc ratelimits). Unsigned requests suffice:
 		// the limiter runs before signature verification, so the first 20 get 401
 		// and the 21st is cut off with 429 (no outbound calls either way).
 		const statuses: number[] = [];
@@ -265,7 +265,7 @@ describe("rate limiting", () => {
 			RATE_LIMITER: { limit: () => Promise.reject(new Error("limiter down")) } as RateLimit,
 		};
 		const res = await run(await slackRequest("/slack/command", COMMAND_BODY), broken);
-		expect(res.status).toBe(200); // not 500, not 429 — the request went through
+		expect(res.status).toBe(200); // not 500 or 429, the request went through
 		expect(viewsOpen.trigger_id).toBe("trigger-123");
 	});
 });
@@ -380,12 +380,13 @@ describe("view_submission -> register + DM", () => {
 		let dm: any;
 		mockUserInfo();
 		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
-		// The create returned 200 but the record never appears in /my (even after the
-		// retry). The POST may still have gone through, so warn softly (DM only, no
-		// channel log) and steer away from a blind retry rather than cry failure.
+		// The create returned 200 but the record never appears in /my (even after
+		// the retry). The POST may still have gone through, so warn softly (DM only,
+		// no channel log) and steer away from a blind retry rather than report an
+		// outright failure.
 		mockMyList([]); // first lookup: not there
 		mockMyList([]); // retry: still not there
-		mockSlack("chat.postMessage", (b) => (dm = b)); // DM only — no channel post
+		mockSlack("chat.postMessage", (b) => (dm = b)); // DM only, no channel post
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -585,7 +586,7 @@ describe("view_submission -> register + DM", () => {
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 
-		// The Slack messages carry the escaped form — no mention injection…
+		// The Slack messages carry the escaped form, no mention injection…
 		for (const post of posts) {
 			expect(post.text).toContain("*Name:* Jane &lt;!channel&gt; &amp; Co");
 			expect(post.text).not.toContain("<!channel>");
@@ -628,7 +629,7 @@ describe("view_submission -> register + DM", () => {
 		// The ack immediately swaps the modal for the "registering" placeholder…
 		expect(JSON.parse(await res.text()).response_action).toBe("update");
 		// …then the background work updates that same view to the ✅ result (no
-		// Delete button in the modal — that lives on the durable DM/channel message).
+		// Delete button in the modal; that lives on the durable DM/channel message).
 		expect(update.view_id).toBe("V123");
 		expect(update.view.blocks[0].text.text).toBe(`${SUCCESS_TEXT}\n*Nexudus ID:* 42`);
 		expect(JSON.stringify(update.view.blocks)).not.toContain("delete_visitor");
@@ -639,7 +640,7 @@ describe("view_submission -> register + DM", () => {
 		let update: any;
 		mockUserInfo();
 		mockSlack("views.update", (b) => (update = b));
-		mockSlack("chat.postMessage"); // DM only — no channel log on failure
+		mockSlack("chat.postMessage"); // DM only, no channel log on failure
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { viewId: "V123" })));
 		expect(res.status).toBe(200);
@@ -652,7 +653,7 @@ describe("view_submission -> register + DM", () => {
 		mockUserInfo();
 		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
 		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		// No mockSlack("views.update") — afterEach asserts none was attempted.
+		// No mockSlack("views.update"); afterEach asserts none was attempted.
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
 
@@ -687,7 +688,7 @@ describe("App Home -> button -> modal", () => {
 		expect(res.status).toBe(200); // afterEach asserts no views.publish happened
 	});
 
-	it("ignores a DM to the bot — the DM entry point is disabled (no outbound calls)", async () => {
+	it("ignores a DM to the bot, since the DM entry point is disabled (no outbound calls)", async () => {
 		const res = await run(
 			await slackRequest("/slack/events", eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", text: "hi" })),
 		);
@@ -748,8 +749,8 @@ describe("delete button -> remove visitor", () => {
 
 	it("deletes by the captured Id (no /my lookup) and confirms by restyling the clicked message", async () => {
 		// The button carries the exact Nexudus Id, so deletion is a direct DELETE by
-		// Id and the 🗑️ confirmation is the ✅ message restyled — the only place the
-		// Notes / Submitted-by lines survive (the list API omits them). No mockList:
+		// Id and the 🗑️ confirmation is the ✅ message restyled, the only place the
+		// Notes and Submitted-by lines survive (the list API omits them). No mockList:
 		// asserting no /my call is made on this path.
 		const clicked = SUCCESS_TEXT + "\n*Nexudus ID:* 42"; // exactly what the ✅ posts
 		mockDelete(42);
@@ -760,9 +761,9 @@ describe("delete button -> remove visitor", () => {
 		expect(res.status).toBe(200);
 		expect(await res.text()).toBe("");
 		expect(respond.replace_original).toBe(true);
-		// Header swapped (matched by text — Slack requalifies the ✅), every visitor
-		// field struck, invite note dropped, Submitted-by + ID kept. Line breaks
-		// intact because it's sourced from blocks, not the collapsed fallback text.
+		// Header swapped (matched by text since Slack requalifies the ✅), every
+		// visitor field struck, invite note dropped, Submitted-by + ID kept. Line
+		// breaks intact because it's sourced from blocks, not the collapsed fallback.
 		const deletedText = [
 			"🗑️ *Registration deleted*",
 			"~*Name:* Jane Doe~",
