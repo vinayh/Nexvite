@@ -52,7 +52,7 @@ The submitter's identity comes from the payload's `user` field, upgraded to the 
 
 ## Log channel
 
-Successes are logged to the admin-set channel stored in KV if present, else the `VISITOR_CHANNEL` default from config. To change it, a user listed in `ADMIN_USER_IDS` opens the app's **Home tab** and picks a channel under **Admin settings**. No redeploy needed. `ADMIN_USER_IDS` is the only gate; workspace-admin status is not consulted, so access is deterministic and testable from config, and an empty list means nobody can change it. The picker is rendered only for allowlisted users, and the handler re-checks the allowlist (and that the value is a conversation id) server-side before writing. The bot must be a member of whichever channel is in effect (`/invite @<bot name>`), or channel logging fails `not_in_channel`.
+Successes are logged to the `VISITOR_CHANNEL` from config (a channel id or `#name`; empty disables the channel log). To change it, edit `wrangler.jsonc` and redeploy; there is no in-app setting. The bot must be a member of the channel (`/invite @<bot name>`), or channel logging fails `not_in_channel`.
 
 ## Deleting a registration
 
@@ -88,10 +88,9 @@ Every ✅ message's **Delete registration** button holds the Nexudus Id captured
 | `NEXUDUS_SUBDOMAIN` | Space subdomain in `https://{sub}.spaces.nexudus.com` |
 | `NEXUDUS_BUSINESS_ID` | The space's location id |
 | `SPACE_TIMEZONE` | IANA timezone of the space; used to *display* arrival times in messages (`ExpectedArrival` itself is sent as UTC) |
-| `VISITOR_CHANNEL` | **Default** channel id or `#name` that successful registrations are logged to; admins can override it from the Home tab (stored in KV under `visitor_channel`) |
-| `ADMIN_USER_IDS` | Comma-separated Slack **user ids** (e.g. `U012ABC3,U045DEF6`) allowed to change the log channel. The only gate; empty means nobody can change it |
+| `VISITOR_CHANNEL` | Channel id or `#name` that successful registrations are logged to; empty disables the channel log |
 
-**KV binding** `TOKENS`: the Nexudus auth record (under the `nexudus` key, rotated by the Worker) and the admin-set log channel (under `visitor_channel`). Created and seeded in [Deploying](#deploying); shared with the Nexroom Worker, the keys don't collide.
+**KV binding** `TOKENS`: the Nexudus auth record (under the `nexudus` key, rotated by the Worker). Created and seeded in [Deploying](#deploying); shared with the Nexroom Worker, the keys don't collide.
 
 **Secrets**: production only, set with `wrangler secret put <NAME>`. There is no local secrets file by default. If you ever run `wrangler dev` against the real APIs, create `.dev.vars` from [`.dev.vars.example`](.dev.vars.example) (gitignored):
 
@@ -112,7 +111,7 @@ npm run check        # typecheck src/ and test/
 npm test             # vitest (one-shot; npm run test:watch to watch)
 ```
 
-Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts): routing, rate limiting and signature rejection; slash command to modal; registration (the outbound Nexudus body, the KV auth record, refresh-on-401 rotation, failure modes, past-arrival rejection, mrkdwn escaping); the Home tab and admin allowlist; and the delete flow.
+Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts): routing, rate limiting and signature rejection; slash command to modal; registration (the outbound Nexudus body, the KV auth record, refresh-on-401 rotation, failure modes, past-arrival rejection, mrkdwn escaping); the Home tab; and the delete flow.
 
 ## Deploying
 

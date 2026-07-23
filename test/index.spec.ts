@@ -1,6 +1,6 @@
 import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import worker, { TOKEN_KEY, CHANNEL_KEY, lookupRetry } from "../src/index";
+import worker, { TOKEN_KEY, lookupRetry } from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
 
@@ -46,7 +46,6 @@ beforeAll(() => {
 afterEach(async () => {
 	fetchMock.assertNoPendingInterceptors();
 	await env.TOKENS.delete(TOKEN_KEY); // isolate KV state between tests
-	await env.TOKENS.delete(CHANNEL_KEY); // …including the admin-set log channel
 });
 
 // --- Slack signing helpers (mirror the Worker) -----------------------------
@@ -131,7 +130,6 @@ function blockActionsBody(
 	extra: {
 		value?: string;
 		responseUrl?: string;
-		selectedConversation?: string;
 		userId?: string;
 		messageText?: string;
 	} = {},
@@ -159,7 +157,6 @@ function blockActionsBody(
 			{
 				action_id: actionId,
 				...(extra.value ? { value: extra.value } : {}),
-				...(extra.selectedConversation ? { selected_conversation: extra.selectedConversation } : {}),
 			},
 		],
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
@@ -399,21 +396,6 @@ describe("view_submission -> register + DM", () => {
 		expect(dm.text).not.toContain("❌"); // not framed as an outright failure
 		expect(dm.text).toContain("*Name:* Jane Doe"); // still echoes what was submitted
 		expect(dm.text).not.toContain("*Nexudus ID:*");
-	});
-
-	it("logs a success to the admin-configured channel instead of the default", async () => {
-		await env.TOKENS.put(CHANNEL_KEY, "C777"); // an admin picked this channel earlier
-		const posts: any[] = [];
-		mockUserInfo();
-		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
-
-		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
-		expect(res.status).toBe(200);
-		expect(posts[0].channel).toBe("U1"); // DM unchanged
-		expect(posts[1].channel).toBe("C777"); // the KV override, not env.VISITOR_CHANNEL
 	});
 
 	it("DMs a friendly failure with a generic contact when KV is unseeded (nothing reaches Nexudus)", async () => {
@@ -698,8 +680,6 @@ describe("App Home -> button -> modal", () => {
 		expect(publish.view.type).toBe("home");
 		const actions = publish.view.blocks.find((b: any) => b.type === "actions");
 		expect(actions.elements[0].action_id).toBe("open_visitor_form");
-		// Not on the ADMIN_USER_IDS allowlist — the channel picker is absent.
-		expect(JSON.stringify(publish.view.blocks)).not.toContain("set_visitor_channel");
 	});
 
 	it("ignores app_home_opened for the Messages tab (no outbound calls)", async () => {
@@ -727,79 +707,6 @@ describe("App Home -> button -> modal", () => {
 	it("acks and ignores block_actions for an unknown action_id (no outbound calls)", async () => {
 		const res = await run(await slackRequest("/slack/interactivity", blockActionsBody("some_other_action")));
 		expect(res.status).toBe(200);
-	});
-});
-
-describe("admin config -> log channel", () => {
-	// U1 is allowlisted here; testEnv's own ADMIN_USER_IDS (from wrangler.jsonc)
-	// contains none of the test users. (Cast: wrangler types the var's literal.)
-	const allowlistEnv = { ...testEnv, ADMIN_USER_IDS: "U9, U1 , U2" } as unknown as Env;
-
-	// The channel picker is a conversations_select rendered as a section accessory.
-	function findPicker(view: any): any {
-		return view.blocks.find((b: any) => b.accessory?.action_id === "set_visitor_channel")?.accessory;
-	}
-
-	async function openHome(user = "U1", envOverride: Env = testEnv): Promise<any> {
-		let publish: any;
-		mockSlack("views.publish", (b) => (publish = b));
-		const res = await run(await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user, tab: "home" })), envOverride);
-		expect(res.status).toBe(200);
-		return publish;
-	}
-
-	it("shows the log-channel picker to an allowlisted user, seeded with the default channel", async () => {
-		const publish = await openHome("U1", allowlistEnv);
-		const picker = findPicker(publish.view);
-		expect(picker?.type).toBe("conversations_select");
-		// The default #visitor-requests is a name, not an id → no initial_conversation.
-		expect(picker.initial_conversation).toBeUndefined();
-		expect(JSON.stringify(publish.view.blocks)).toContain("Currently logging to #visitor-requests");
-	});
-
-	it("hides the picker from a user not on the allowlist", async () => {
-		expect(findPicker((await openHome()).view)).toBeUndefined();
-	});
-
-	it("stores an allowlisted user's channel choice and re-publishes with it selected", async () => {
-		let publish: any;
-		mockSlack("views.publish", (b) => (publish = b));
-
-		const res = await run(
-			await slackRequest("/slack/interactivity", blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" })),
-			allowlistEnv,
-		);
-		expect(res.status).toBe(200);
-		// Persisted to KV…
-		expect(await env.TOKENS.get(CHANNEL_KEY)).toBe("C999");
-		// …and the refreshed Home tab preselects it and mentions it as a channel link.
-		const picker = findPicker(publish.view);
-		expect(picker.initial_conversation).toBe("C999");
-		expect(JSON.stringify(publish.view.blocks)).toContain("<#C999>");
-	});
-
-	it("ignores a channel change from a user not on the allowlist (KV untouched)", async () => {
-		mockSlack("views.publish"); // the re-publish still happens, just without the picker
-
-		const res = await run(
-			await slackRequest("/slack/interactivity", blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "C999" })),
-		);
-		expect(res.status).toBe(200);
-		expect(await env.TOKENS.get(CHANNEL_KEY)).toBeNull();
-	});
-
-	it("ignores a selection that isn't a conversation id, even from an allowlisted user (KV untouched)", async () => {
-		mockSlack("views.publish");
-
-		const res = await run(
-			await slackRequest(
-				"/slack/interactivity",
-				blockActionsBody("set_visitor_channel", "trig-set", { selectedConversation: "#typed-name" }),
-			),
-			allowlistEnv,
-		);
-		expect(res.status).toBe(200);
-		expect(await env.TOKENS.get(CHANNEL_KEY)).toBeNull();
 	});
 });
 
