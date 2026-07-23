@@ -213,6 +213,14 @@ function mockMyList(records: unknown[]) {
 		.reply(200, JSON.stringify({ Records: records }));
 }
 
+// Raw /my reply, for the response shapes and statuses mockMyList can't model.
+function mockMyListRaw(body: string, status = 200) {
+	fetchMock
+		.get(NEXUDUS_BASE)
+		.intercept({ path: "/api/public/visitors/my", method: "GET", query: { showUpcoming: "true" } })
+		.reply(status, body);
+}
+
 function mockRefresh(
 	capture?: (c: Captured) => void,
 	status = 200,
@@ -239,6 +247,16 @@ describe("routing", () => {
 		const req = new IncomingRequest("https://worker.example/slack/command", { method: "GET" });
 		const res = await run(req);
 		expect(res.status).toBe(405);
+	});
+
+	it("acks malformed JSON on /slack/events with a 200 (no outbound calls)", async () => {
+		const res = await run(await slackRequest("/slack/events", "{not json"));
+		expect(res.status).toBe(200);
+	});
+
+	it("acks a malformed interactivity payload with a 200 (no outbound calls)", async () => {
+		const res = await run(await slackRequest("/slack/interactivity", new URLSearchParams({ payload: "{not json" }).toString()));
+		expect(res.status).toBe(200);
 	});
 });
 
@@ -660,6 +678,208 @@ describe("view_submission -> register + DM", () => {
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
 		expect(posts).toHaveLength(2);
+	});
+
+	it("treats a legacy KV pair without a username as unseeded", async () => {
+		// Nexroom shares this namespace and predates the {username, ...} shape.
+		await env.TOKENS.put(TOKEN_KEY, JSON.stringify({ access_token: "old-access", refresh_token: "old-refresh" }));
+		let dm: any;
+		mockUserInfo();
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("contact the space team"); // no username to name
+	});
+
+	it("treats a refresh 200 with a malformed body as a failure and leaves KV untouched", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockVisitors(undefined, 401);
+		mockRefresh(undefined, 200, {}); // 200 but no token pair in the body
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("contact svc@example.com");
+		// The good record survives; a garbage pair must never overwrite it.
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(AUTH);
+	});
+
+	it("still posts the channel log when the DM fetch itself throws", async () => {
+		// The existing DM-failure test mocks an ok:false reply; this one throws.
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		fetchMock
+			.get(SLACK_BASE)
+			.intercept({ path: "/api/chat.postMessage", method: "POST" })
+			.replyWithError(new Error("socket hang up")); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log still goes out
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(1);
+		expect(posts[0].channel).toBe(env.VISITOR_CHANNEL);
+	});
+
+	it("falls back to the username when the users.info fetch throws", async () => {
+		const posts: any[] = [];
+		fetchMock
+			.get(SLACK_BASE)
+			.intercept({ path: "/api/users.info", method: "GET", query: { user: "U1" } })
+			.replyWithError(new Error("connection refused"));
+		mockVisitors();
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Submitted by:* vinay");
+	});
+
+	it("renders a winter arrival without the summer offset", async () => {
+		const winterEpoch = Date.UTC(2031, 0, 20, 14, 30, 0) / 1000; // Europe/London on GMT, UTC+0
+		let visitor: Captured | undefined;
+		const posts: any[] = [];
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-01-20T14:30:00" }]);
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+
+		const values = {
+			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
+			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+			arrival: { value: { type: "datetimepicker", selected_date_time: winterEpoch } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(visitor!.body!)[0].ExpectedArrival).toBe("2031-01-20T14:30:00");
+		expect(posts[0].text).toContain("*Arrival:* 2031-01-20 14:30 (Europe/London)");
+	});
+
+	it("drops the dangling half when the length cap splits an emoji", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockSlack("chat.postMessage"); // DM
+		mockSlack("chat.postMessage"); // channel log
+
+		// 199 chars + an emoji (two code units): the 200-char cap lands mid-pair.
+		const values = {
+			full_name: { value: { type: "plain_text_input", value: "N".repeat(199) + "😀" } },
+			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+			arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(visitor!.body!)[0].FullName).toBe("N".repeat(199)); // no lone surrogate
+	});
+});
+
+describe("Id lookup -> /my parsing", () => {
+	beforeEach(seed);
+
+	// Submit the default form, expect a success DM carrying `id`, return the DM.
+	async function submitExpectingId(id: number): Promise<any> {
+		const posts: any[] = [];
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain(`*Nexudus ID:* ${id}`);
+		return posts[0];
+	}
+
+	// Submit the default form, expect the soft "not confirmed" DM (no channel log).
+	async function submitExpectingUnconfirmed(): Promise<void> {
+		let dm: any;
+		mockSlack("chat.postMessage", (b) => (dm = b)); // DM only
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("not confirmed");
+	}
+
+	it("resolves the Id from a bare-array /my response", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyListRaw(JSON.stringify([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]));
+		await submitExpectingId(42);
+	});
+
+	it("resolves the Id from an envelope under a key other than Records", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyListRaw(JSON.stringify({ Items: [{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }] }));
+		await submitExpectingId(42);
+	});
+
+	it("treats a /my body with no array anywhere as unconfirmed", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyListRaw(JSON.stringify({ Foo: 1 })); // first lookup
+		mockMyListRaw(JSON.stringify({ Foo: 1 })); // retry
+		await submitExpectingUnconfirmed();
+	});
+
+	it("treats a /my 500 as unconfirmed", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyListRaw("", 500); // first lookup
+		mockMyListRaw("", 500); // retry
+		await submitExpectingUnconfirmed();
+	});
+
+	it("matches a record in the legacy /Date(ms)/ form", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: `/Date(${ARRIVAL_EPOCH * 1000})/` }]);
+		await submitExpectingId(42);
+	});
+
+	it("matches an offset-suffixed ISO arrival", async () => {
+		mockUserInfo();
+		mockVisitors();
+		// Same instant as ARRIVAL_UTC, expressed with an explicit +01:00 offset.
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-20T15:30:00+01:00" }]);
+		await submitExpectingId(42);
+	});
+
+	it("prefers UtcExpectedArrival over ExpectedArrival when both parse", async () => {
+		mockUserInfo();
+		mockVisitors();
+		// 99 matches only on the space-local ExpectedArrival; 42 matches on the UTC
+		// field. Utc wins whenever it parses, so 99 must be excluded.
+		mockMyList([
+			{ Id: 99, Email: "jane.doe@gmail.com", UtcExpectedArrival: "2030-07-20T13:30:00", ExpectedArrival: ARRIVAL_UTC },
+			{ Id: 42, Email: "jane.doe@gmail.com", UtcExpectedArrival: ARRIVAL_UTC, ExpectedArrival: "2030-07-20T15:30:00" },
+		]);
+		const dm = await submitExpectingId(42);
+		const button = dm.blocks.find((b: any) => b.type === "actions").elements[0];
+		expect(JSON.parse(button.value)).toEqual({ id: 42 }); // not the decoy's 99
+	});
+
+	it("matches the visitor email case-insensitively", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([{ Id: 42, Email: "Jane.Doe@Gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		await submitExpectingId(42);
+	});
+
+	it("picks the newest Id when duplicate registrations match", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([
+			{ Id: 41, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC },
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC },
+		]);
+		await submitExpectingId(43);
 	});
 });
 
