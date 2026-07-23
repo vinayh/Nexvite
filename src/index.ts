@@ -16,7 +16,8 @@
 
 const CALLBACK_ID = "visitor_registration";
 const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
-const DELETE_ACTION = "delete_visitor"; // button on the ✅ confirmation messages
+const DELETE_ACTION = "delete_visitor"; // button on the ✅ confirmation messages (single visit / whole series)
+const DELETE_ROW_ACTION = "delete_visitor_row"; // per-visit button on a series ✅ message's rows
 
 // Modal block/action ids, used to read each value from view.state.values.
 const FIELDS = {
@@ -518,11 +519,16 @@ function fromWallClock(wallClock: string, timeZone: string): number {
 	return epoch;
 }
 
-// mrkdwn arrival line, space-local and minute-granular (like the modal pickers),
-// e.g. "*Arrival:* 2026-07-20 15:30 (Europe/London)".
-function arrivalLine(env: Env, epochSeconds: number): string {
+// Space-local, minute-granular rendering of an instant (like the modal
+// pickers), e.g. "2026-07-20 15:30 (Europe/London)".
+function spaceTime(env: Env, epochSeconds: number): string {
 	const local = toWallClock(epochSeconds, env.SPACE_TIMEZONE).replace("T", " ").slice(0, 16);
-	return `*Arrival:* ${local} (${env.SPACE_TIMEZONE})`;
+	return `${local} (${env.SPACE_TIMEZONE})`;
+}
+
+// mrkdwn arrival line (the first visit when repeating).
+function arrivalLine(env: Env, epochSeconds: number): string {
+	return `*Arrival:* ${spaceTime(env, epochSeconds)}`;
 }
 
 interface VisitorInput {
@@ -561,40 +567,62 @@ function submissionSummary(env: Env, input: VisitorInput): string {
 const INVITE_NOTE = "_The visitor should receive an invite from the Nexudus platform shortly at the email below._";
 const SERIES_INVITE_NOTE = "_The visitor should receive a separate Nexudus invite at the email below for each visit in the series._";
 
-// The delete button's payload: the Nexudus Id(s) captured at registration,
-// which the click handler deletes directly (README, delete flow). Single
-// visits keep the original `{id}` shape so older messages' buttons still work.
+// The delete buttons' payload: the Nexudus Id(s) captured at registration,
+// which the click handlers delete directly (README, delete flow). Single
+// visits and per-visit rows use the `{id}` shape (so older single-visit
+// messages' buttons still work); a series' Delete-all button carries `{ids}`.
 interface DeleteRef {
 	id?: number;
 	ids?: number[];
 }
 
-// Success message blocks: the summary plus a Delete button (with a Slack-side
-// confirm dialog) carrying the DeleteRef in its value. A repeating series gets
-// one button for the whole series; per-visit deletion stays in the portal.
+function deleteButton(label: string, ref: DeleteRef, actionId: string, confirmText: string) {
+	return {
+		type: "button",
+		text: { type: "plain_text", text: label },
+		style: "danger",
+		action_id: actionId,
+		value: JSON.stringify(ref),
+		confirm: {
+			title: { type: "plain_text", text: "Delete?" },
+			text: { type: "plain_text", text: confirmText },
+			confirm: { type: "plain_text", text: "Delete" },
+			deny: { type: "plain_text", text: "Keep" },
+		},
+	};
+}
+
+// Single-visit ✅ blocks: the summary plus a Delete button.
 function successBlocks(text: string, ref: DeleteRef): unknown[] {
-	const count = ref.ids?.length ?? 1;
 	return [
 		{ type: "section", text: { type: "mrkdwn", text } },
+		{ type: "actions", elements: [deleteButton("Delete registration", ref, DELETE_ACTION, "The visitor will be removed from Nexudus.")] },
+	];
+}
+
+// Series ✅ blocks: the summary section, then one row per visit with its own
+// Delete accessory (strikes just that row), then a Delete-all button. 30 rows
+// + head + actions stays well under Slack's 50-block message cap. The row's
+// block_id carries the visit's Nexudus Id so the click handler can find and
+// restyle exactly the clicked row.
+function seriesSuccessBlocks(headText: string, rows: { id: number; line: string }[]): unknown[] {
+	return [
+		{ type: "section", text: { type: "mrkdwn", text: headText } },
+		...rows.map((row) => ({
+			type: "section",
+			block_id: `visit_${row.id}`,
+			text: { type: "mrkdwn", text: row.line },
+			accessory: deleteButton("Delete", { id: row.id }, DELETE_ROW_ACTION, "This visit will be removed from Nexudus."),
+		})),
 		{
 			type: "actions",
 			elements: [
-				{
-					type: "button",
-					text: { type: "plain_text", text: count > 1 ? `Delete all ${count} registrations` : "Delete registration" },
-					style: "danger",
-					action_id: DELETE_ACTION,
-					value: JSON.stringify(ref),
-					confirm: {
-						title: { type: "plain_text", text: count > 1 ? "Delete all registrations?" : "Delete this registration?" },
-						text: {
-							type: "plain_text",
-							text: count > 1 ? `All ${count} visits will be removed from Nexudus.` : "The visitor will be removed from Nexudus.",
-						},
-						confirm: { type: "plain_text", text: "Delete" },
-						deny: { type: "plain_text", text: "Keep" },
-					},
-				},
+				deleteButton(
+					`Delete all ${rows.length} registrations`,
+					{ ids: rows.map((row) => row.id) },
+					DELETE_ACTION,
+					`All ${rows.length} visits will be removed from Nexudus.`,
+				),
 			],
 		},
 	];
@@ -672,10 +700,16 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 		};
 	}
 
-	const inviteNote = ids.length > 1 ? SERIES_INVITE_NOTE : INVITE_NOTE;
-	const idLine = ids.length > 1 ? `*Nexudus IDs:* ${ids.join(", ")}` : `*Nexudus ID:* ${ids[0]}`;
-	const message = `✅ *Visitor registered*\n${inviteNote}\n${summary}\n${idLine}`;
-	return { ok: true, message, blocks: successBlocks(message, ids.length > 1 ? { ids } : { id: ids[0] }) };
+	if (ids.length === 1) {
+		const message = `✅ *Visitor registered*\n${INVITE_NOTE}\n${summary}\n*Nexudus ID:* ${ids[0]}`;
+		return { ok: true, message, blocks: successBlocks(message, { id: ids[0] }) };
+	}
+	// A series lists each visit on its own row (with a per-visit Delete button
+	// in the blocks); ids and arrivalEpochs are aligned, both ascending.
+	const rows = ids.map((id, i) => ({ id, line: `*Visit ${i + 1}:* ${spaceTime(env, input.arrivalEpochs![i])} · Nexudus ID ${id}` }));
+	const head = `✅ *Visitor registered*\n${SERIES_INVITE_NOTE}\n${summary}`;
+	const message = [head, ...rows.map((row) => row.line)].join("\n");
+	return { ok: true, message, blocks: seriesSuccessBlocks(head, rows) };
 }
 
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
@@ -769,21 +803,69 @@ function deletedFromMessage(messageText: string | undefined): string {
 			// Match on the header text, not the leading ✅: Slack fully qualifies the
 			// emoji on round-trip (appends a variation selector), so === would miss.
 			if (line.includes("*Visitor registered*")) return "🗑️ *Registration deleted*";
-			return /^\*(Name|Email|Phone|Arrival|Repeats|Visiting|Notes):\*/.test(line) ? `~${line}~` : line;
+			if (line.startsWith("~")) return line; // a row already struck by its own Delete
+			return /^\*(Name|Email|Phone|Arrival|Repeats|Visiting|Notes|Visit \d+):\*/.test(line) ? `~${line}~` : line;
 		})
 		.join("\n");
+}
+
+type SlackMessage = { text?: string; blocks?: unknown[] };
+
+type SectionBlock = { type?: string; block_id?: unknown; text?: { text?: unknown }; accessory?: unknown };
+
+// Restyle the whole clicked message for the single/Delete-all path: every
+// section's lines run through deletedFromMessage's rules; accessories (row
+// Delete buttons) and actions blocks are dropped. Falls back to the text-only
+// form when the message carries no section blocks.
+function deletedFromBlocks(message?: SlackMessage): { text: string; blocks: unknown[] } {
+	const restyled = (message?.blocks ?? []).flatMap((raw) => {
+		const block = raw as SectionBlock;
+		if (block.type !== "section" || typeof block.text?.text !== "string") return [];
+		return [{ type: "section", text: { type: "mrkdwn", text: deletedFromMessage(block.text.text) } }];
+	});
+	if (!restyled.length) {
+		const text = deletedFromMessage(message?.text);
+		return { text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] };
+	}
+	return { text: restyled.map((b) => b.text.text).join("\n"), blocks: restyled };
+}
+
+// Strike one visit row in place (per-visit Delete): the row's text is struck
+// and its Delete accessory dropped; every other block — the summary, the other
+// rows' buttons, the Delete-all actions block — survives, so the rest of the
+// series stays deletable. Null when the row can't be found (stale message).
+function strikeRowBlocks(message: SlackMessage | undefined, blockId: string): { text: string; blocks: unknown[] } | null {
+	if (!message?.blocks || !blockId) return null;
+	let found = false;
+	const rebuilt = message.blocks.map((raw) => {
+		const block = raw as SectionBlock;
+		if (block.type === "section" && block.block_id === blockId && typeof block.text?.text === "string") {
+			found = true;
+			return { type: "section", block_id: blockId, text: { type: "mrkdwn", text: `~${block.text.text}~` } };
+		}
+		return raw;
+	});
+	if (!found) return null;
+	const text = rebuilt
+		.map((raw) => {
+			const block = raw as SectionBlock;
+			return block.type === "section" && typeof block.text?.text === "string" ? block.text.text : "";
+		})
+		.filter(Boolean)
+		.join("\n");
+	return { text, blocks: rebuilt };
 }
 
 // Pause between batches of series deletes; mutable so tests can shrink it.
 export const deletePause = { ms: 5000, batch: 8 };
 
-// Delete the registration(s) by Id and return the member-facing outcome. Never
-// throws; the clicker always gets feedback. Deletes run in sequence, pausing
-// between batches: the public API allows 10 requests / 5 s and a token refresh
-// can add a call, so a full 30-visit series must not fire at once. messageText
-// is the clicked ✅ message, restyled into the 🗑️ confirmation
-// (see deletedFromMessage).
-async function deleteVisitors(env: Env, ids: number[], messageText?: string): Promise<{ ok: boolean; text: string }> {
+// Delete the registration(s) by Id and return the outcome. Never throws; the
+// clicker always gets feedback. Deletes run in sequence, pausing between
+// batches: the public API allows 10 requests / 5 s and a token refresh can add
+// a call, so a full 30-visit series must not fire at once. On ok the caller
+// restyles the clicked message itself; `note` flags visits that were already
+// gone, `text` is the ephemeral warning for failures.
+async function deleteVisitors(env: Env, ids: number[]): Promise<{ ok: boolean; note?: string; text?: string }> {
 	let missing = 0;
 	let failed = 0;
 	for (let i = 0; i < ids.length; i++) {
@@ -801,7 +883,7 @@ async function deleteVisitors(env: Env, ids: number[], messageText?: string): Pr
 			failed++;
 		}
 	}
-	if (failed === 0 && missing === 0) return { ok: true, text: deletedFromMessage(messageText) };
+	if (failed === 0 && missing === 0) return { ok: true };
 
 	// Failure contact is the Nexudus account email (see nexudusContact), not
 	// the portal, since members can't see these registrations in their own login.
@@ -823,34 +905,13 @@ async function deleteVisitors(env: Env, ids: number[], messageText?: string): Pr
 	}
 	// Some visits deleted, the rest already gone: the series is fully removed
 	// either way, so confirm with a note rather than warn.
-	return {
-		ok: true,
-		text: `${deletedFromMessage(messageText)}\n_${missing} of the ${ids.length} visits couldn't be found — they may already have been deleted._`,
-	};
+	return { ok: true, note: `_${missing} of the ${ids.length} visits couldn't be found — they may already have been deleted._` };
 }
 
-type SlackMessage = { text?: string; blocks?: unknown[] };
-
-// The clicked message's content, from its first section block: verbatim mrkdwn,
-// newlines intact. message.text is only the notification fallback (newlines
-// collapsed), so it can't be restyled line by line; used only if blocks absent.
-function messageSectionText(message?: SlackMessage): string | undefined {
-	for (const block of message?.blocks ?? []) {
-		const section = block as { type?: string; text?: { text?: unknown } };
-		if (section.type === "section" && typeof section.text?.text === "string") return section.text.text;
-	}
-	return message?.text;
-}
-
-// Handle a Delete click: delete in Nexudus, then report via the clicked
-// message's response_url. On success replace it with the restyled section
-// (Delete button dropped), on failure send the clicker an ephemeral note.
-async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
-	const { ok, text } = await deleteVisitors(env, ids, messageSectionText(message));
+// Post a report back through the clicked message's response_url; failures are
+// only log-worthy (the deletion itself already happened or didn't).
+async function respond(responseUrl: string, body: unknown): Promise<void> {
 	try {
-		const body = ok
-			? { replace_original: true, text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }
-			: { replace_original: false, response_type: "ephemeral", text };
 		const res = await fetch(responseUrl, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -860,6 +921,34 @@ async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, m
 	} catch (err) {
 		console.warn(`response_url post threw: ${err instanceof Error ? err.name : "unknown"}`); // no PII
 	}
+}
+
+// Handle a single/Delete-all click: delete in Nexudus, then on success replace
+// the clicked message with its restyled form (every delete button dropped); on
+// failure send the clicker an ephemeral note.
+async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
+	const outcome = await deleteVisitors(env, ids);
+	if (!outcome.ok) {
+		return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text: outcome.text });
+	}
+	const { text, blocks } = deletedFromBlocks(message);
+	const fullText = outcome.note ? `${text}\n${outcome.note}` : text;
+	const fullBlocks = outcome.note ? [...blocks, { type: "section", text: { type: "mrkdwn", text: outcome.note } }] : blocks;
+	return respond(responseUrl, { replace_original: true, text: fullText, blocks: fullBlocks });
+}
+
+// Handle a per-visit Delete click on a series message: delete that one visit,
+// then strike just its row in place (other rows and the Delete-all button
+// survive). Failure wording matches the single-visit path.
+async function handleRowDeleteClick(env: Env, id: number, blockId: string, responseUrl: string, message?: SlackMessage): Promise<void> {
+	const outcome = await deleteVisitors(env, [id]);
+	if (!outcome.ok) {
+		return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text: outcome.text });
+	}
+	const struck = strikeRowBlocks(message, blockId);
+	// A stale/foreign message we can't rebuild still gets a truthful ephemeral.
+	if (!struck) return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text: "🗑️ Visit deleted from Nexudus." });
+	return respond(responseUrl, { replace_original: true, ...struck });
 }
 
 // ---------------------------------------------------------------------------
@@ -947,7 +1036,7 @@ export default {
 			user?: SlackUser;
 			trigger_id?: string;
 			response_url?: string;
-			actions?: Array<{ action_id?: string; value?: string; selected_conversation?: string }>;
+			actions?: Array<{ action_id?: string; block_id?: string; value?: string; selected_conversation?: string }>;
 			message?: SlackMessage; // present on block_actions from a message (delete-by-Id)
 			view?: { id?: string; callback_id?: string; state?: ViewState };
 		};
@@ -962,6 +1051,7 @@ export default {
 		if (payload.type === "block_actions") {
 			const clickedOpen = (payload.actions ?? []).some((a) => a.action_id === OPEN_ACTION);
 			const clickedDelete = (payload.actions ?? []).find((a) => a.action_id === DELETE_ACTION);
+			const clickedRow = (payload.actions ?? []).find((a) => a.action_id === DELETE_ROW_ACTION);
 			if (clickedOpen && payload.trigger_id) {
 				const { ok, error } = await openModal(env, payload.trigger_id);
 				if (!ok) console.warn(`views.open failed: ${error ?? "unknown"}`);
@@ -981,6 +1071,17 @@ export default {
 				}
 				if (ids.length) {
 					ctx.waitUntil(handleDeleteClick(env, ids, payload.response_url, payload.message));
+				}
+			} else if (clickedRow?.value && payload.response_url) {
+				let id: number | null = null;
+				try {
+					const parsed = JSON.parse(clickedRow.value) as { id?: unknown };
+					if (typeof parsed.id === "number") id = parsed.id;
+				} catch {
+					// stale or foreign button value, ignore
+				}
+				if (id != null) {
+					ctx.waitUntil(handleRowDeleteClick(env, id, clickedRow.block_id ?? "", payload.response_url, payload.message));
 				}
 			}
 			return new Response("", { status: 200 });
