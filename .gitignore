@@ -8,6 +8,10 @@ node_modules/
 .env*
 !.env.example
 
+# Deployment-specific ids — copy wrangler.example.jsonc and run cf-typegen
+wrangler.jsonc
+worker-configuration.d.ts
+
 # Build / test output
 coverage/
 *.log

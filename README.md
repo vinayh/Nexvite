@@ -81,7 +81,7 @@ Every ✅ message's **Delete registration** button holds the Nexudus Id captured
 
 ## Configuration
 
-**Non-secret `vars`**, committed in `wrangler.jsonc`:
+**Non-secret `vars`** in `wrangler.jsonc`. The file is gitignored (it carries deployment-specific ids, as does the generated `worker-configuration.d.ts`); copy [`wrangler.example.jsonc`](wrangler.example.jsonc) to `wrangler.jsonc`, fill in your values, and run `npm run cf-typegen`:
 
 | Name | Purpose |
 |---|---|

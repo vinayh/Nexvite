@@ -19,6 +19,10 @@ jobs:
 
       - run: npm ci
 
+      # wrangler.jsonc and the generated types are gitignored (deployment ids);
+      # the placeholder template is enough for typegen and the test env.
+      - run: cp wrangler.example.jsonc wrangler.jsonc && npm run cf-typegen
+
       - run: npm run check
 
       - run: npm run test:coverage

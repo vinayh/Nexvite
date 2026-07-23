@@ -42,7 +42,7 @@ if (-not $Subdomain) {
         if ($m.Success) { $Subdomain = $m.Groups[1].Value }
     }
 }
-if (-not $Subdomain) { $Subdomain = 'your-space' }
+if (-not $Subdomain) { $Subdomain = Read-Host -Prompt 'Nexudus subdomain ({sub}.spaces.nexudus.com)' }
 
 $Username = $env:NEXUDUS_USERNAME
 if (-not $Username) { $Username = Read-Host -Prompt 'Nexudus username (email)' }
