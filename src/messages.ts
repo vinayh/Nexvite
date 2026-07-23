@@ -174,21 +174,28 @@ export interface VisitorInput {
 	submittedBy: string;
 }
 
+// The visitor's own field labels: written by submissionSummary and struck by
+// the 🗑️ restyle below. Keeping the list here (typed into both) means a new
+// summary field strikes correctly on deletion by construction. "Submitted by"
+// and "Nexudus ID" are deliberately absent so they survive the restyle.
+const SUMMARY_LABELS = ["Name", "Email", "Phone", "Arrival", "Repeats", "Visiting", "Notes"] as const;
+const STRUCK_LINE = new RegExp(`^\\*(${SUMMARY_LABELS.join("|")}|Visit \\d+):\\*`);
+
 // mrkdwn summary of what was submitted, shown under every result header (and in
 // the channel log). Blank optional fields are omitted; arrival is space-local
 // (the first visit when repeating).
 export function submissionSummary(env: Env, input: VisitorInput): string {
-	const lines: string[] = [];
-	if (input.fullName) lines.push(`*Name:* ${mrkdwnEscape(input.fullName)}`);
-	if (input.email) lines.push(`*Email:* ${mrkdwnEscape(input.email)}`);
-	if (input.phone) lines.push(`*Phone:* ${mrkdwnEscape(input.phone)}`);
-	if (input.arrivalEpochs?.length) lines.push(`*Arrival:* ${spaceTime(env, input.arrivalEpochs[0])}`);
-	if (input.repeat) {
-		const { label, until, count } = input.repeat;
-		lines.push(`*Repeats:* ${label} until ${until} (${count} visit${count === 1 ? "" : "s"})`);
-	}
-	if (input.host) lines.push(`*Visiting:* ${mrkdwnEscape(input.host)}`);
-	if (input.notes) lines.push(`*Notes:* ${mrkdwnEscape(input.notes)}`);
+	const { repeat } = input;
+	const fields: Record<(typeof SUMMARY_LABELS)[number], string | undefined> = {
+		Name: input.fullName && mrkdwnEscape(input.fullName),
+		Email: input.email && mrkdwnEscape(input.email),
+		Phone: input.phone && mrkdwnEscape(input.phone),
+		Arrival: input.arrivalEpochs?.length ? spaceTime(env, input.arrivalEpochs[0]) : undefined,
+		Repeats: repeat && `${repeat.label} until ${repeat.until} (${repeat.count} visit${repeat.count === 1 ? "" : "s"})`,
+		Visiting: input.host && mrkdwnEscape(input.host),
+		Notes: input.notes && mrkdwnEscape(input.notes),
+	};
+	const lines = SUMMARY_LABELS.filter((label) => fields[label]).map((label) => `*${label}:* ${fields[label]}`);
 	lines.push(`*Submitted by:* ${mrkdwnEscape(input.submittedBy)}`);
 	return lines.join("\n");
 }
@@ -279,7 +286,7 @@ function deletedFromMessage(messageText: string | undefined): string {
 			// emoji on round-trip (appends a variation selector), so === would miss.
 			if (line.includes("*Visitor registered*")) return "🗑️ *Registration deleted*";
 			if (line.startsWith("~")) return line; // a row already struck by its own Delete
-			return /^\*(Name|Email|Phone|Arrival|Repeats|Visiting|Notes|Visit \d+):\*/.test(line) ? `~${line}~` : line;
+			return STRUCK_LINE.test(line) ? `~${line}~` : line;
 		})
 		.join("\n");
 }

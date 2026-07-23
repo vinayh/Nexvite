@@ -46,60 +46,58 @@ export async function verifySlackSignature(request: Request, rawBody: string, si
 // Slack Web API
 // ---------------------------------------------------------------------------
 
-// Never throws: a Slack network failure must not 500 the endpoint or stop the
-// background notify chain (a failed DM should still let the channel log post).
-export async function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: boolean; error?: string }> {
+// The shared transport: authorized fetch + response parsing. Never throws — a
+// Slack network failure must not 500 the endpoint or stop the background
+// notify chain (a failed DM should still let the channel log post).
+async function slackCall(env: Env, url: string, init: RequestInit): Promise<{ ok: boolean; error?: string; json: unknown }> {
 	try {
-		const res = await fetch(`${SLACK_API}/${method}`, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
-				"Content-Type": "application/json; charset=utf-8",
-			},
-			body: JSON.stringify(body),
+		const res = await fetch(url, {
+			...init,
+			headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`, ...init.headers },
 		});
 		const json = (await res.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
-		return { ok: Boolean(json?.ok), error: json?.error };
+		return { ok: Boolean(json?.ok), error: json?.error, json };
 	} catch {
-		return { ok: false, error: "network_error" };
+		return { ok: false, error: "network_error", json: null };
 	}
 }
 
+// A JSON-POST Web API method call.
+export function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: boolean; error?: string }> {
+	return slackCall(env, `${SLACK_API}/${method}`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json; charset=utf-8" },
+		body: JSON.stringify(body),
+	});
+}
+
 // A Slack call whose failure is only log-worthy: warn with the error code
-// (never PII) and move on.
-export async function slackApiWarn(env: Env, method: string, body: unknown): Promise<void> {
+// (never PII) and move on, reporting the outcome for callers that care.
+export async function slackApiWarn(env: Env, method: string, body: unknown): Promise<boolean> {
 	const { ok, error } = await slackApi(env, method, body);
 	if (!ok) console.warn(`${method} failed: ${error ?? "unknown"}`);
+	return ok;
 }
 
 // Post a message. `channel` may be a user id (chat.postMessage opens the IM)
 // or a channel id / #name (the bot must be a member of the channel). `blocks`
 // is optional Block Kit; `text` remains the notification fallback.
-export function postMessage(env: Env, channel: string, text: string, blocks?: unknown[]): Promise<void> {
-	return slackApiWarn(env, "chat.postMessage", { channel, text, ...(blocks && { blocks }) });
+export async function postMessage(env: Env, channel: string, text: string, blocks?: unknown[]): Promise<void> {
+	await slackApiWarn(env, "chat.postMessage", { channel, text, ...(blocks && { blocks }) });
 }
 
 // The interactivity payload only carries the submitter's username; the
-// profile's full name needs a users.info lookup (scope: users:read). Returns
-// null on any failure so the caller can fall back to the username.
+// profile's full name needs a users.info lookup (scope: users:read, GET
+// unlike the POST methods). Returns null on any failure so the caller can
+// fall back to the username.
 export async function fetchFullName(env: Env, userId: string): Promise<string | null> {
-	try {
-		const res = await fetch(`${SLACK_API}/users.info?user=${encodeURIComponent(userId)}`, {
-			headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
-		});
-		const json = (await res.json().catch(() => null)) as {
-			ok?: boolean;
-			error?: string;
-			user?: { real_name?: string; profile?: { real_name?: string } };
-		} | null;
-		if (!json?.ok) {
-			console.warn(`users.info failed: ${json?.error ?? "unknown"}`); // error code only, no PII
-			return null;
-		}
-		return json.user?.profile?.real_name || json.user?.real_name || null;
-	} catch {
+	const { ok, error, json } = await slackCall(env, `${SLACK_API}/users.info?user=${encodeURIComponent(userId)}`, {});
+	if (!ok) {
+		console.warn(`users.info failed: ${error ?? "unknown"}`); // error code only, no PII
 		return null;
 	}
+	const { user } = json as { user?: { real_name?: string; profile?: { real_name?: string } } };
+	return user?.profile?.real_name || user?.real_name || null;
 }
 
 // Post a report back through a clicked message's response_url; failures are
@@ -139,14 +137,25 @@ export type ViewState = {
 	>;
 };
 
+// Where a value lives in view.state.values, as the caller's field table
+// declares it (e.g. FIELDS in src/messages.ts).
+export interface FieldRef {
+	block: string;
+	action: string;
+}
+
+function fieldValue(state: ViewState, field: FieldRef) {
+	return state.values?.[field.block]?.[field.action];
+}
+
 // Trimmed, length-capped string; undefined when absent or blank.
-export function readText(state: ViewState, block: string, action: string, cap: number): string | undefined {
-	const raw = state.values?.[block]?.[action]?.value;
+export function readText(state: ViewState, field: FieldRef & { cap: number }): string | undefined {
+	const raw = fieldValue(state, field)?.value;
 	if (typeof raw !== "string") return undefined;
 	const trimmed = raw.trim();
 	if (!trimmed) return undefined;
 	// Don't let the cap split a surrogate pair (e.g. mid-emoji).
-	const capped = trimmed.slice(0, cap);
+	const capped = trimmed.slice(0, field.cap);
 	const last = capped.charCodeAt(capped.length - 1);
 	return last >= 0xd800 && last <= 0xdbff ? capped.slice(0, -1) : capped;
 }
@@ -154,18 +163,18 @@ export function readText(state: ViewState, block: string, action: string, cap: n
 // The date/time pickers return naive strings ("YYYY-MM-DD" / "HH:mm") with no
 // timezone attached; the submission handler reads them as SPACE_TIMEZONE
 // wall-clock, matching the timezone named in the modal's labels.
-export function readDate(state: ViewState, block: string, action: string): string | undefined {
-	const raw = state.values?.[block]?.[action]?.selected_date;
+export function readDate(state: ViewState, field: FieldRef): string | undefined {
+	const raw = fieldValue(state, field)?.selected_date;
 	return typeof raw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : undefined;
 }
 
-export function readTime(state: ViewState, block: string, action: string): string | undefined {
-	const raw = state.values?.[block]?.[action]?.selected_time;
+export function readTime(state: ViewState, field: FieldRef): string | undefined {
+	const raw = fieldValue(state, field)?.selected_time;
 	return typeof raw === "string" && /^\d{2}:\d{2}$/.test(raw) ? raw : undefined;
 }
 
 // A static_select's selected value; undefined when absent (crafted payload).
-export function readSelect(state: ViewState, block: string, action: string): string | undefined {
-	const raw = state.values?.[block]?.[action]?.selected_option?.value;
+export function readSelect(state: ViewState, field: FieldRef): string | undefined {
+	const raw = fieldValue(state, field)?.selected_option?.value;
 	return typeof raw === "string" ? raw : undefined;
 }

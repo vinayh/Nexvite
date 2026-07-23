@@ -117,21 +117,48 @@ export const COMMAND_BODY = new URLSearchParams({
 	user_name: "vinay",
 }).toString();
 
+// Build view_submission state values from plain field strings, in the shapes
+// the Slack pickers deliver. Omit a key to leave its block out of the state;
+// null models a picker that is present but empty.
+export function formValues(fields: {
+	fullName?: string;
+	email?: string;
+	phone?: string;
+	date?: string;
+	time?: string | null;
+	repeat?: string;
+	until?: string | null;
+	host?: string;
+	notes?: string;
+}): Record<string, unknown> {
+	const values: Record<string, unknown> = {};
+	if ("fullName" in fields) values.full_name = { value: { type: "plain_text_input", value: fields.fullName } };
+	if ("email" in fields) values.email = { value: { type: "email_text_input", value: fields.email } };
+	if ("phone" in fields) values.phone = { value: { type: "plain_text_input", value: fields.phone } };
+	if ("date" in fields) values.arrival_date = { value: { type: "datepicker", selected_date: fields.date } };
+	if ("time" in fields) values.arrival_time = { value: { type: "timepicker", selected_time: fields.time } };
+	if ("repeat" in fields) values.repeat = { value: { type: "static_select", selected_option: { value: fields.repeat } } };
+	if ("until" in fields) values.repeat_until = { value: { type: "datepicker", selected_date: fields.until } };
+	if ("host" in fields) values.host = { value: { type: "plain_text_input", value: fields.host } };
+	if ("notes" in fields) values.notes = { value: { type: "plain_text_input", value: fields.notes } };
+	return values;
+}
+
 export function submissionBody(
 	values?: Record<string, unknown>,
 	over: { type?: string; callback_id?: string; viewId?: string } = {},
 ): string {
-	const defaults = {
-		full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
-		email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-		phone: { value: { type: "plain_text_input", value: "+44 7700 900123" } },
-		arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
-		arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
-		repeat: { value: { type: "static_select", selected_option: { value: "none" } } },
-		repeat_until: { value: { type: "datepicker", selected_date: null } },
-		host: { value: { type: "plain_text_input", value: "Sam" } },
-		notes: { value: { type: "plain_text_input", value: "Needs step-free access" } },
-	};
+	const defaults = formValues({
+		fullName: "Jane Doe",
+		email: "jane.doe@gmail.com",
+		phone: "+44 7700 900123",
+		date: ARRIVAL_DATE,
+		time: ARRIVAL_TIME,
+		repeat: "none",
+		until: null,
+		host: "Sam",
+		notes: "Needs step-free access",
+	});
 	const payload = {
 		type: over.type ?? "view_submission",
 		user: { id: "U1", name: "vinay" }, // `name` is the *username*; the full name comes from users.info

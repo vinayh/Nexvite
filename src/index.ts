@@ -50,7 +50,6 @@ import {
 	readText,
 	readTime,
 	respond,
-	slackApi,
 	slackApiWarn,
 	verifySlackSignature,
 	type SlackMessage,
@@ -62,20 +61,22 @@ import { MAX_VISITS, REPEATS, expandRepeat, fromWallClock, toWallClock, type Rep
 // rejected inline; the /my lookup used for confirmation only sees upcoming visits.
 const ARRIVAL_GRACE_S = 120;
 
-// Open the modal from a trigger_id (slash command or the Home-tab button click).
-function openModal(env: Env, triggerId: string) {
-	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal(env) });
+// Open the modal from a trigger_id (slash command or the Home-tab button
+// click). A failure is warned with the Slack error code (never PII); false
+// lets the slash-command path tell the user to retry.
+function openModal(env: Env, triggerId: string): Promise<boolean> {
+	return slackApiWarn(env, "views.open", { trigger_id: triggerId, view: visitorModal(env) });
 }
 
 // Swap the post-submission placeholder for the result, if the submitter still
 // has the modal open. A closed or expired view makes this a no-op (the DM
 // already carries the outcome), so a failure here is only logged.
-function updateStatusModal(env: Env, viewId: string, text: string): Promise<void> {
+function updateStatusModal(env: Env, viewId: string, text: string): Promise<boolean> {
 	return slackApiWarn(env, "views.update", { view_id: viewId, view: statusModal(text) });
 }
 
 // (Re)publish the Home tab for one user, on app_home_opened.
-function publishHome(env: Env, userId: string): Promise<void> {
+function publishHome(env: Env, userId: string): Promise<boolean> {
 	return slackApiWarn(env, "views.publish", { user_id: userId, view: homeView() });
 }
 
@@ -194,14 +195,17 @@ async function deleteVisitors(env: Env, ids: number[]): Promise<{ ok: boolean; n
 	return { ok: true, note: `_${missing} of the ${ids.length} visits couldn't be found — they may already have been deleted._` };
 }
 
+// An ephemeral note to just the clicker, leaving the clicked message as-is.
+function respondEphemeral(responseUrl: string, text: string | undefined): Promise<void> {
+	return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text });
+}
+
 // Handle a single/Delete-all click: delete in Nexudus, then on success replace
 // the clicked message with its restyled form (every delete button dropped); on
 // failure send the clicker an ephemeral note.
 async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
 	const outcome = await deleteVisitors(env, ids);
-	if (!outcome.ok) {
-		return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text: outcome.text });
-	}
+	if (!outcome.ok) return respondEphemeral(responseUrl, outcome.text);
 	const { text, blocks } = deletedFromBlocks(message);
 	const fullText = outcome.note ? `${text}\n${outcome.note}` : text;
 	const fullBlocks = outcome.note ? [...blocks, { type: "section", text: { type: "mrkdwn", text: outcome.note } }] : blocks;
@@ -213,13 +217,27 @@ async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, m
 // survive). Failure wording matches the single-visit path.
 async function handleRowDeleteClick(env: Env, id: number, blockId: string, responseUrl: string, message?: SlackMessage): Promise<void> {
 	const outcome = await deleteVisitors(env, [id]);
-	if (!outcome.ok) {
-		return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text: outcome.text });
-	}
+	if (!outcome.ok) return respondEphemeral(responseUrl, outcome.text);
 	const struck = strikeRowBlocks(message, blockId);
 	// A stale/foreign message we can't rebuild still gets a truthful ephemeral.
-	if (!struck) return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text: "🗑️ Visit deleted from Nexudus." });
+	if (!struck) return respondEphemeral(responseUrl, "🗑️ Visit deleted from Nexudus.");
 	return respond(responseUrl, { replace_original: true, ...struck });
+}
+
+// A delete button's value is a JSON DeleteRef: `{id}` (single visit or a
+// series row) or `{ids}` (a series' Delete-all). Empty on a stale or foreign
+// value; capped so a malformed value can't drive an unbounded delete loop.
+function parseDeleteIds(value: string): number[] {
+	try {
+		const parsed = JSON.parse(value) as DeleteRef;
+		if (typeof parsed.id === "number") return [parsed.id];
+		if (Array.isArray(parsed.ids) && parsed.ids.every((v): v is number => typeof v === "number")) {
+			return parsed.ids.slice(0, MAX_VISITS);
+		}
+	} catch {
+		// stale or foreign button value, ignore
+	}
+	return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +253,11 @@ function jsonResponse(body: unknown): Response {
 		status: 200,
 		headers: { "Content-Type": "application/json; charset=utf-8" },
 	});
+}
+
+// Bounce a view_submission with an inline error under one form block.
+function fieldError(block: string, message: string): Response {
+	return jsonResponse({ response_action: "errors", errors: { [block]: message } });
 }
 
 export default {
@@ -271,9 +294,7 @@ export default {
 			const triggerId = new URLSearchParams(rawBody).get("trigger_id");
 			if (!triggerId) return new Response("", { status: 200 });
 
-			const { ok, error } = await openModal(env, triggerId);
-			if (!ok) {
-				console.warn(`views.open failed: ${error ?? "unknown"}`);
+			if (!(await openModal(env, triggerId))) {
 				return new Response("Couldn't open the visitor form — please try again.", { status: 200 });
 			}
 			return new Response("", { status: 200 });
@@ -318,41 +339,21 @@ export default {
 		}
 
 		// Button clicks: the Home tab's "Register a visitor" opens the modal; a
-		// confirmation's "Delete registration" removes the visitor again.
+		// confirmation's "Delete registration" removes the visitor again. Slack
+		// delivers exactly one action per click.
 		if (payload.type === "block_actions") {
-			const clickedOpen = (payload.actions ?? []).some((a) => a.action_id === OPEN_ACTION);
-			const clickedDelete = (payload.actions ?? []).find((a) => a.action_id === DELETE_ACTION);
-			const clickedRow = (payload.actions ?? []).find((a) => a.action_id === DELETE_ROW_ACTION);
-			if (clickedOpen && payload.trigger_id) {
-				const { ok, error } = await openModal(env, payload.trigger_id);
-				if (!ok) console.warn(`views.open failed: ${error ?? "unknown"}`);
-			} else if (clickedDelete?.value && payload.response_url) {
-				// Accept the single `{id}` shape (older messages) or a series'
-				// `{ids}`; cap the count so a malformed value can't drive an
-				// unbounded delete loop.
-				let ids: number[] = [];
-				try {
-					const parsed = JSON.parse(clickedDelete.value) as DeleteRef;
-					if (typeof parsed.id === "number") ids = [parsed.id];
-					else if (Array.isArray(parsed.ids) && parsed.ids.every((v): v is number => typeof v === "number")) {
-						ids = parsed.ids.slice(0, MAX_VISITS);
-					}
-				} catch {
-					// stale or foreign button value, ignore
-				}
+			const action = payload.actions?.[0];
+			if (action?.action_id === OPEN_ACTION && payload.trigger_id) {
+				await openModal(env, payload.trigger_id);
+			} else if (action?.action_id === DELETE_ACTION && action.value && payload.response_url) {
+				const ids = parseDeleteIds(action.value);
 				if (ids.length) {
 					ctx.waitUntil(handleDeleteClick(env, ids, payload.response_url, payload.message));
 				}
-			} else if (clickedRow?.value && payload.response_url) {
-				let id: number | null = null;
-				try {
-					const parsed = JSON.parse(clickedRow.value) as DeleteRef;
-					if (typeof parsed.id === "number") id = parsed.id;
-				} catch {
-					// stale or foreign button value, ignore
-				}
+			} else if (action?.action_id === DELETE_ROW_ACTION && action.value && payload.response_url) {
+				const [id] = parseDeleteIds(action.value);
 				if (id != null) {
-					ctx.waitUntil(handleRowDeleteClick(env, id, clickedRow.block_id ?? "", payload.response_url, payload.message));
+					ctx.waitUntil(handleRowDeleteClick(env, id, action.block_id ?? "", payload.response_url, payload.message));
 				}
 			}
 			return new Response("", { status: 200 });
@@ -366,13 +367,14 @@ export default {
 		const userId = payload.user?.id;
 		// The pickers are naive and labeled with SPACE_TIMEZONE in the modal, so the
 		// combined wall-clock is read in the space's timezone, not the member's.
-		const arrivalDate = readDate(state, FIELDS.arrivalDate.block, FIELDS.arrivalDate.action);
-		const arrivalTime = readTime(state, FIELDS.arrivalTime.block, FIELDS.arrivalTime.action);
+		const arrivalDate = readDate(state, FIELDS.arrivalDate);
+		const arrivalTime = readTime(state, FIELDS.arrivalTime);
 		// The repeat select always carries a value (it has an initial_option), but a
 		// crafted payload may not; anything unrecognized reads as "none".
-		const repeatRaw = readSelect(state, FIELDS.repeat.block, FIELDS.repeat.action);
-		const repeat: RepeatKey = repeatRaw !== undefined && repeatRaw in REPEATS ? (repeatRaw as RepeatKey) : "none";
-		const repeatUntil = readDate(state, FIELDS.repeatUntil.block, FIELDS.repeatUntil.action);
+		// Object.hasOwn, not `in`: a crafted "toString" must not walk the prototype.
+		const repeatRaw = readSelect(state, FIELDS.repeat);
+		const repeat: RepeatKey = repeatRaw !== undefined && Object.hasOwn(REPEATS, repeatRaw) ? (repeatRaw as RepeatKey) : "none";
+		const repeatUntil = readDate(state, FIELDS.repeatUntil);
 
 		// Expand the repeat into visit dates, bouncing bad combinations back onto
 		// the repeat fields inline. Skipped when the arrival itself is missing
@@ -382,7 +384,7 @@ export default {
 		if (arrivalDate && arrivalTime) {
 			const expanded = expandRepeat(arrivalDate, repeat, repeatUntil);
 			if ("error" in expanded) {
-				return jsonResponse({ response_action: "errors", errors: { [FIELDS[expanded.field].block]: expanded.error } });
+				return fieldError(FIELDS[expanded.field].block, expanded.error);
 			}
 			arrivalEpochs = expanded.dates.map((date) => fromWallClock(`${date}T${arrivalTime}:00`, env.SPACE_TIMEZONE));
 			if (repeat !== "none") {
@@ -393,25 +395,23 @@ export default {
 			}
 		}
 		const input: VisitorInput = {
-			fullName: readText(state, FIELDS.fullName.block, FIELDS.fullName.action, FIELDS.fullName.cap),
-			email: readText(state, FIELDS.email.block, FIELDS.email.action, FIELDS.email.cap),
-			phone: readText(state, FIELDS.phone.block, FIELDS.phone.action, FIELDS.phone.cap),
+			fullName: readText(state, FIELDS.fullName),
+			email: readText(state, FIELDS.email),
+			phone: readText(state, FIELDS.phone),
 			arrivalEpochs,
 			repeat: repeatInfo,
-			host: readText(state, FIELDS.host.block, FIELDS.host.action, FIELDS.host.cap),
-			notes: readText(state, FIELDS.notes.block, FIELDS.notes.action, FIELDS.notes.cap),
+			host: readText(state, FIELDS.host),
+			notes: readText(state, FIELDS.notes),
 			submittedBy: payload.user?.name ?? payload.user?.username ?? "a Slack user",
 		};
 
 		// Bounce a past first arrival back onto the time field (ARRIVAL_GRACE_S);
 		// the series is ascending, so later visits can't be earlier.
 		if (input.arrivalEpochs?.length && input.arrivalEpochs[0] < Date.now() / 1000 - ARRIVAL_GRACE_S) {
-			return jsonResponse({
-				response_action: "errors",
-				errors: {
-					[FIELDS.arrivalTime.block]: `This time is in the past (${env.SPACE_TIMEZONE}) — pick when the visitor is expected to arrive.`,
-				},
-			});
+			return fieldError(
+				FIELDS.arrivalTime.block,
+				`This time is in the past (${env.SPACE_TIMEZONE}) — pick when the visitor is expected to arrive.`,
+			);
 		}
 
 		// Register + notify in the background so we ack within Slack's 3s window.

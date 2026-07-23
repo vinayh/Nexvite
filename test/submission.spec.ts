@@ -14,6 +14,7 @@ import {
 	NEXUDUS_BASE,
 	SLACK_BASE,
 	SUCCESS_TEXT,
+	formValues,
 	mockMyList,
 	mockMyListRaw,
 	mockPosts,
@@ -231,12 +232,7 @@ describe("view_submission -> register + DM", () => {
 		mockMyList([MY_RECORD]);
 		mockPosts();
 
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "N".repeat(250) } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
-			arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
-		};
+		const values = formValues({ fullName: "N".repeat(250), email: "jane.doe@gmail.com", date: ARRIVAL_DATE, time: ARRIVAL_TIME });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(JSON.parse(visitor!.body!)[0].FullName).toBe("N".repeat(200)); // FIELDS.fullName.cap
@@ -262,12 +258,7 @@ describe("view_submission -> register + DM", () => {
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
 		// Date without time: the pair only yields an arrival when both parse.
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
-			arrival_time: { value: { type: "timepicker", selected_time: null } },
-		};
+		const values = formValues({ fullName: "Jane Doe", email: "jane.doe@gmail.com", date: ARRIVAL_DATE, time: null });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(dm.text).toContain("❌ *Registration failed*");
@@ -275,12 +266,7 @@ describe("view_submission -> register + DM", () => {
 	});
 
 	it("rejects a past arrival with an inline field error (no outbound calls)", async () => {
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: "2020-01-01" } },
-			arrival_time: { value: { type: "timepicker", selected_time: "12:00" } },
-		};
+		const values = formValues({ fullName: "Jane Doe", email: "jane.doe@gmail.com", date: "2020-01-01", time: "12:00" });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		const ack = JSON.parse(await res.text());
@@ -295,12 +281,7 @@ describe("view_submission -> register + DM", () => {
 		mockMyList([MY_RECORD]);
 		const posts = mockPosts();
 
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "Jane <!channel> & Co" } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
-			arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
-		};
+		const values = formValues({ fullName: "Jane <!channel> & Co", email: "jane.doe@gmail.com", date: ARRIVAL_DATE, time: ARRIVAL_TIME });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 
@@ -465,12 +446,7 @@ describe("view_submission -> register + DM", () => {
 		const posts = mockPosts();
 
 		// 14:30 UK time on 2031-01-20 is GMT (UTC+0), so Nexudus gets 14:30 as-is.
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: "2031-01-20" } },
-			arrival_time: { value: { type: "timepicker", selected_time: "14:30" } },
-		};
+		const values = formValues({ fullName: "Jane Doe", email: "jane.doe@gmail.com", date: "2031-01-20", time: "14:30" });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(JSON.parse(visitor!.body!)[0].ExpectedArrival).toBe("2031-01-20T14:30:00");
@@ -485,12 +461,7 @@ describe("view_submission -> register + DM", () => {
 		mockPosts();
 
 		// 199 chars + an emoji (two code units): the 200-char cap lands mid-pair.
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "N".repeat(199) + "😀" } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
-			arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
-		};
+		const values = formValues({ fullName: "N".repeat(199) + "😀", email: "jane.doe@gmail.com", date: ARRIVAL_DATE, time: ARRIVAL_TIME });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(JSON.parse(visitor!.body!)[0].FullName).toBe("N".repeat(199)); // no lone surrogate

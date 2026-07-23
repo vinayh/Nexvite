@@ -77,20 +77,26 @@ function nexudusBase(env: Env): string {
 	return `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 }
 
-// Run an authenticated Nexudus request: current token first; on a 401 refresh
-// once (rotating the KV record) and retry. A 401 that survives the refresh is
-// a broken auth chain, not a caller-level rejection, so it also yields null.
-// Never throws; returns null on an auth or network failure, which the caller
-// turns into a member-facing message.
-async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: string) => Promise<Response>): Promise<Response | null> {
+// Run an authenticated Nexudus API request: current token first; on a 401
+// refresh once (rotating the KV record) and retry. A 401 that survives the
+// refresh is a broken auth chain, not a caller-level rejection, so it also
+// yields null. Never throws; returns null on an auth or network failure,
+// which the caller turns into a member-facing message.
+async function nexudusFetch(
+	env: Env,
+	path: string,
+	init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+): Promise<Response | null> {
 	const base = nexudusBase(env);
+	const doFetch = (accessToken: string) =>
+		fetch(`${base}${path}`, { ...init, headers: { ...init.headers, Authorization: `Bearer ${accessToken}` } });
 	try {
 		const auth = await readAuth(env);
 		if (!auth) {
 			console.error("nexudus auth missing from KV; seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
 			return null;
 		}
-		let res = await doFetch(base, auth.access_token);
+		let res = await doFetch(auth.access_token);
 		if (res.status === 401) {
 			const refreshed = await refreshAuth(base, auth);
 			if (!refreshed) {
@@ -98,7 +104,7 @@ async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: strin
 				return null;
 			}
 			await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
-			res = await doFetch(base, refreshed.access_token);
+			res = await doFetch(refreshed.access_token);
 			if (res.status === 401) {
 				console.error("nexudus rejected the refreshed token; check the account, then re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
 				return null;
@@ -110,6 +116,8 @@ async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: strin
 		return null;
 	}
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // Visitor operations
@@ -130,13 +138,7 @@ export interface NewVisitor {
 // Null on an auth or network failure (see nexudusFetch).
 export function createVisitors(env: Env, visitors: NewVisitor[]): Promise<Response | null> {
 	const body = JSON.stringify(visitors.map((visitor) => ({ BusinessId: Number(env.NEXUDUS_BUSINESS_ID), ...visitor })));
-	return nexudusFetch(env, (base, accessToken) =>
-		fetch(`${base}/api/public/visitors`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
-			body,
-		}),
-	);
+	return nexudusFetch(env, "/api/public/visitors", { method: "POST", headers: { "Content-Type": "application/json" }, body });
 }
 
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
@@ -181,11 +183,7 @@ export const lookupRetry = { ms: 1000 };
 export async function lookupVisitorIds(env: Env, email: string, arrivalUtcs: string[]): Promise<number[] | null> {
 	const sentMs = arrivalUtcs.map((arrivalUtc) => Date.parse(`${arrivalUtc}Z`));
 	const attempt = async (): Promise<number[] | null> => {
-		const res = await nexudusFetch(env, (base, accessToken) =>
-			fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
-				headers: { Authorization: `Bearer ${accessToken}` },
-			}),
-		);
+		const res = await nexudusFetch(env, "/api/public/visitors/my?showUpcoming=true");
 		if (!res?.ok) return null;
 		// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
 		// space-local, so a visit one offset-hour away could match by coincidence.
@@ -205,7 +203,7 @@ export async function lookupVisitorIds(env: Env, email: string, arrivalUtcs: str
 	};
 	const ids = await attempt();
 	if (ids != null) return ids;
-	await new Promise((resolve) => setTimeout(resolve, lookupRetry.ms));
+	await sleep(lookupRetry.ms);
 	return attempt();
 }
 
@@ -222,13 +220,8 @@ export async function deleteVisitorIds(env: Env, ids: number[]): Promise<{ missi
 	let missing = 0;
 	let failed = 0;
 	for (let i = 0; i < ids.length; i++) {
-		if (i > 0 && i % deletePause.batch === 0) await new Promise((resolve) => setTimeout(resolve, deletePause.ms));
-		const res = await nexudusFetch(env, (base, accessToken) =>
-			fetch(`${base}/api/public/visitors/${ids[i]}`, {
-				method: "DELETE",
-				headers: { Authorization: `Bearer ${accessToken}` },
-			}),
-		);
+		if (i > 0 && i % deletePause.batch === 0) await sleep(deletePause.ms);
+		const res = await nexudusFetch(env, `/api/public/visitors/${ids[i]}`, { method: "DELETE" });
 		if (res?.ok) continue;
 		if (res && (res.status === 404 || res.status === 410)) missing++;
 		else {

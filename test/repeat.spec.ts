@@ -6,6 +6,7 @@ import {
 	ARRIVAL_DATE,
 	ARRIVAL_TIME,
 	MY_RECORD,
+	formValues,
 	mockMyList,
 	mockPosts,
 	mockSlack,
@@ -37,16 +38,16 @@ describe("repeating visits", () => {
 		]);
 		const posts = mockPosts();
 
-		const values = {
-			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
-			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival_date: { value: { type: "datepicker", selected_date: "2030-10-17" } },
-			arrival_time: { value: { type: "timepicker", selected_time: "10:00" } },
-			repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } },
-			// A Friday: the last matching Thursday is Oct 31, and the summary must
-			// show that real last visit, not the raw picker value.
-			repeat_until: { value: { type: "datepicker", selected_date: "2030-11-01" } },
-		};
+		// Until is a Friday: the last matching Thursday is Oct 31, and the summary
+		// must show that real last visit, not the raw picker value.
+		const values = formValues({
+			fullName: "Jane Doe",
+			email: "jane.doe@gmail.com",
+			date: "2030-10-17",
+			time: "10:00",
+			repeat: "weekly",
+			until: "2030-11-01",
+		});
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering 3 visits");
@@ -88,57 +89,40 @@ describe("repeating visits", () => {
 		expect(ack.errors[block]).toContain(fragment);
 	}
 
-	const base = {
-		full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
-		email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-		arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
-		arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
-	};
+	const base = { fullName: "Jane Doe", email: "jane.doe@gmail.com", date: ARRIVAL_DATE, time: ARRIVAL_TIME };
 
 	it("rejects a repeat without an end date", async () => {
-		await expectInlineError(
-			{ ...base, repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } } },
-			"repeat_until",
-			"Pick the last visit date",
-		);
+		await expectInlineError(formValues({ ...base, repeat: "weekly" }), "repeat_until", "Pick the last visit date");
 	});
 
 	it("rejects an end date before the first visit", async () => {
-		await expectInlineError(
-			{
-				...base,
-				repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } },
-				repeat_until: { value: { type: "datepicker", selected_date: "2030-07-19" } },
-			},
-			"repeat_until",
-			"before the first visit",
-		);
+		await expectInlineError(formValues({ ...base, repeat: "weekly", until: "2030-07-19" }), "repeat_until", "before the first visit");
 	});
 
 	it("rejects a series longer than 30 visits, naming the cap", async () => {
 		// Daily 2030-07-20 → 2030-08-20 inclusive is 32 visits.
-		await expectInlineError(
-			{
-				...base,
-				repeat: { value: { type: "static_select", selected_option: { value: "daily" } } },
-				repeat_until: { value: { type: "datepicker", selected_date: "2030-08-20" } },
-			},
-			"repeat_until",
-			"more than 30 visits",
-		);
+		await expectInlineError(formValues({ ...base, repeat: "daily", until: "2030-08-20" }), "repeat_until", "more than 30 visits");
 	});
 
 	it("rejects a weekday repeat starting on a weekend", async () => {
 		// ARRIVAL_DATE 2030-07-20 is a Saturday.
-		await expectInlineError(
-			{
-				...base,
-				repeat: { value: { type: "static_select", selected_option: { value: "weekdays" } } },
-				repeat_until: { value: { type: "datepicker", selected_date: "2030-07-25" } },
-			},
-			"repeat",
-			"weekend",
-		);
+		await expectInlineError(formValues({ ...base, repeat: "weekdays", until: "2030-07-25" }), "repeat", "weekend");
+	});
+
+	it("reads an inherited-property repeat value as 'none' (single visit, no crash)", async () => {
+		// "toString" passes an `in REPEATS` check via the prototype chain; it must
+		// be treated like any other unrecognized value, not expanded as a cadence.
+		mockUserInfo();
+		let visitor: Captured | undefined;
+		mockVisitors((c) => (visitor = c));
+		mockMyList([MY_RECORD]);
+		mockPosts();
+
+		const values = formValues({ ...base, repeat: "toString", until: "2030-08-20" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering your visitor");
+		expect(JSON.parse(visitor!.body!)).toHaveLength(1); // one visit, until ignored
 	});
 
 	it("goes unconfirmed when the Id lookup can't resolve every visit in the series", async () => {
@@ -149,11 +133,7 @@ describe("repeating visits", () => {
 		let dm: any;
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
-		const values = {
-			...base,
-			repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } },
-			repeat_until: { value: { type: "datepicker", selected_date: "2030-07-27" } },
-		};
+		const values = formValues({ ...base, repeat: "weekly", until: "2030-07-27" });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(dm.text).toContain("⚠️ *Registration submitted — but not confirmed*");
