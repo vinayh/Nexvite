@@ -25,9 +25,27 @@ const FIELDS = {
 	phone: { block: "phone", action: "value", cap: 50 },
 	arrivalDate: { block: "arrival_date", action: "value" },
 	arrivalTime: { block: "arrival_time", action: "value" },
+	repeat: { block: "repeat", action: "value" },
+	repeatUntil: { block: "repeat_until", action: "value" },
 	host: { block: "host", action: "value", cap: 200 },
 	notes: { block: "notes", action: "value", cap: 1000 },
 } as const;
+
+// The cadences offered by the modal's "Repeat visit" select. Expansion steps
+// through calendar dates in SPACE_TIMEZONE date space; every occurrence keeps
+// the first visit's wall-clock time. Nexudus has no recurrence field — a
+// repeating visit is just one visitor object per date in a single create
+// request (README) — so a series is capped like the Nexudus portal's own
+// "up to 30 visits in one go".
+const REPEATS = {
+	none: { label: "Does not repeat", stepDays: 0 },
+	daily: { label: "Every day", stepDays: 1 },
+	weekdays: { label: "Every weekday (Mon–Fri)", stepDays: 1 },
+	weekly: { label: "Every week", stepDays: 7 },
+	fortnightly: { label: "Every 2 weeks", stepDays: 14 },
+} as const;
+type RepeatKey = keyof typeof REPEATS;
+const MAX_VISITS = 30;
 
 const SLACK_API = "https://slack.com/api";
 
@@ -146,6 +164,10 @@ function inputBlock(block: string, action: string, label: string, element: Recor
 	};
 }
 
+function repeatOption(key: RepeatKey) {
+	return { text: { type: "plain_text", text: REPEATS[key].label }, value: key };
+}
+
 function visitorModal(env: Env) {
 	return {
 		type: "modal",
@@ -175,6 +197,23 @@ function visitorModal(env: Env) {
 				false,
 				`Time at the space (${env.SPACE_TIMEZONE}), not your own time zone.`,
 			),
+			// Repeat cadence + inclusive end date; the arrival above is the first
+			// visit. "Repeat until" must be optional so Slack doesn't demand it on
+			// single-visit submissions; picking a cadence without it is bounced
+			// with an inline error instead.
+			inputBlock(FIELDS.repeat.block, FIELDS.repeat.action, "Repeat visit", {
+				type: "static_select",
+				initial_option: repeatOption("none"),
+				options: (Object.keys(REPEATS) as RepeatKey[]).map(repeatOption),
+			}),
+			inputBlock(
+				FIELDS.repeatUntil.block,
+				FIELDS.repeatUntil.action,
+				`Repeat until (${env.SPACE_TIMEZONE})`,
+				{ type: "datepicker" },
+				true,
+				`Last possible visit date when repeating — up to ${MAX_VISITS} visits.`,
+			),
 			inputBlock(FIELDS.host.block, FIELDS.host.action, "Who are they visiting?", { type: "plain_text_input" }, true),
 			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, true),
 		],
@@ -201,8 +240,10 @@ function statusModal(text: string) {
 }
 
 // Placeholder shown on submission while registration runs in the background.
-const REGISTERING_TEXT =
-	"⏳ *Registering your visitor…*\nThis usually takes a few seconds. You'll get a direct message with the result — you can close this window any time.";
+function registeringText(visitCount: number): string {
+	const head = visitCount > 1 ? `⏳ *Registering ${visitCount} visits…*` : "⏳ *Registering your visitor…*";
+	return `${head}\nThis usually takes a few seconds. You'll get a direct message with the result — you can close this window any time.`;
+}
 
 // Swap the post-submission placeholder for the result, if the submitter still
 // has the modal open. A closed or expired view makes this a no-op (the DM
@@ -251,7 +292,10 @@ function publishHome(env: Env, userId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 type ViewState = {
-	values?: Record<string, Record<string, { value?: unknown; selected_date?: unknown; selected_time?: unknown }>>;
+	values?: Record<
+		string,
+		Record<string, { value?: unknown; selected_date?: unknown; selected_time?: unknown; selected_option?: { value?: unknown } }>
+	>;
 };
 
 // Trimmed, length-capped string; undefined when absent or blank.
@@ -279,9 +323,65 @@ function readTime(state: ViewState, block: string, action: string): string | und
 	return typeof raw === "string" && /^\d{2}:\d{2}$/.test(raw) ? raw : undefined;
 }
 
+// The repeat select always carries a value (it has an initial_option), but a
+// crafted payload may not; anything unrecognized reads as "none".
+function readRepeat(state: ViewState, block: string, action: string): RepeatKey {
+	const raw = state.values?.[block]?.[action]?.selected_option?.value;
+	return typeof raw === "string" && raw in REPEATS ? (raw as RepeatKey) : "none";
+}
+
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
 // rejected inline; the /my lookup used for confirmation only sees upcoming visits.
 const ARRIVAL_GRACE_S = 120;
+
+// ---------------------------------------------------------------------------
+// Repeat expansion
+// ---------------------------------------------------------------------------
+//
+// Calendar math over naive "YYYY-MM-DD" strings is timezone-free, so the
+// series is expanded in date space and only the final date+time wall-clocks
+// are converted to instants (per occurrence, so DST changes mid-series keep
+// the space-local time).
+
+function addDays(date: string, days: number): string {
+	const d = new Date(`${date}T00:00:00Z`);
+	d.setUTCDate(d.getUTCDate() + days);
+	return d.toISOString().slice(0, 10);
+}
+
+function isWeekend(date: string): boolean {
+	const day = new Date(`${date}T00:00:00Z`).getUTCDay();
+	return day === 0 || day === 6;
+}
+
+// Expand the repeat selection into visit dates (first date included, ascending)
+// or an inline field error. `until` is inclusive; ISO date strings compare
+// correctly as strings.
+function expandRepeat(
+	firstDate: string,
+	repeat: RepeatKey,
+	until: string | undefined,
+): { dates: string[] } | { errorBlock: string; error: string } {
+	if (repeat === "none") return { dates: [firstDate] };
+	if (!until) {
+		return { errorBlock: FIELDS.repeatUntil.block, error: "Pick the last visit date for the repeat." };
+	}
+	if (until < firstDate) {
+		return { errorBlock: FIELDS.repeatUntil.block, error: "The repeat ends before the first visit — pick a later date." };
+	}
+	if (repeat === "weekdays" && isWeekend(firstDate)) {
+		return { errorBlock: FIELDS.repeat.block, error: "The first visit falls on a weekend — pick a weekday arrival date to repeat on weekdays." };
+	}
+	const dates: string[] = [];
+	for (let date = firstDate; date <= until; date = addDays(date, REPEATS[repeat].stepDays)) {
+		if (repeat === "weekdays" && isWeekend(date)) continue;
+		dates.push(date);
+		if (dates.length > MAX_VISITS) {
+			return { errorBlock: FIELDS.repeatUntil.block, error: `That's more than ${MAX_VISITS} visits — pick an earlier end date.` };
+		}
+	}
+	return { dates };
+}
 
 // ---------------------------------------------------------------------------
 // Nexudus auth (KV-backed, auto-refreshing)
@@ -429,20 +529,26 @@ interface VisitorInput {
 	fullName?: string;
 	email?: string;
 	phone?: string;
-	arrivalEpoch?: number;
+	arrivalEpochs?: number[]; // ascending; single-element when not repeating
+	repeat?: { label: string; until: string; count: number }; // set when repeating; until is the last visit's date
 	host?: string;
 	notes?: string;
 	submittedBy: string;
 }
 
 // mrkdwn summary of what was submitted, shown under every result header (and in
-// the channel log). Blank optional fields are omitted; arrival is space-local.
+// the channel log). Blank optional fields are omitted; arrival is space-local
+// (the first visit when repeating).
 function submissionSummary(env: Env, input: VisitorInput): string {
 	const lines: string[] = [];
 	if (input.fullName) lines.push(`*Name:* ${mrkdwnEscape(input.fullName)}`);
 	if (input.email) lines.push(`*Email:* ${mrkdwnEscape(input.email)}`);
 	if (input.phone) lines.push(`*Phone:* ${mrkdwnEscape(input.phone)}`);
-	if (input.arrivalEpoch != null) lines.push(arrivalLine(env, input.arrivalEpoch));
+	if (input.arrivalEpochs?.length) lines.push(arrivalLine(env, input.arrivalEpochs[0]));
+	if (input.repeat) {
+		const { label, until, count } = input.repeat;
+		lines.push(`*Repeats:* ${label} until ${until} (${count} visit${count === 1 ? "" : "s"})`);
+	}
 	if (input.host) lines.push(`*Visiting:* ${mrkdwnEscape(input.host)}`);
 	if (input.notes) lines.push(`*Notes:* ${mrkdwnEscape(input.notes)}`);
 	lines.push(`*Submitted by:* ${mrkdwnEscape(input.submittedBy)}`);
@@ -450,17 +556,24 @@ function submissionSummary(env: Env, input: VisitorInput): string {
 }
 
 // Top line of the ✅ confirmation; dropped from the 🗑️ message on deletion.
+// Nexudus emails a separate invite (with its own PIN/QR) per visit, so the
+// series variant says so — otherwise one invite per visit looks like a bug.
 const INVITE_NOTE = "_The visitor should receive an invite from the Nexudus platform shortly at the email below._";
+const SERIES_INVITE_NOTE = "_The visitor should receive a separate Nexudus invite at the email below for each visit in the series._";
 
-// The delete button's payload: the Nexudus Id captured at registration, which
-// the click handler deletes directly (README, delete flow).
+// The delete button's payload: the Nexudus Id(s) captured at registration,
+// which the click handler deletes directly (README, delete flow). Single
+// visits keep the original `{id}` shape so older messages' buttons still work.
 interface DeleteRef {
-	id: number;
+	id?: number;
+	ids?: number[];
 }
 
 // Success message blocks: the summary plus a Delete button (with a Slack-side
-// confirm dialog) carrying the DeleteRef in its value.
+// confirm dialog) carrying the DeleteRef in its value. A repeating series gets
+// one button for the whole series; per-visit deletion stays in the portal.
 function successBlocks(text: string, ref: DeleteRef): unknown[] {
+	const count = ref.ids?.length ?? 1;
 	return [
 		{ type: "section", text: { type: "mrkdwn", text } },
 		{
@@ -468,13 +581,16 @@ function successBlocks(text: string, ref: DeleteRef): unknown[] {
 			elements: [
 				{
 					type: "button",
-					text: { type: "plain_text", text: "Delete registration" },
+					text: { type: "plain_text", text: count > 1 ? `Delete all ${count} registrations` : "Delete registration" },
 					style: "danger",
 					action_id: DELETE_ACTION,
 					value: JSON.stringify(ref),
 					confirm: {
-						title: { type: "plain_text", text: "Delete this registration?" },
-						text: { type: "plain_text", text: "The visitor will be removed from Nexudus." },
+						title: { type: "plain_text", text: count > 1 ? "Delete all registrations?" : "Delete this registration?" },
+						text: {
+							type: "plain_text",
+							text: count > 1 ? `All ${count} visits will be removed from Nexudus.` : "The visitor will be removed from Nexudus.",
+						},
 						confirm: { type: "plain_text", text: "Delete" },
 						deny: { type: "plain_text", text: "Keep" },
 					},
@@ -498,12 +614,12 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 		message: `❌ *Registration failed*\n${reason}\n${summary}`,
 	});
 
-	if (!input.fullName || !input.email || input.arrivalEpoch == null) {
+	if (!input.fullName || !input.email || !input.arrivalEpochs?.length) {
 		return failed("Full name, email and expected arrival are all required.");
 	}
 	// Nexudus reads the naive ExpectedArrival as UTC (shown space-local in the
 	// portal), so send UTC wall-clock; the summary echoes the space-local time.
-	const arrivalUtc = toWallClock(input.arrivalEpoch, "UTC");
+	const arrivalUtcs = input.arrivalEpochs.map((epoch) => toWallClock(epoch, "UTC"));
 
 	// All registrations go through one account, so CustomerNotes is reception's
 	// only view of who submitted and who the visitor is for.
@@ -511,15 +627,17 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 	if (input.host) noteLines.push(`Visiting: ${input.host}`);
 	if (input.notes) noteLines.push(input.notes);
 
-	const visitor = {
+	// One visitor object per visit in a single request: this is how the Nexudus
+	// API registers a repeating series — there is no recurrence field (README).
+	const visitors = arrivalUtcs.map((arrivalUtc) => ({
 		BusinessId: Number(env.NEXUDUS_BUSINESS_ID), // config only, never from the request
 		FullName: input.fullName,
 		Email: input.email,
 		PhoneNumber: input.phone,
 		ExpectedArrival: arrivalUtc,
 		CustomerNotes: noteLines.join("\n"),
-	};
-	const body = JSON.stringify([visitor]); // body is an array of visitors
+	}));
+	const body = JSON.stringify(visitors);
 
 	const regRes = await nexudusFetch(env, (base, accessToken) =>
 		fetch(`${base}/api/public/visitors`, {
@@ -538,13 +656,14 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 		return failed(`Nexudus rejected the registration: ${detail ? mrkdwnEscape(detail) : `HTTP ${regRes.status}`}`);
 	}
 
-	// The create returns no Id (README), so confirm by finding the record in the
-	// account's own list, which also yields the Id the Delete button needs. If it
-	// can't be found the POST may still have landed, so warn softly (DM only, no
-	// channel log) and steer away from a blind retry rather than claim success.
-	const id = await lookupVisitorId(env, input.email, arrivalUtc);
-	if (id == null) {
-		console.warn("registration unconfirmed; visitor Id lookup found no match"); // no PII
+	// The create returns no Ids (README), so confirm by finding each record in
+	// the account's own list, which also yields the Ids the Delete button needs.
+	// If any visit can't be found the POST may still have landed (whole or in
+	// part), so warn softly (DM only, no channel log) and steer away from a
+	// blind retry rather than claim success.
+	const ids = await lookupVisitorIds(env, input.email, arrivalUtcs);
+	if (ids == null) {
+		console.warn("registration unconfirmed; visitor Id lookup left unmatched visits"); // no PII
 		return {
 			ok: false,
 			message:
@@ -553,8 +672,10 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 		};
 	}
 
-	const message = `✅ *Visitor registered*\n${INVITE_NOTE}\n${summary}\n*Nexudus ID:* ${id}`;
-	return { ok: true, message, blocks: successBlocks(message, { id }) };
+	const inviteNote = ids.length > 1 ? SERIES_INVITE_NOTE : INVITE_NOTE;
+	const idLine = ids.length > 1 ? `*Nexudus IDs:* ${ids.join(", ")}` : `*Nexudus ID:* ${ids[0]}`;
+	const message = `✅ *Visitor registered*\n${inviteNote}\n${summary}\n${idLine}`;
+	return { ok: true, message, blocks: successBlocks(message, ids.length > 1 ? { ids } : { id: ids[0] }) };
 }
 
 // Parse a Nexudus date value to epoch milliseconds. Tolerates ISO strings
@@ -591,12 +712,14 @@ interface VisitorRecord {
 // Delay before the single lookup retry; mutable so tests can shrink it.
 export const lookupRetry = { ms: 1000 };
 
-// Resolve the new registration's Id from the account's own list (the only read
-// route, see README), matching on email + exact visit instant, newest wins.
-// Retries once for replication lag; null if still not found.
-async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Promise<number | null> {
-	const sentMs = Date.parse(`${arrivalUtc}Z`);
-	const attempt = async (): Promise<number | null> => {
+// Resolve the new registrations' Ids from the account's own list (the only
+// read route, see README), matching on email + each exact visit instant,
+// newest wins per instant. One GET covers the whole series. Retries once for
+// replication lag; null unless every visit resolves (a partial series takes
+// the soft-unconfirmed path rather than claiming success).
+async function lookupVisitorIds(env: Env, email: string, arrivalUtcs: string[]): Promise<number[] | null> {
+	const sentMs = arrivalUtcs.map((arrivalUtc) => Date.parse(`${arrivalUtc}Z`));
+	const attempt = async (): Promise<number[] | null> => {
 		const res = await nexudusFetch(env, (base, accessToken) =>
 			fetch(`${base}/api/public/visitors/my?showUpcoming=true`, {
 				headers: { Authorization: `Bearer ${accessToken}` },
@@ -605,18 +728,22 @@ async function lookupVisitorId(env: Env, email: string, arrivalUtc: string): Pro
 		if (!res?.ok) return null;
 		// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
 		// space-local, so a visit one offset-hour away could match by coincidence.
-		const matches = listRecords(await res.json().catch(() => null)).filter(
+		const records = listRecords(await res.json().catch(() => null)).filter(
 			(r): r is VisitorRecord =>
 				typeof (r as { Id?: unknown })?.Id === "number" &&
 				typeof (r as { Email?: unknown })?.Email === "string" &&
-				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase() &&
-				(parseNexudusInstant((r as VisitorRecord).UtcExpectedArrival) ?? parseNexudusInstant((r as VisitorRecord).ExpectedArrival)) ===
-					sentMs,
+				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase(),
 		);
-		return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
+		const ids = sentMs.map((ms) => {
+			const matches = records.filter(
+				(r) => (parseNexudusInstant(r.UtcExpectedArrival) ?? parseNexudusInstant(r.ExpectedArrival)) === ms,
+			);
+			return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
+		});
+		return ids.every((id): id is number => id != null) ? ids : null;
 	};
-	const id = await attempt();
-	if (id != null) return id;
+	const ids = await attempt();
+	if (ids != null) return ids;
 	await new Promise((resolve) => setTimeout(resolve, lookupRetry.ms));
 	return attempt();
 }
@@ -637,40 +764,69 @@ function deletedFromMessage(messageText: string | undefined): string {
 	if (!messageText) return "🗑️ *Registration deleted*";
 	return messageText
 		.split("\n")
-		.filter((line) => line !== INVITE_NOTE) // the invite no longer applies
+		.filter((line) => line !== INVITE_NOTE && line !== SERIES_INVITE_NOTE) // the invite no longer applies
 		.map((line) => {
 			// Match on the header text, not the leading ✅: Slack fully qualifies the
 			// emoji on round-trip (appends a variation selector), so === would miss.
 			if (line.includes("*Visitor registered*")) return "🗑️ *Registration deleted*";
-			return /^\*(Name|Email|Phone|Arrival|Visiting|Notes):\*/.test(line) ? `~${line}~` : line;
+			return /^\*(Name|Email|Phone|Arrival|Repeats|Visiting|Notes):\*/.test(line) ? `~${line}~` : line;
 		})
 		.join("\n");
 }
 
-// Delete the registration by its Id and return the member-facing outcome. Never
-// throws; the clicker always gets feedback. messageText is the clicked ✅
-// message, restyled into the 🗑️ confirmation (see deletedFromMessage).
-async function deleteVisitor(env: Env, id: number, messageText?: string): Promise<{ ok: boolean; text: string }> {
-	const res = await nexudusFetch(env, (base, accessToken) =>
-		fetch(`${base}/api/public/visitors/${id}`, {
-			method: "DELETE",
-			headers: { Authorization: `Bearer ${accessToken}` },
-		}),
-	);
-	if (!res?.ok) {
-		// Failure contact is the Nexudus account email (see nexudusContact), not
-		// the portal, since members can't see these registrations in their own login.
-		const contact = await nexudusContact(env);
-		if (res && (res.status === 404 || res.status === 410)) {
-			return {
-				ok: false,
-				text: `⚠️ Couldn't find this registration — it may already be deleted. If it still needs removing, contact ${contact}.`,
-			};
+// Pause between batches of series deletes; mutable so tests can shrink it.
+export const deletePause = { ms: 5000, batch: 8 };
+
+// Delete the registration(s) by Id and return the member-facing outcome. Never
+// throws; the clicker always gets feedback. Deletes run in sequence, pausing
+// between batches: the public API allows 10 requests / 5 s and a token refresh
+// can add a call, so a full 30-visit series must not fire at once. messageText
+// is the clicked ✅ message, restyled into the 🗑️ confirmation
+// (see deletedFromMessage).
+async function deleteVisitors(env: Env, ids: number[], messageText?: string): Promise<{ ok: boolean; text: string }> {
+	let missing = 0;
+	let failed = 0;
+	for (let i = 0; i < ids.length; i++) {
+		if (i > 0 && i % deletePause.batch === 0) await new Promise((resolve) => setTimeout(resolve, deletePause.ms));
+		const res = await nexudusFetch(env, (base, accessToken) =>
+			fetch(`${base}/api/public/visitors/${ids[i]}`, {
+				method: "DELETE",
+				headers: { Authorization: `Bearer ${accessToken}` },
+			}),
+		);
+		if (res?.ok) continue;
+		if (res && (res.status === 404 || res.status === 410)) missing++;
+		else {
+			if (res) console.warn(`visitor delete failed: HTTP ${res.status}`); // status only, no PII
+			failed++;
 		}
-		if (res) console.warn(`visitor delete failed: HTTP ${res.status}`); // status only, no PII
-		return { ok: false, text: `⚠️ Deleting failed — please contact ${contact} to remove the visitor.` };
 	}
-	return { ok: true, text: deletedFromMessage(messageText) };
+	if (failed === 0 && missing === 0) return { ok: true, text: deletedFromMessage(messageText) };
+
+	// Failure contact is the Nexudus account email (see nexudusContact), not
+	// the portal, since members can't see these registrations in their own login.
+	const contact = await nexudusContact(env);
+	if (failed > 0) {
+		const done = ids.length - missing - failed;
+		const text =
+			ids.length === 1
+				? `⚠️ Deleting failed — please contact ${contact} to remove the visitor.`
+				: `⚠️ Deleted ${done} of ${ids.length} registrations — the rest couldn't be deleted. Please contact ${contact} to remove them.`;
+		return { ok: false, text };
+	}
+	if (missing === ids.length) {
+		const text =
+			ids.length === 1
+				? `⚠️ Couldn't find this registration — it may already be deleted. If it still needs removing, contact ${contact}.`
+				: `⚠️ Couldn't find these registrations — they may already be deleted. If they still need removing, contact ${contact}.`;
+		return { ok: false, text };
+	}
+	// Some visits deleted, the rest already gone: the series is fully removed
+	// either way, so confirm with a note rather than warn.
+	return {
+		ok: true,
+		text: `${deletedFromMessage(messageText)}\n_${missing} of the ${ids.length} visits couldn't be found — they may already have been deleted._`,
+	};
 }
 
 type SlackMessage = { text?: string; blocks?: unknown[] };
@@ -689,8 +845,8 @@ function messageSectionText(message?: SlackMessage): string | undefined {
 // Handle a Delete click: delete in Nexudus, then report via the clicked
 // message's response_url. On success replace it with the restyled section
 // (Delete button dropped), on failure send the clicker an ephemeral note.
-async function handleDeleteClick(env: Env, id: number, responseUrl: string, message?: SlackMessage): Promise<void> {
-	const { ok, text } = await deleteVisitor(env, id, messageSectionText(message));
+async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
+	const { ok, text } = await deleteVisitors(env, ids, messageSectionText(message));
 	try {
 		const body = ok
 			? { replace_original: true, text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }
@@ -810,15 +966,21 @@ export default {
 				const { ok, error } = await openModal(env, payload.trigger_id);
 				if (!ok) console.warn(`views.open failed: ${error ?? "unknown"}`);
 			} else if (clickedDelete?.value && payload.response_url) {
-				let id: number | null = null;
+				// Accept the single `{id}` shape (older messages) or a series'
+				// `{ids}`; cap the count so a malformed value can't drive an
+				// unbounded delete loop.
+				let ids: number[] = [];
 				try {
-					const parsed = JSON.parse(clickedDelete.value) as { id?: unknown };
-					if (typeof parsed.id === "number") id = parsed.id;
+					const parsed = JSON.parse(clickedDelete.value) as { id?: unknown; ids?: unknown };
+					if (typeof parsed.id === "number") ids = [parsed.id];
+					else if (Array.isArray(parsed.ids) && parsed.ids.every((v): v is number => typeof v === "number")) {
+						ids = parsed.ids.slice(0, MAX_VISITS);
+					}
 				} catch {
 					// stale or foreign button value, ignore
 				}
-				if (id != null) {
-					ctx.waitUntil(handleDeleteClick(env, id, payload.response_url, payload.message));
+				if (ids.length) {
+					ctx.waitUntil(handleDeleteClick(env, ids, payload.response_url, payload.message));
 				}
 			}
 			return new Response("", { status: 200 });
@@ -834,18 +996,41 @@ export default {
 		// combined wall-clock is read in the space's timezone, not the member's.
 		const arrivalDate = readDate(state, FIELDS.arrivalDate.block, FIELDS.arrivalDate.action);
 		const arrivalTime = readTime(state, FIELDS.arrivalTime.block, FIELDS.arrivalTime.action);
+		const repeat = readRepeat(state, FIELDS.repeat.block, FIELDS.repeat.action);
+		const repeatUntil = readDate(state, FIELDS.repeatUntil.block, FIELDS.repeatUntil.action);
+
+		// Expand the repeat into visit dates, bouncing bad combinations back onto
+		// the repeat fields inline. Skipped when the arrival itself is missing
+		// (crafted payload); that falls through to the required-fields failure.
+		let arrivalEpochs: number[] | undefined;
+		let repeatInfo: VisitorInput["repeat"];
+		if (arrivalDate && arrivalTime) {
+			const expanded = expandRepeat(arrivalDate, repeat, repeatUntil);
+			if ("error" in expanded) {
+				return jsonResponse({ response_action: "errors", errors: { [expanded.errorBlock]: expanded.error } });
+			}
+			arrivalEpochs = expanded.dates.map((date) => fromWallClock(`${date}T${arrivalTime}:00`, env.SPACE_TIMEZONE));
+			if (repeat !== "none") {
+				// `until` is the last generated visit, not the raw picker value:
+				// "every week until Sep 19" may end days earlier.
+				const dates = expanded.dates;
+				repeatInfo = { label: REPEATS[repeat].label, until: dates[dates.length - 1], count: dates.length };
+			}
+		}
 		const input: VisitorInput = {
 			fullName: readText(state, FIELDS.fullName.block, FIELDS.fullName.action, FIELDS.fullName.cap),
 			email: readText(state, FIELDS.email.block, FIELDS.email.action, FIELDS.email.cap),
 			phone: readText(state, FIELDS.phone.block, FIELDS.phone.action, FIELDS.phone.cap),
-			arrivalEpoch: arrivalDate && arrivalTime ? fromWallClock(`${arrivalDate}T${arrivalTime}:00`, env.SPACE_TIMEZONE) : undefined,
+			arrivalEpochs,
+			repeat: repeatInfo,
 			host: readText(state, FIELDS.host.block, FIELDS.host.action, FIELDS.host.cap),
 			notes: readText(state, FIELDS.notes.block, FIELDS.notes.action, FIELDS.notes.cap),
 			submittedBy: payload.user?.name ?? payload.user?.username ?? "a Slack user",
 		};
 
-		// Bounce a past arrival back onto the time field (see ARRIVAL_GRACE_S).
-		if (input.arrivalEpoch != null && input.arrivalEpoch < Date.now() / 1000 - ARRIVAL_GRACE_S) {
+		// Bounce a past first arrival back onto the time field (ARRIVAL_GRACE_S);
+		// the series is ascending, so later visits can't be earlier.
+		if (input.arrivalEpochs?.length && input.arrivalEpochs[0] < Date.now() / 1000 - ARRIVAL_GRACE_S) {
 			return jsonResponse({
 				response_action: "errors",
 				errors: {
@@ -874,7 +1059,7 @@ export default {
 					if (ok && env.VISITOR_CHANNEL) await postMessage(env, env.VISITOR_CHANNEL, message, blocks);
 				})(),
 			);
-			return jsonResponse({ response_action: "update", view: statusModal(REGISTERING_TEXT) });
+			return jsonResponse({ response_action: "update", view: statusModal(registeringText(input.arrivalEpochs?.length ?? 1)) });
 		}
 		// No user id (shouldn't happen for a real submission), just close the modal.
 		return new Response("", { status: 200 });

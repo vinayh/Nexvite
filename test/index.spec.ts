@@ -1,6 +1,6 @@
 import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
-import worker, { TOKEN_KEY, lookupRetry } from "../src/index";
+import worker, { TOKEN_KEY, lookupRetry, deletePause } from "../src/index";
 
 const SIGNING_SECRET = "test-signing-secret";
 
@@ -47,6 +47,7 @@ beforeAll(() => {
 	fetchMock.activate();
 	fetchMock.disableNetConnect();
 	lookupRetry.ms = 0; // don't really sleep between Id-lookup attempts
+	deletePause.ms = 0; // …or between series-delete batches
 });
 afterEach(async () => {
 	fetchMock.assertNoPendingInterceptors();
@@ -109,6 +110,8 @@ function submissionBody(values?: Record<string, unknown>, over: { type?: string;
 		phone: { value: { type: "plain_text_input", value: "+44 7700 900123" } },
 		arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
 		arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
+		repeat: { value: { type: "static_select", selected_option: { value: "none" } } },
+		repeat_until: { value: { type: "datepicker", selected_date: null } },
 		host: { value: { type: "plain_text_input", value: "Sam" } },
 		notes: { value: { type: "plain_text_input", value: "Needs step-free access" } },
 	};
@@ -331,7 +334,7 @@ describe("slash command -> open modal", () => {
 		expect(viewsOpen.trigger_id).toBe("trigger-123");
 		expect(viewsOpen.view.callback_id).toBe("visitor_registration");
 		const blockIds = viewsOpen.view.blocks.map((b: any) => b.block_id);
-		expect(blockIds).toEqual(["full_name", "email", "phone", "arrival_date", "arrival_time", "host", "notes"]);
+		expect(blockIds).toEqual(["full_name", "email", "phone", "arrival_date", "arrival_time", "repeat", "repeat_until", "host", "notes"]);
 		// The pickers are naive and read as SPACE_TIMEZONE wall-clock, so both
 		// arrival fields must name the timezone — a member abroad is not
 		// entering their local time.
@@ -339,6 +342,18 @@ describe("slash command -> open modal", () => {
 		expect(byId.arrival_date.label.text).toContain("Europe/London");
 		expect(byId.arrival_time.label.text).toContain("Europe/London");
 		expect(byId.arrival_time.hint.text).toContain("not your own time zone");
+		// Repeat defaults to "none" so the single-visit flow needs no interaction;
+		// the until field stays optional and names the timezone like the pickers.
+		expect(byId.repeat.element.initial_option.value).toBe("none");
+		expect(byId.repeat.element.options.map((o: any) => o.text.text)).toEqual([
+			"Does not repeat",
+			"Every day",
+			"Every weekday (Mon–Fri)",
+			"Every week",
+			"Every 2 weeks",
+		]);
+		expect(byId.repeat_until.optional).toBe(true);
+		expect(byId.repeat_until.label.text).toContain("Europe/London");
 	});
 
 	it("tells the user to retry if views.open fails, still 200", async () => {
@@ -815,6 +830,131 @@ describe("view_submission -> register + DM", () => {
 	});
 });
 
+describe("repeating visits", () => {
+	beforeEach(seed);
+
+	it("expands a weekly repeat into one POST of one visitor per date, DST-correct, and DMs the series result", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		// 2030-10-17/24/31 are Thursdays; BST ends 2030-10-27, so 10:00 UK is
+		// 09:00 UTC for the first two visits and 10:00 UTC for the last.
+		mockMyList([
+			{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-10-17T09:00:00" },
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-10-24T09:00:00" },
+			{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-10-31T10:00:00" },
+		]);
+		const posts = mockPosts();
+
+		const values = {
+			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
+			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+			arrival_date: { value: { type: "datepicker", selected_date: "2030-10-17" } },
+			arrival_time: { value: { type: "timepicker", selected_time: "10:00" } },
+			repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } },
+			// A Friday: the last matching Thursday is Oct 31, and the summary must
+			// show that real last visit, not the raw picker value.
+			repeat_until: { value: { type: "datepicker", selected_date: "2030-11-01" } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering 3 visits");
+
+		const body = JSON.parse(visitor!.body!);
+		expect(body.map((v: any) => v.ExpectedArrival)).toEqual(["2030-10-17T09:00:00", "2030-10-24T09:00:00", "2030-10-31T10:00:00"]);
+		expect(new Set(body.map((v: any) => v.FullName))).toEqual(new Set(["Jane Doe"])); // only the arrival differs
+
+		expect(posts).toHaveLength(2); // DM + channel log
+		expect(posts[0].text).toContain("a separate Nexudus invite at the email below for each visit");
+		expect(posts[0].text).toContain("*Arrival:* 2030-10-17 10:00 (Europe/London)");
+		expect(posts[0].text).toContain("*Repeats:* Every week until 2030-10-31 (3 visits)");
+		expect(posts[0].text).toContain("*Nexudus IDs:* 42, 43, 44");
+		const button = posts[0].blocks.find((b: any) => b.type === "actions").elements[0];
+		expect(button.text.text).toBe("Delete all 3 registrations");
+		expect(JSON.parse(button.value)).toEqual({ ids: [42, 43, 44] });
+	});
+
+	// Inline repeat errors happen before the ack, so no outbound calls at all.
+	async function expectInlineError(values: Record<string, unknown>, block: string, fragment: string): Promise<void> {
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		const ack = JSON.parse(await res.text());
+		expect(ack.response_action).toBe("errors");
+		expect(ack.errors[block]).toContain(fragment);
+	}
+
+	const base = {
+		full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
+		email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
+		arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
+		arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
+	};
+
+	it("rejects a repeat without an end date", async () => {
+		await expectInlineError(
+			{ ...base, repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } } },
+			"repeat_until",
+			"Pick the last visit date",
+		);
+	});
+
+	it("rejects an end date before the first visit", async () => {
+		await expectInlineError(
+			{
+				...base,
+				repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } },
+				repeat_until: { value: { type: "datepicker", selected_date: "2030-07-19" } },
+			},
+			"repeat_until",
+			"before the first visit",
+		);
+	});
+
+	it("rejects a series longer than 30 visits, naming the cap", async () => {
+		// Daily 2030-07-20 → 2030-08-20 inclusive is 32 visits.
+		await expectInlineError(
+			{
+				...base,
+				repeat: { value: { type: "static_select", selected_option: { value: "daily" } } },
+				repeat_until: { value: { type: "datepicker", selected_date: "2030-08-20" } },
+			},
+			"repeat_until",
+			"more than 30 visits",
+		);
+	});
+
+	it("rejects a weekday repeat starting on a weekend", async () => {
+		// ARRIVAL_DATE 2030-07-20 is a Saturday.
+		await expectInlineError(
+			{
+				...base,
+				repeat: { value: { type: "static_select", selected_option: { value: "weekdays" } } },
+				repeat_until: { value: { type: "datepicker", selected_date: "2030-07-25" } },
+			},
+			"repeat",
+			"weekend",
+		);
+	});
+
+	it("goes unconfirmed when the Id lookup can't resolve every visit in the series", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([MY_RECORD]); // first visit only, second unmatched — first lookup
+		mockMyList([MY_RECORD]); // retry
+		let dm: any;
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const values = {
+			...base,
+			repeat: { value: { type: "static_select", selected_option: { value: "weekly" } } },
+			repeat_until: { value: { type: "datepicker", selected_date: "2030-07-27" } },
+		};
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("⚠️ *Registration submitted — but not confirmed*");
+	});
+});
+
 describe("Id lookup -> /my parsing", () => {
 	beforeEach(seed);
 
@@ -1071,5 +1211,80 @@ describe("delete button -> remove visitor", () => {
 			),
 		);
 		expect(res.status).toBe(200);
+	});
+
+	// A series' button carries every Id captured at registration ({ids}).
+	async function clickDeleteByIds(ids: number[], messageText: string): Promise<Response> {
+		return run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ ids }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageText,
+				}),
+			),
+		);
+	}
+
+	// A series ✅ message as posted: series invite note, Repeats line, plural IDs.
+	const SERIES_TEXT = [
+		"✅ *Visitor registered*",
+		"_The visitor should receive a separate Nexudus invite at the email below for each visit in the series._",
+		"*Name:* Jane Doe",
+		"*Repeats:* Every week until 2030-10-31 (3 visits)",
+		"*Nexudus IDs:* 42, 43, 44",
+	].join("\n");
+
+	it("deletes every visit in a series and restyles the message, Repeats line struck", async () => {
+		mockDelete(42);
+		mockDelete(43);
+		mockDelete(44);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDeleteByIds([42, 43, 44], SERIES_TEXT);
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(true);
+		expect(respond.blocks[0].text.text).toBe(
+			[
+				"🗑️ *Registration deleted*",
+				"~*Name:* Jane Doe~",
+				"~*Repeats:* Every week until 2030-10-31 (3 visits)~",
+				"*Nexudus IDs:* 42, 43, 44",
+			].join("\n"),
+		);
+		expect(respond.text).not.toContain("separate Nexudus invite"); // note gone
+	});
+
+	it("still confirms, with a note, when part of a series is already gone (404)", async () => {
+		mockDelete(42);
+		mockDelete(43, 404);
+		mockDelete(44);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDeleteByIds([42, 43, 44], SERIES_TEXT);
+		expect(res.status).toBe(200);
+		// The series is fully removed either way, so the message is replaced,
+		// with the shortfall noted rather than warned about.
+		expect(respond.replace_original).toBe(true);
+		expect(respond.blocks[0].text.text).toContain("🗑️ *Registration deleted*");
+		expect(respond.blocks[0].text.text).toContain("1 of the 3 visits couldn't be found");
+	});
+
+	it("reports the partial outcome (ephemeral) when a series delete hits a hard failure", async () => {
+		mockDelete(42);
+		mockDelete(43, 500);
+		mockDelete(44);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDeleteByIds([42, 43, 44], SERIES_TEXT);
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("Deleted 2 of 3 registrations");
+		expect(respond.text).toContain("svc@example.com");
 	});
 });
