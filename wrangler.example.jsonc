@@ -30,7 +30,7 @@
 		"VISITOR_CHANNEL": "#visitor-requests"
 	},
 	// Live, auto-rotating Nexudus auth record {username, access_token,
-	// refresh_token}. Seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh.
+	// refresh_token}. Seeding: README, Deploying.
 	"kv_namespaces": [
 		{ "binding": "TOKENS", "id": "00000000000000000000000000000000" }
 	],

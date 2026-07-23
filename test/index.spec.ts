@@ -23,6 +23,9 @@ const ARRIVAL_EPOCH = Date.UTC(2030, 6, 20, 14, 30, 0) / 1000;
 const ARRIVAL_UTC = "2030-07-20T14:30:00"; // sent to Nexudus (naive UTC)
 const ARRIVAL_LOCAL = "2030-07-20 15:30"; // shown in messages (Europe/London, BST)
 
+// The default submission as /my returns it: the record the Id lookup resolves.
+const MY_RECORD = { Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC };
+
 // What the default submissionBody() produces as a success message.
 const SUCCESS_TEXT = [
 	"✅ *Visitor registered*",
@@ -191,6 +194,15 @@ function mockSlack(method: string, capture?: (body: any) => void, reply: object 
 		});
 }
 
+// The DM + channel-log chat.postMessage pair, captured in send order (the DM
+// is always posted first).
+function mockPosts(): any[] {
+	const posts: any[] = [];
+	mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
+	mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+	return posts;
+}
+
 type Captured = { body?: string; auth?: string; clientId?: string };
 
 function mockVisitors(capture?: (c: Captured) => void, status = 200, data = "") {
@@ -332,14 +344,12 @@ describe("view_submission -> register + DM", () => {
 
 	it("registers with the KV access token, DMs success with the looked-up Nexudus Id, and logs to the channel", async () => {
 		let visitor: Captured | undefined;
-		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c), 200, JSON.stringify([{ Id: 1 }])); // create returns no usable Id
 		// The Id comes from the follow-up /my lookup (42 ≠ the create-body's 1),
 		// matched on email + the arrival exactly as sent.
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM to the submitter
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -380,13 +390,11 @@ describe("view_submission -> register + DM", () => {
 	});
 
 	it("retries the Id lookup once when the record isn't visible yet, then shows it", async () => {
-		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
 		mockMyList([]); // first lookup: created record not replicated into /my yet
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]); // retry: now there
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		mockMyList([MY_RECORD]); // retry: now there
+		const posts = mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -435,14 +443,12 @@ describe("view_submission -> register + DM", () => {
 	it("refreshes on 401, persists the rotated pair to KV, retries, and DMs success", async () => {
 		let refresh: Captured | undefined;
 		let retried: Captured | undefined;
-		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors(undefined, 401); // first attempt: access token expired
 		mockRefresh((c) => (refresh = c)); // → new-access / new-refresh
 		mockVisitors((c) => (retried = c), 200); // retry with the fresh token
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]); // Id lookup (new token)
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		mockMyList([MY_RECORD]); // Id lookup (new token)
+		const posts = mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -503,7 +509,7 @@ describe("view_submission -> register + DM", () => {
 		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors();
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockMyList([MY_RECORD]);
 		mockSlack("chat.postMessage", (b) => posts.push(b), { ok: false, error: "cannot_dm_user" }); // DM fails
 		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log still goes out
 
@@ -530,9 +536,8 @@ describe("view_submission -> register + DM", () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage"); // DM
-		mockSlack("chat.postMessage"); // channel log
+		mockMyList([MY_RECORD]);
+		mockPosts();
 
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "N".repeat(250) } },
@@ -589,12 +594,10 @@ describe("view_submission -> register + DM", () => {
 
 	it("escapes mrkdwn control characters in member-provided fields (Slack only, not Nexudus)", async () => {
 		let visitor: Captured | undefined;
-		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
 
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane <!channel> & Co" } },
@@ -615,12 +618,10 @@ describe("view_submission -> register + DM", () => {
 
 	it("falls back to the username when the full-name lookup fails", async () => {
 		let visitor: Captured | undefined;
-		const posts: any[] = [];
 		mockUserInfo({ ok: false, error: "missing_scope" });
 		mockVisitors((c) => (visitor = c));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -637,10 +638,9 @@ describe("view_submission -> register + DM", () => {
 		let update: any;
 		mockUserInfo();
 		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockMyList([MY_RECORD]);
 		mockSlack("views.update", (b) => (update = b));
-		mockSlack("chat.postMessage"); // DM
-		mockSlack("chat.postMessage"); // channel log
+		mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { viewId: "V123" })));
 		expect(res.status).toBe(200);
@@ -667,13 +667,11 @@ describe("view_submission -> register + DM", () => {
 	});
 
 	it("skips the modal update (still DMs) when the submission carries no view id", async () => {
-		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors(undefined, 200, JSON.stringify([{ Id: 1 }]));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockMyList([MY_RECORD]);
 		// No mockSlack("views.update"); afterEach asserts none was attempted.
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		const posts = mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -708,12 +706,34 @@ describe("view_submission -> register + DM", () => {
 		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(AUTH);
 	});
 
+	it("DMs the friendly connect failure, not a Nexudus rejection, when a 401 survives the refresh", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockVisitors(undefined, 401); // first attempt: rejected
+		mockRefresh(); // refresh succeeds → new pair
+		mockVisitors(undefined, 401); // retry still rejected: the auth chain is broken
+		mockSlack("chat.postMessage", (b) => (dm = b)); // DM only, no channel log
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("couldn't connect to the visitor system");
+		expect(dm.text).not.toContain("Nexudus rejected"); // not misreported as a rejection
+		expect(dm.text).not.toContain("HTTP 401"); // no auth detail in the DM
+		// The rotated pair still lands in KV; the next attempt starts from it.
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual({
+			username: "svc@example.com",
+			access_token: "new-access",
+			refresh_token: "new-refresh",
+		});
+	});
+
 	it("still posts the channel log when the DM fetch itself throws", async () => {
 		// The existing DM-failure test mocks an ok:false reply; this one throws.
 		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors();
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
+		mockMyList([MY_RECORD]);
 		fetchMock
 			.get(SLACK_BASE)
 			.intercept({ path: "/api/chat.postMessage", method: "POST" })
@@ -727,15 +747,13 @@ describe("view_submission -> register + DM", () => {
 	});
 
 	it("falls back to the username when the users.info fetch throws", async () => {
-		const posts: any[] = [];
 		fetchMock
 			.get(SLACK_BASE)
 			.intercept({ path: "/api/users.info", method: "GET", query: { user: "U1" } })
 			.replyWithError(new Error("connection refused"));
 		mockVisitors();
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
 
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
@@ -745,12 +763,10 @@ describe("view_submission -> register + DM", () => {
 	it("renders a winter arrival without the summer offset", async () => {
 		const winterEpoch = Date.UTC(2031, 0, 20, 14, 30, 0) / 1000; // Europe/London on GMT, UTC+0
 		let visitor: Captured | undefined;
-		const posts: any[] = [];
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
 		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-01-20T14:30:00" }]);
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		const posts = mockPosts();
 
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
@@ -767,9 +783,8 @@ describe("view_submission -> register + DM", () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]);
-		mockSlack("chat.postMessage"); // DM
-		mockSlack("chat.postMessage"); // channel log
+		mockMyList([MY_RECORD]);
+		mockPosts();
 
 		// 199 chars + an emoji (two code units): the 200-char cap lands mid-pair.
 		const values = {
@@ -788,9 +803,7 @@ describe("Id lookup -> /my parsing", () => {
 
 	// Submit the default form, expect a success DM carrying `id`, return the DM.
 	async function submitExpectingId(id: number): Promise<any> {
-		const posts: any[] = [];
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // DM
-		mockSlack("chat.postMessage", (b) => posts.push(b)); // channel log
+		const posts = mockPosts();
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
 		expect(res.status).toBe(200);
 		expect(posts[0].text).toContain(`*Nexudus ID:* ${id}`);
@@ -809,14 +822,14 @@ describe("Id lookup -> /my parsing", () => {
 	it("resolves the Id from a bare-array /my response", async () => {
 		mockUserInfo();
 		mockVisitors();
-		mockMyListRaw(JSON.stringify([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }]));
+		mockMyListRaw(JSON.stringify([MY_RECORD]));
 		await submitExpectingId(42);
 	});
 
 	it("resolves the Id from an envelope under a key other than Records", async () => {
 		mockUserInfo();
 		mockVisitors();
-		mockMyListRaw(JSON.stringify({ Items: [{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC }] }));
+		mockMyListRaw(JSON.stringify({ Items: [MY_RECORD] }));
 		await submitExpectingId(42);
 	});
 

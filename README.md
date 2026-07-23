@@ -33,14 +33,14 @@ Any other path returns `404`; any non-POST returns `405`. DMs to the bot are del
 
 Every request passes two gates before any handling:
 
-1. **Rate limit**: 20 requests/min per IP (`CF-Connecting-IP`) via a Workers rate-limiting binding, checked before the HMAC work. Over the limit returns `429`. Slack retries a 429ed *event* but not slash commands or modal submissions, so a sustained burst can drop those; accepted as flood insurance. The IP is Slack's egress, not the member's. The check fails open if the limiter errors. Limits are per Cloudflare location and eventually consistent.
+1. **Rate limit**: 20 requests/min per IP (`CF-Connecting-IP`) via a Workers rate-limiting binding, checked before the HMAC work. Over the limit returns `429`. Slack retries a 429ed *event* but not slash commands or modal submissions, so a sustained burst can drop those; accepted as flood insurance. The IP is Slack's egress, not the member's. The check fails open if the limiter errors.
 2. **Signature**: `v0=HMAC-SHA256(SLACK_SIGNING_SECRET, "v0:{timestamp}:{body}")` over the raw body, compared against `X-Slack-Signature` in constant time. Returns `401` if the header is missing, the timestamp is older than 5 minutes (replay protection), or the signature mismatches. Slack request signing is the only gate; there is no shared secret.
 
 ## Registering a visitor
 
 The modal (`callback_id: visitor_registration`, fields defined in `FIELDS`) requires full name, email and expected arrival; phone, host and notes are optional. Slack enforces the required fields before submission. The Worker rejects an expected arrival in the past with an inline error on the field, with two minutes of grace for picking "now". The email must be a real domain or Nexudus rejects it (see [Nexudus API notes](#nexudus-api-notes-verified-live)).
 
-On submission the Worker acks within Slack's 3-second window by swapping the modal for a "⏳ registering" placeholder. In the background it trims and length-caps each value, converts the arrival to UTC wall-clock, creates the visitor (`BusinessId` from config only), looks up the new record's **Nexudus Id** via `GET /api/public/visitors/my` (one retry for replication lag), updates the modal with the result, and DMs the member a summary. The modal is live feedback the member can close at any time; the DM is the durable record. Successes also go to the visitors log channel; failures stay in the DM.
+On submission the Worker follows the flow above; along the way it trims and length-caps each value, converts the arrival to UTC wall-clock, creates the visitor (`BusinessId` from config only), and looks up the new record's **Nexudus Id** via `GET /api/public/visitors/my` (one retry for replication lag). The modal is live feedback the member can close at any time; the DM is the durable record. Successes also go to the visitors log channel; failures stay in the DM.
 
 Outcomes:
 
@@ -75,7 +75,7 @@ Every ✅ message's **Delete registration** button holds the Nexudus Id captured
 - **Email is required for this space**: a visitor with no email is rejected `400 "not valid"`. **It must also be a real domain**: `@example.com` returns `400 "Invalid Email Address"`; normal member emails are accepted. Any 400 is surfaced to the member as a ❌ DM.
 - **Arrival timezone.** Nexudus stores the naive `ExpectedArrival` as **UTC** and *displays* it in the space's local timezone in the portal. The Worker therefore sends the UTC wall-clock (no `Z`/offset) and separately renders the space-local time in messages, so the portal and Slack agree. Do **not** send space-local wall-clock; it only looks right while the space is on GMT.
 - **Token auth, not password.** The Worker never holds the account password. The auth record `{username, access_token, refresh_token}` lives in KV; the access token is valid ~14 days and `username` is the account email. Refresh uses `grant_type=refresh_token` with `username` as a `client_id` **header**.
-- **Refresh tokens are single-use and rotate on every exchange**, which is why the auth record lives in KV rather than static config. The `TOKENS` namespace is **shared with the Nexroom Worker**, so both rotate one record and a single seeding covers both. If KV is cleared or the chain breaks, re-seed with `scripts/nexudus-token.sh | scripts/nexudus-seed.sh` (a fresh `grant_type=password` exchange; requires the account to have no 2FA).
+- **Refresh tokens are single-use and rotate on every exchange**, which is why the auth record lives in KV rather than static config. The `TOKENS` namespace is **shared with the Nexroom Worker**, so both rotate one record and a single seeding covers both. If KV is cleared or the chain breaks, re-seed as in [Deploying](#deploying) (a fresh `grant_type=password` exchange; requires the account to have no 2FA).
 - **`POST /api/public/visitors` returns `200` with an empty body and no id-bearing header.** The visitors *collection* is create-only: `GET` on it, `/all`, and `/upcoming` all return `405`, and the admin `/api/spaces/visitors` API rejects portal bearer tokens. The only read route is `GET /api/public/visitors/my`, used to capture the new visitor's Id right after creation.
 - Public API rate limit is 10 requests / 5 s. A submission is normally one Nexudus call (up to three when a token refresh intervenes), so a burst of near-simultaneous submissions could 429; that surfaces as a ❌ DM and the member retries.
 
@@ -111,7 +111,7 @@ npm run check        # typecheck src/ and test/
 npm test             # vitest (one-shot; npm run test:watch to watch)
 ```
 
-Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts): routing, rate limiting and signature rejection; slash command to modal; registration (the outbound Nexudus body, the KV auth record, refresh-on-401 rotation, failure modes, past-arrival rejection, mrkdwn escaping); the Home tab; and the delete flow.
+Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts).
 
 ## Deploying
 
@@ -124,10 +124,7 @@ wrangler deploy
 # → note the printed workers.dev URL for the Slack app request URLs below
 
 scripts/nexudus-token.sh | scripts/nexudus-seed.sh   # seed the Nexudus auth record in KV
-# remote seeding from a Windows machine: they run
-#   powershell -ExecutionPolicy Bypass -File scripts\nexudus-token.ps1
-# and send back the encrypted line it prints; then locally:
-#   pbpaste | scripts/nexudus-open.sh | scripts/nexudus-seed.sh
+# seeding from a remote Windows machine: see the header of scripts/nexudus-token.ps1
 wrangler secret put SLACK_SIGNING_SECRET
 wrangler secret put SLACK_BOT_TOKEN
 ```
@@ -140,4 +137,4 @@ The app config is [`slack-manifest.yaml`](slack-manifest.yaml): the scopes, the 
 2. **Install to Workspace**, then set the two secrets: the **Bot User OAuth Token** (`xoxb-…`, OAuth & Permissions) with `wrangler secret put SLACK_BOT_TOKEN`, and the **Signing Secret** (Basic Information) with `wrangler secret put SLACK_SIGNING_SECRET`.
 3. **Invite the bot to the log channel** (`/invite @<bot name>`); see [Log channel](#log-channel).
 
-Add `im:write` to the scopes if the result DMs ever fail to deliver. Keep `token_rotation_enabled: false`; the Worker assumes a static bot token.
+Keep `token_rotation_enabled: false`; the Worker assumes a static bot token.

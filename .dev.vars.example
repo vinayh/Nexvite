@@ -1,7 +1,7 @@
 # Copy to `.dev.vars` (gitignored) only if you run `wrangler dev` against the
 # real Slack app. Production uses `wrangler secret put <NAME>`; non-secret
 # config lives in wrangler.jsonc `vars`; the Nexudus auth record lives in KV
-# (seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh).
+# (seeding: README, Deploying).
 
 # Slack app credentials — see README.md, "Slack app setup".
 SLACK_SIGNING_SECRET="change-me"

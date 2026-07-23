@@ -86,12 +86,18 @@ async function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: 
 	}
 }
 
+// A Slack call whose failure is only log-worthy: warn with the error code
+// (never PII) and move on.
+async function slackApiWarn(env: Env, method: string, body: unknown): Promise<void> {
+	const { ok, error } = await slackApi(env, method, body);
+	if (!ok) console.warn(`${method} failed: ${error ?? "unknown"}`);
+}
+
 // Post a message. `channel` may be a user id (chat.postMessage opens the IM)
 // or a channel id / #name (the bot must be a member of the channel). `blocks`
 // is optional Block Kit; `text` remains the notification fallback.
-async function postMessage(env: Env, channel: string, text: string, blocks?: unknown[]): Promise<void> {
-	const { ok, error } = await slackApi(env, "chat.postMessage", { channel, text, ...(blocks && { blocks }) });
-	if (!ok) console.warn(`chat.postMessage failed: ${error ?? "unknown"}`); // error code only, no PII
+function postMessage(env: Env, channel: string, text: string, blocks?: unknown[]): Promise<void> {
+	return slackApiWarn(env, "chat.postMessage", { channel, text, ...(blocks && { blocks }) });
 }
 
 // The interactivity payload only carries the submitter's username; the
@@ -161,7 +167,7 @@ function visitorModal() {
 	};
 }
 
-// Open the modal from a trigger_id (slash command or the DM button click).
+// Open the modal from a trigger_id (slash command or the Home-tab button click).
 function openModal(env: Env, triggerId: string) {
 	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal() });
 }
@@ -187,43 +193,43 @@ const REGISTERING_TEXT =
 // Swap the post-submission placeholder for the result, if the submitter still
 // has the modal open. A closed or expired view makes this a no-op (the DM
 // already carries the outcome), so a failure here is only logged.
-async function updateStatusModal(env: Env, viewId: string, text: string): Promise<void> {
-	const { ok, error } = await slackApi(env, "views.update", { view_id: viewId, view: statusModal(text) });
-	if (!ok) console.warn(`views.update failed: ${error ?? "unknown"}`); // error code only, no PII
+function updateStatusModal(env: Env, viewId: string, text: string): Promise<void> {
+	return slackApiWarn(env, "views.update", { view_id: viewId, view: statusModal(text) });
 }
 
 // The App Home tab: the button entry point for every workspace user. The tab
 // can't open a modal itself, but its button click arrives as block_actions with
 // a trigger_id (what views.open needs).
 function homeView() {
-	const blocks: unknown[] = [
-		{ type: "header", text: { type: "plain_text", text: "Visitor registration" } },
-		{
-			type: "section",
-			text: {
-				type: "mrkdwn",
-				text: "Expecting a guest? Register them so reception knows they're coming. You can also run `/visitor` from any channel.",
-			},
-		},
-		{
-			type: "actions",
-			elements: [
-				{
-					type: "button",
-					text: { type: "plain_text", text: "Register a visitor" },
-					style: "primary",
-					action_id: OPEN_ACTION,
+	return {
+		type: "home",
+		blocks: [
+			{ type: "header", text: { type: "plain_text", text: "Visitor registration" } },
+			{
+				type: "section",
+				text: {
+					type: "mrkdwn",
+					text: "Expecting a guest? Register them so reception knows they're coming. You can also run `/visitor` from any channel.",
 				},
-			],
-		},
-	];
-	return { type: "home", blocks };
+			},
+			{
+				type: "actions",
+				elements: [
+					{
+						type: "button",
+						text: { type: "plain_text", text: "Register a visitor" },
+						style: "primary",
+						action_id: OPEN_ACTION,
+					},
+				],
+			},
+		],
+	};
 }
 
 // (Re)publish the Home tab for one user, on app_home_opened.
-async function publishHome(env: Env, userId: string): Promise<void> {
-	const { ok, error } = await slackApi(env, "views.publish", { user_id: userId, view: homeView() });
-	if (!ok) console.warn(`views.publish failed: ${error ?? "unknown"}`); // error code only, no PII
+function publishHome(env: Env, userId: string): Promise<void> {
+	return slackApiWarn(env, "views.publish", { user_id: userId, view: homeView() });
 }
 
 // ---------------------------------------------------------------------------
@@ -325,8 +331,10 @@ function nexudusBase(env: Env): string {
 }
 
 // Run an authenticated Nexudus request: current token first; on a 401 refresh
-// once (rotating the KV record) and retry. Never throws; returns null on an
-// auth or network failure, which the caller turns into a member-facing message.
+// once (rotating the KV record) and retry. A 401 that survives the refresh is
+// a broken auth chain, not a caller-level rejection, so it also yields null.
+// Never throws; returns null on an auth or network failure, which the caller
+// turns into a member-facing message.
 async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: string) => Promise<Response>): Promise<Response | null> {
 	const base = nexudusBase(env);
 	try {
@@ -344,6 +352,10 @@ async function nexudusFetch(env: Env, doFetch: (base: string, accessToken: strin
 			}
 			await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
 			res = await doFetch(base, refreshed.access_token);
+			if (res.status === 401) {
+				console.error("nexudus rejected the refreshed token; check the account, then re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
+				return null;
+			}
 		}
 		return res;
 	} catch (err) {
@@ -754,7 +766,7 @@ export default {
 			return new Response("", { status: 200 });
 		}
 
-		// Button clicks: the Home/DM "Register a visitor" opens the modal; a
+		// Button clicks: the Home tab's "Register a visitor" opens the modal; a
 		// confirmation's "Delete registration" removes the visitor again.
 		if (payload.type === "block_actions") {
 			const clickedOpen = (payload.actions ?? []).some((a) => a.action_id === OPEN_ACTION);
