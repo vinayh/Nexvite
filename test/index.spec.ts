@@ -332,11 +332,12 @@ describe("slash command -> open modal", () => {
 		expect(viewsOpen.view.callback_id).toBe("visitor_registration");
 		const blockIds = viewsOpen.view.blocks.map((b: any) => b.block_id);
 		expect(blockIds).toEqual(["full_name", "email", "phone", "arrival_date", "arrival_time", "host", "notes"]);
-		// The pickers are naive and read as UK wall-clock, so both arrival
-		// fields must say so — a member abroad is not entering their local time.
+		// The pickers are naive and read as SPACE_TIMEZONE wall-clock, so both
+		// arrival fields must name the timezone — a member abroad is not
+		// entering their local time.
 		const byId = Object.fromEntries(viewsOpen.view.blocks.map((b: any) => [b.block_id, b]));
-		expect(byId.arrival_date.label.text).toContain("UK time");
-		expect(byId.arrival_time.label.text).toContain("UK time");
+		expect(byId.arrival_date.label.text).toContain("Europe/London");
+		expect(byId.arrival_time.label.text).toContain("Europe/London");
 		expect(byId.arrival_time.hint.text).toContain("not your own time zone");
 	});
 

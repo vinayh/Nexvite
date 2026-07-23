@@ -146,7 +146,7 @@ function inputBlock(block: string, action: string, label: string, element: Recor
 	};
 }
 
-function visitorModal() {
+function visitorModal(env: Env) {
 	return {
 		type: "modal",
 		callback_id: CALLBACK_ID,
@@ -161,18 +161,19 @@ function visitorModal() {
 			inputBlock(FIELDS.phone.block, FIELDS.phone.action, "Phone", { type: "plain_text_input" }, true),
 			// Naive date + time pickers, not a datetimepicker: a datetimepicker
 			// renders in each member's own timezone, so the instant it submits
-			// depends on who submitted it. These values are read as UK wall-clock
-			// (SPACE_TIMEZONE); the labels say so because for a member abroad the
-			// field is *not* their local time. Labels assume the deployed
-			// SPACE_TIMEZONE stays Europe/London.
-			inputBlock(FIELDS.arrivalDate.block, FIELDS.arrivalDate.action, "Expected arrival — date (UK time)", { type: "datepicker" }),
+			// depends on who submitted it. These values are read as SPACE_TIMEZONE
+			// wall-clock; the labels name that timezone because for a member
+			// abroad the field is *not* their local time.
+			inputBlock(FIELDS.arrivalDate.block, FIELDS.arrivalDate.action, `Expected arrival — date (${env.SPACE_TIMEZONE})`, {
+				type: "datepicker",
+			}),
 			inputBlock(
 				FIELDS.arrivalTime.block,
 				FIELDS.arrivalTime.action,
-				"Expected arrival — time (UK time)",
+				`Expected arrival — time (${env.SPACE_TIMEZONE})`,
 				{ type: "timepicker" },
 				false,
-				"Enter the time at the space in the UK, not your own time zone.",
+				`Time at the space (${env.SPACE_TIMEZONE}), not your own time zone.`,
 			),
 			inputBlock(FIELDS.host.block, FIELDS.host.action, "Who are they visiting?", { type: "plain_text_input" }, true),
 			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, true),
@@ -182,7 +183,7 @@ function visitorModal() {
 
 // Open the modal from a trigger_id (slash command or the Home-tab button click).
 function openModal(env: Env, triggerId: string) {
-	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal() });
+	return slackApi(env, "views.open", { trigger_id: triggerId, view: visitorModal(env) });
 }
 
 // The post-submission modal: a single-message view, no inputs. Shown first as a
@@ -267,7 +268,7 @@ function readText(state: ViewState, block: string, action: string, cap: number):
 
 // The date/time pickers return naive strings ("YYYY-MM-DD" / "HH:mm") with no
 // timezone attached; the submission handler reads them as SPACE_TIMEZONE
-// wall-clock, matching the modal's "UK time" labels.
+// wall-clock, matching the timezone named in the modal's labels.
 function readDate(state: ViewState, block: string, action: string): string | undefined {
 	const raw = state.values?.[block]?.[action]?.selected_date;
 	return typeof raw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : undefined;
@@ -829,7 +830,7 @@ export default {
 
 		const state = payload.view?.state ?? {};
 		const userId = payload.user?.id;
-		// The pickers are naive and labeled "UK time" in the modal, so the
+		// The pickers are naive and labeled with SPACE_TIMEZONE in the modal, so the
 		// combined wall-clock is read in the space's timezone, not the member's.
 		const arrivalDate = readDate(state, FIELDS.arrivalDate.block, FIELDS.arrivalDate.action);
 		const arrivalTime = readTime(state, FIELDS.arrivalTime.block, FIELDS.arrivalTime.action);
@@ -847,7 +848,9 @@ export default {
 		if (input.arrivalEpoch != null && input.arrivalEpoch < Date.now() / 1000 - ARRIVAL_GRACE_S) {
 			return jsonResponse({
 				response_action: "errors",
-				errors: { [FIELDS.arrivalTime.block]: "This time is in the past in the UK — pick when the visitor is expected to arrive." },
+				errors: {
+					[FIELDS.arrivalTime.block]: `This time is in the past (${env.SPACE_TIMEZONE}) — pick when the visitor is expected to arrive.`,
+				},
 			});
 		}
 
