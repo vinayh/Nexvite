@@ -23,7 +23,8 @@ const FIELDS = {
 	fullName: { block: "full_name", action: "value", cap: 200 },
 	email: { block: "email", action: "value", cap: 320 },
 	phone: { block: "phone", action: "value", cap: 50 },
-	arrival: { block: "arrival", action: "value" },
+	arrivalDate: { block: "arrival_date", action: "value" },
+	arrivalTime: { block: "arrival_time", action: "value" },
 	host: { block: "host", action: "value", cap: 200 },
 	notes: { block: "notes", action: "value", cap: 1000 },
 } as const;
@@ -134,13 +135,14 @@ function mrkdwnEscape(text: string): string {
 // The modal
 // ---------------------------------------------------------------------------
 
-function inputBlock(block: string, action: string, label: string, element: Record<string, unknown>, optional = false) {
+function inputBlock(block: string, action: string, label: string, element: Record<string, unknown>, optional = false, hint?: string) {
 	return {
 		type: "input",
 		block_id: block,
 		optional,
 		label: { type: "plain_text", text: label },
 		element: { action_id: action, ...element },
+		...(hint && { hint: { type: "plain_text", text: hint } }),
 	};
 }
 
@@ -157,10 +159,21 @@ function visitorModal() {
 			}),
 			inputBlock(FIELDS.email.block, FIELDS.email.action, "Email", { type: "email_text_input" }),
 			inputBlock(FIELDS.phone.block, FIELDS.phone.action, "Phone", { type: "plain_text_input" }, true),
-			// datetimepicker returns `selected_date_time` as epoch SECONDS.
-			inputBlock(FIELDS.arrival.block, FIELDS.arrival.action, "Expected arrival", {
-				type: "datetimepicker",
-			}),
+			// Naive date + time pickers, not a datetimepicker: a datetimepicker
+			// renders in each member's own timezone, so the instant it submits
+			// depends on who submitted it. These values are read as UK wall-clock
+			// (SPACE_TIMEZONE); the labels say so because for a member abroad the
+			// field is *not* their local time. Labels assume the deployed
+			// SPACE_TIMEZONE stays Europe/London.
+			inputBlock(FIELDS.arrivalDate.block, FIELDS.arrivalDate.action, "Expected arrival — date (UK time)", { type: "datepicker" }),
+			inputBlock(
+				FIELDS.arrivalTime.block,
+				FIELDS.arrivalTime.action,
+				"Expected arrival — time (UK time)",
+				{ type: "timepicker" },
+				false,
+				"Enter the time at the space in the UK, not your own time zone.",
+			),
 			inputBlock(FIELDS.host.block, FIELDS.host.action, "Who are they visiting?", { type: "plain_text_input" }, true),
 			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, true),
 		],
@@ -237,7 +250,7 @@ function publishHome(env: Env, userId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 type ViewState = {
-	values?: Record<string, Record<string, { value?: unknown; selected_date_time?: unknown }>>;
+	values?: Record<string, Record<string, { value?: unknown; selected_date?: unknown; selected_time?: unknown }>>;
 };
 
 // Trimmed, length-capped string; undefined when absent or blank.
@@ -252,9 +265,17 @@ function readText(state: ViewState, block: string, action: string, cap: number):
 	return last >= 0xd800 && last <= 0xdbff ? capped.slice(0, -1) : capped;
 }
 
-function readDateTime(state: ViewState, block: string, action: string): number | undefined {
-	const dt = state.values?.[block]?.[action]?.selected_date_time;
-	return typeof dt === "number" && Number.isFinite(dt) ? dt : undefined;
+// The date/time pickers return naive strings ("YYYY-MM-DD" / "HH:mm") with no
+// timezone attached; the submission handler reads them as SPACE_TIMEZONE
+// wall-clock, matching the modal's "UK time" labels.
+function readDate(state: ViewState, block: string, action: string): string | undefined {
+	const raw = state.values?.[block]?.[action]?.selected_date;
+	return typeof raw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : undefined;
+}
+
+function readTime(state: ViewState, block: string, action: string): string | undefined {
+	const raw = state.values?.[block]?.[action]?.selected_time;
+	return typeof raw === "string" && /^\d{2}:\d{2}$/.test(raw) ? raw : undefined;
 }
 
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
@@ -383,7 +404,20 @@ function toWallClock(epochSeconds: number, timeZone: string): string {
 	return wallClock.replace(" ", "T");
 }
 
-// mrkdwn arrival line, space-local and minute-granular (like the datetimepicker),
+// Inverse of toWallClock: naive "YYYY-MM-DDTHH:mm:ss" read as `timeZone`
+// wall-clock → epoch seconds. Start from the UTC reading, then correct by the
+// round-trip error; the second pass settles values near a DST transition. A
+// wall-clock skipped by spring-forward resolves to a nearby real instant.
+function fromWallClock(wallClock: string, timeZone: string): number {
+	const target = Date.parse(`${wallClock}Z`) / 1000;
+	let epoch = target;
+	for (let i = 0; i < 2; i++) {
+		epoch += target - Date.parse(`${toWallClock(epoch, timeZone)}Z`) / 1000;
+	}
+	return epoch;
+}
+
+// mrkdwn arrival line, space-local and minute-granular (like the modal pickers),
 // e.g. "*Arrival:* 2026-07-20 15:30 (Europe/London)".
 function arrivalLine(env: Env, epochSeconds: number): string {
 	const local = toWallClock(epochSeconds, env.SPACE_TIMEZONE).replace("T", " ").slice(0, 16);
@@ -795,21 +829,25 @@ export default {
 
 		const state = payload.view?.state ?? {};
 		const userId = payload.user?.id;
+		// The pickers are naive and labeled "UK time" in the modal, so the
+		// combined wall-clock is read in the space's timezone, not the member's.
+		const arrivalDate = readDate(state, FIELDS.arrivalDate.block, FIELDS.arrivalDate.action);
+		const arrivalTime = readTime(state, FIELDS.arrivalTime.block, FIELDS.arrivalTime.action);
 		const input: VisitorInput = {
 			fullName: readText(state, FIELDS.fullName.block, FIELDS.fullName.action, FIELDS.fullName.cap),
 			email: readText(state, FIELDS.email.block, FIELDS.email.action, FIELDS.email.cap),
 			phone: readText(state, FIELDS.phone.block, FIELDS.phone.action, FIELDS.phone.cap),
-			arrivalEpoch: readDateTime(state, FIELDS.arrival.block, FIELDS.arrival.action),
+			arrivalEpoch: arrivalDate && arrivalTime ? fromWallClock(`${arrivalDate}T${arrivalTime}:00`, env.SPACE_TIMEZONE) : undefined,
 			host: readText(state, FIELDS.host.block, FIELDS.host.action, FIELDS.host.cap),
 			notes: readText(state, FIELDS.notes.block, FIELDS.notes.action, FIELDS.notes.cap),
 			submittedBy: payload.user?.name ?? payload.user?.username ?? "a Slack user",
 		};
 
-		// Bounce a past arrival back onto the field (see ARRIVAL_GRACE_S).
+		// Bounce a past arrival back onto the time field (see ARRIVAL_GRACE_S).
 		if (input.arrivalEpoch != null && input.arrivalEpoch < Date.now() / 1000 - ARRIVAL_GRACE_S) {
 			return jsonResponse({
 				response_action: "errors",
-				errors: { [FIELDS.arrival.block]: "This time is in the past — pick when the visitor is expected to arrive." },
+				errors: { [FIELDS.arrivalTime.block]: "This time is in the past in the UK — pick when the visitor is expected to arrive." },
 			});
 		}
 

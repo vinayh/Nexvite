@@ -22,8 +22,10 @@
 		"NEXUDUS_SUBDOMAIN": "your-space",
 		// The space's location id (GET /api/public/businesses/all)
 		"NEXUDUS_BUSINESS_ID": "1000000000",
-		// Display timezone for arrival times; ExpectedArrival is sent as UTC (README).
-		// Tests assert Europe/London rendering; leave it if you run the suite.
+		// The modal's arrival pickers are read as this timezone (labeled "UK
+		// time") and messages display arrival times in it; ExpectedArrival is
+		// sent as UTC (README). Tests assert Europe/London; leave it if you run
+		// the suite.
 		"SPACE_TIMEZONE": "Europe/London",
 		// Registration log channel (id or #name); the bot must be invited to it.
 		// Change it here and redeploy; empty disables the channel log.

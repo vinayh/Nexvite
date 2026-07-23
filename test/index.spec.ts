@@ -17,9 +17,11 @@ const seed = () => env.TOKENS.put(TOKEN_KEY, JSON.stringify(AUTH));
 const NEXUDUS_BASE = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 const SLACK_BASE = "https://slack.com";
 
-// 2030-07-20 14:30:00 UTC → 15:30 in Europe/London (BST, UTC+1). Must stay in
-// the future: past arrivals are rejected inline; summer exercises the offset.
-const ARRIVAL_EPOCH = Date.UTC(2030, 6, 20, 14, 30, 0) / 1000;
+// The pickers submit naive UK wall-clock: 15:30 on 2030-07-20 is BST (UTC+1),
+// so Nexudus gets 14:30 UTC. Must stay in the future: past arrivals are
+// rejected inline; summer exercises the offset.
+const ARRIVAL_DATE = "2030-07-20";
+const ARRIVAL_TIME = "15:30";
 const ARRIVAL_UTC = "2030-07-20T14:30:00"; // sent to Nexudus (naive UTC)
 const ARRIVAL_LOCAL = "2030-07-20 15:30"; // shown in messages (Europe/London, BST)
 
@@ -105,7 +107,8 @@ function submissionBody(values?: Record<string, unknown>, over: { type?: string;
 		full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
 		email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
 		phone: { value: { type: "plain_text_input", value: "+44 7700 900123" } },
-		arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+		arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
+		arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
 		host: { value: { type: "plain_text_input", value: "Sam" } },
 		notes: { value: { type: "plain_text_input", value: "Needs step-free access" } },
 	};
@@ -328,7 +331,13 @@ describe("slash command -> open modal", () => {
 		expect(viewsOpen.trigger_id).toBe("trigger-123");
 		expect(viewsOpen.view.callback_id).toBe("visitor_registration");
 		const blockIds = viewsOpen.view.blocks.map((b: any) => b.block_id);
-		expect(blockIds).toEqual(["full_name", "email", "phone", "arrival", "host", "notes"]);
+		expect(blockIds).toEqual(["full_name", "email", "phone", "arrival_date", "arrival_time", "host", "notes"]);
+		// The pickers are naive and read as UK wall-clock, so both arrival
+		// fields must say so — a member abroad is not entering their local time.
+		const byId = Object.fromEntries(viewsOpen.view.blocks.map((b: any) => [b.block_id, b]));
+		expect(byId.arrival_date.label.text).toContain("UK time");
+		expect(byId.arrival_time.label.text).toContain("UK time");
+		expect(byId.arrival_time.hint.text).toContain("not your own time zone");
 	});
 
 	it("tells the user to retry if views.open fails, still 200", async () => {
@@ -542,7 +551,8 @@ describe("view_submission -> register + DM", () => {
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "N".repeat(250) } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
+			arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
@@ -563,15 +573,17 @@ describe("view_submission -> register + DM", () => {
 		expect(dm.text).toContain("*Submitted by:* Vinay Hiremath");
 	});
 
-	it("DMs a required-fields error and never calls Nexudus when arrival is missing", async () => {
+	it("DMs a required-fields error and never calls Nexudus when the arrival time is missing", async () => {
 		let dm: any;
 		mockUserInfo();
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
+		// Date without time: the pair only yields an arrival when both parse.
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival: { value: { type: "datetimepicker", selected_date_time: null } },
+			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
+			arrival_time: { value: { type: "timepicker", selected_time: null } },
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
@@ -583,13 +595,14 @@ describe("view_submission -> register + DM", () => {
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival: { value: { type: "datetimepicker", selected_date_time: Math.floor(Date.now() / 1000) - 3600 } },
+			arrival_date: { value: { type: "datepicker", selected_date: "2020-01-01" } },
+			arrival_time: { value: { type: "timepicker", selected_time: "12:00" } },
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		const ack = JSON.parse(await res.text());
 		expect(ack.response_action).toBe("errors");
-		expect(ack.errors.arrival).toContain("in the past");
+		expect(ack.errors.arrival_time).toContain("in the past");
 	});
 
 	it("escapes mrkdwn control characters in member-provided fields (Slack only, not Nexudus)", async () => {
@@ -602,7 +615,8 @@ describe("view_submission -> register + DM", () => {
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane <!channel> & Co" } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
+			arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
@@ -760,18 +774,19 @@ describe("view_submission -> register + DM", () => {
 		expect(posts[0].text).toContain("*Submitted by:* vinay");
 	});
 
-	it("renders a winter arrival without the summer offset", async () => {
-		const winterEpoch = Date.UTC(2031, 0, 20, 14, 30, 0) / 1000; // Europe/London on GMT, UTC+0
+	it("sends a winter arrival without the summer offset (UK wall-clock = UTC on GMT)", async () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
 		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-01-20T14:30:00" }]);
 		const posts = mockPosts();
 
+		// 14:30 UK time on 2031-01-20 is GMT (UTC+0), so Nexudus gets 14:30 as-is.
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "Jane Doe" } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival: { value: { type: "datetimepicker", selected_date_time: winterEpoch } },
+			arrival_date: { value: { type: "datepicker", selected_date: "2031-01-20" } },
+			arrival_time: { value: { type: "timepicker", selected_time: "14:30" } },
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
@@ -790,7 +805,8 @@ describe("view_submission -> register + DM", () => {
 		const values = {
 			full_name: { value: { type: "plain_text_input", value: "N".repeat(199) + "😀" } },
 			email: { value: { type: "email_text_input", value: "jane.doe@gmail.com" } },
-			arrival: { value: { type: "datetimepicker", selected_date_time: ARRIVAL_EPOCH } },
+			arrival_date: { value: { type: "datepicker", selected_date: ARRIVAL_DATE } },
+			arrival_time: { value: { type: "timepicker", selected_time: ARRIVAL_TIME } },
 		};
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
@@ -852,7 +868,7 @@ describe("Id lookup -> /my parsing", () => {
 	it("matches a record in the legacy /Date(ms)/ form", async () => {
 		mockUserInfo();
 		mockVisitors();
-		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: `/Date(${ARRIVAL_EPOCH * 1000})/` }]);
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: `/Date(${Date.parse(`${ARRIVAL_UTC}Z`)})/` }]);
 		await submitExpectingId(42);
 	});
 
