@@ -29,7 +29,7 @@ POST /slack/interactivity ──► Worker
            the summary to the visitors log channel
 ```
 
-Any other path returns `404`; any non-POST returns `405`. DMs to the bot are deliberately not an entry point. The implementation is [`src/index.ts`](src/index.ts); the code, with its section banners and comments, is the reference.
+Any other path returns `404`; any non-POST returns `405`. DMs to the bot are deliberately not an entry point. The code, with its comments, is the reference. [`src/index.ts`](src/index.ts) owns routing and flow orchestration, on top of [`src/slack.ts`](src/slack.ts) (signature verification, Web API wrappers, payload readers), [`src/messages.ts`](src/messages.ts) (the modal, Home tab, and message builders/restyles), [`src/nexudus.ts`](src/nexudus.ts) (API client and the KV auth chain), and [`src/time.ts`](src/time.ts) (wall-clock conversion and repeat expansion).
 
 Every request passes two gates before any handling:
 
@@ -116,7 +116,7 @@ npm run check        # typecheck src/ and test/
 npm test             # vitest (one-shot; npm run test:watch to watch)
 ```
 
-Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. The authoritative case list is [`test/index.spec.ts`](test/index.spec.ts).
+Tests run in the Workers runtime via `@cloudflare/vitest-pool-workers`, with Slack and Nexudus mocked by `fetchMock`. They are integration tests through `worker.fetch`, split by flow: [`test/http.spec.ts`](test/http.spec.ts) (routing, rate limit, signatures), [`test/modal.spec.ts`](test/modal.spec.ts) (slash command + App Home), [`test/submission.spec.ts`](test/submission.spec.ts) (registration + Id lookup), [`test/repeat.spec.ts`](test/repeat.spec.ts) (repeating visits), and [`test/delete.spec.ts`](test/delete.spec.ts) (the Delete buttons), sharing [`test/helpers.ts`](test/helpers.ts).
 
 ## Deploying
 
