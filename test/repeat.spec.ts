@@ -1,5 +1,6 @@
-// Repeating visits: cadence + repeat-until expansion into one multi-visitor
-// POST, the inline validation errors, and the series result message.
+// Repeating visits, modeled like the Nexudus portal: every N days/weeks/months,
+// ending after N occurrences or on a date, expanded into one multi-visitor
+// POST; the inline validation errors and the series result message.
 
 import { describe, it, expect, beforeEach } from "vitest";
 import {
@@ -25,7 +26,7 @@ setupSuite();
 describe("repeating visits", () => {
 	beforeEach(seed);
 
-	it("expands a weekly repeat into one POST of one visitor per date, DST-correct, and DMs the series result", async () => {
+	it("expands a weekly repeat ending on a date into one POST of one visitor per date, DST-correct, and DMs the series result", async () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
@@ -45,7 +46,7 @@ describe("repeating visits", () => {
 			email: "jane.doe@gmail.com",
 			date: "2030-10-17",
 			time: "10:00",
-			repeat: "weekly",
+			repeat: "week",
 			until: "2030-11-01",
 		});
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
@@ -80,28 +81,83 @@ describe("repeating visits", () => {
 		expect(JSON.parse(button.value)).toEqual({ ids: [42, 43, 44] });
 	});
 
-	it("expands a weekday repeat across a weekend, skipping Saturday and Sunday", async () => {
+	it("honors the interval: every 2 weeks skips the weeks in between", async () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
 		mockVisitors((c) => (visitor = c));
-		// 2030-07-25 is a Thursday; weekdays until Monday the 29th is Thu, Fri,
-		// Mon — the weekend in between must not become visits. July is BST, so
-		// 15:30 UK is 14:30 UTC throughout.
+		// 2030-07-25 is a Thursday; every 2 weeks until 2030-08-25 is Jul 25,
+		// Aug 8 and Aug 22 — the Thursdays in between must not become visits.
+		// July/August are BST, so 15:30 UK is 14:30 UTC throughout.
 		mockMyList([
 			{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-25T14:30:00" },
-			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-26T14:30:00" },
-			{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-29T14:30:00" },
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-08-08T14:30:00" },
+			{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-08-22T14:30:00" },
 		]);
 		const posts = mockPosts();
 
-		const values = formValues({ ...base, date: "2030-07-25", repeat: "weekdays", until: "2030-07-29" });
+		const values = formValues({ ...base, date: "2030-07-25", repeat: "week", every: "2", until: "2030-08-25" });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering 3 visits");
 
 		const body = JSON.parse(visitor!.body!);
-		expect(body.map((v: any) => v.ExpectedArrival)).toEqual(["2030-07-25T14:30:00", "2030-07-26T14:30:00", "2030-07-29T14:30:00"]);
-		expect(posts[0].text).toContain("*Repeats:* Every weekday (Mon–Fri) until 2030-07-29 (3 visits)");
+		expect(body.map((v: any) => v.ExpectedArrival)).toEqual(["2030-07-25T14:30:00", "2030-08-08T14:30:00", "2030-08-22T14:30:00"]);
+		expect(posts[0].text).toContain("*Repeats:* Every 2 weeks until 2030-08-22 (3 visits)");
+	});
+
+	it("clamps a monthly repeat's short months from the anchor date", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		// Monthly from Jan 31: Feb clamps to the 28th but March returns to the
+		// 31st (stepped from the anchor, not the clamped Feb). BST starts
+		// 2031-03-30, so the last visit's 15:30 UK is 14:30 UTC.
+		mockMyList([
+			{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-01-31T15:30:00" },
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-02-28T15:30:00" },
+			{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-03-31T14:30:00" },
+		]);
+		const posts = mockPosts();
+
+		const values = formValues({ ...base, date: "2031-01-31", repeat: "month", until: "2031-03-31" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering 3 visits");
+
+		const body = JSON.parse(visitor!.body!);
+		expect(body.map((v: any) => v.ExpectedArrival)).toEqual(["2031-01-31T15:30:00", "2031-02-28T15:30:00", "2031-03-31T14:30:00"]);
+		expect(posts[0].text).toContain("*Repeats:* Every month until 2031-03-31 (3 visits)");
+	});
+
+	it("expands a weekly repeat with chosen days across each active week, starting at the first chosen day", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		// Arrival Thursday 2030-07-25 repeating on Mon+Thu until Monday
+		// 2030-08-05: the Monday before the arrival is skipped, then Mon and Thu
+		// of each following week. All BST, so 15:30 UK is 14:30 UTC.
+		mockMyList([
+			{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-25T14:30:00" },
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-29T14:30:00" },
+			{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-08-01T14:30:00" },
+			{ Id: 45, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-08-05T14:30:00" },
+		]);
+		const posts = mockPosts();
+
+		// Selection order must not matter for the expansion or the label.
+		const values = formValues({ ...base, date: "2030-07-25", repeat: "week", days: ["thu", "mon"], until: "2030-08-05" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering 4 visits");
+
+		const body = JSON.parse(visitor!.body!);
+		expect(body.map((v: any) => v.ExpectedArrival)).toEqual([
+			"2030-07-25T14:30:00",
+			"2030-07-29T14:30:00",
+			"2030-08-01T14:30:00",
+			"2030-08-05T14:30:00",
+		]);
+		expect(posts[0].text).toContain("*Repeats:* Every week on Mon, Thu until 2030-08-05 (4 visits)");
 	});
 
 	it("uses singular wording when the repeat window only fits one visit", async () => {
@@ -112,7 +168,7 @@ describe("repeating visits", () => {
 
 		// Weekly from Saturday the 20th until Friday the 26th: the next Saturday
 		// falls past the end date, so the series is just the first visit.
-		const values = formValues({ ...base, repeat: "weekly", until: "2030-07-26" });
+		const values = formValues({ ...base, repeat: "week", until: "2030-07-26" });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(posts[0].text).toContain("*Repeats:* Every week until 2030-07-20 (1 visit)");
@@ -133,27 +189,48 @@ describe("repeating visits", () => {
 
 	const base = { fullName: "Jane Doe", email: "jane.doe@gmail.com", date: ARRIVAL_DATE, time: ARRIVAL_TIME };
 
-	it("rejects a repeat without an end date", async () => {
-		await expectInlineError(formValues({ ...base, repeat: "weekly" }), "repeat_until", "Pick the last visit date");
+	it("rejects a crafted repeat without an end date (the modal requires 'Ends on')", async () => {
+		await expectInlineError(formValues({ ...base, repeat: "week" }), "repeat_until", "Pick the last visit date");
 	});
 
 	it("rejects an end date before the first visit", async () => {
-		await expectInlineError(formValues({ ...base, repeat: "weekly", until: "2030-07-19" }), "repeat_until", "before the first visit");
+		await expectInlineError(formValues({ ...base, repeat: "week", until: "2030-07-19" }), "repeat_until", "before the first visit");
 	});
 
-	it("rejects a series longer than 30 visits, naming the cap", async () => {
+	it("rejects an end date putting the series over 30 visits, naming the cap", async () => {
 		// Daily 2030-07-20 → 2030-08-20 inclusive is 32 visits.
-		await expectInlineError(formValues({ ...base, repeat: "daily", until: "2030-08-20" }), "repeat_until", "more than 30 visits");
+		await expectInlineError(formValues({ ...base, repeat: "day", until: "2030-08-20" }), "repeat_until", "more than 30 visits");
 	});
 
-	it("rejects a weekday repeat starting on a weekend", async () => {
-		// ARRIVAL_DATE 2030-07-20 is a Saturday.
-		await expectInlineError(formValues({ ...base, repeat: "weekdays", until: "2030-07-25" }), "repeat", "weekend");
+	it("rejects a weekly day choice with no visit before the end date", async () => {
+		// Arrival Saturday 2030-07-20, Mondays only, ending Sunday the 21st:
+		// the first Monday lands past the end date, so the series is empty.
+		await expectInlineError(formValues({ ...base, repeat: "week", days: ["mon"], until: "2030-07-21" }), "repeat_until", "No chosen day");
+	});
+
+	it("rejects a crafted zero interval (the picker's minimum is 1)", async () => {
+		await expectInlineError(formValues({ ...base, repeat: "week", every: "0", until: "2030-08-20" }), "repeat_every", "1 to 99");
+	});
+
+	it("drops crafted day values, falling back to the arrival date's weekday", async () => {
+		mockUserInfo();
+		let visitor: Captured | undefined;
+		mockVisitors((c) => (visitor = c));
+		mockMyList([MY_RECORD, { Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-27T14:30:00" }]);
+		const posts = mockPosts();
+
+		// "toString" is not a weekday; the filter must not walk the prototype
+		// chain, and an all-dropped selection reads as none (plain weekly).
+		const values = formValues({ ...base, repeat: "week", days: ["toString"], until: "2030-07-27" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(visitor!.body!).map((v: any) => v.ExpectedArrival)).toEqual(["2030-07-20T14:30:00", "2030-07-27T14:30:00"]);
+		expect(posts[0].text).toContain("*Repeats:* Every week until 2030-07-27 (2 visits)"); // no "on …" suffix
 	});
 
 	it("reads an inherited-property repeat value as 'none' (single visit, no crash)", async () => {
-		// "toString" passes an `in REPEATS` check via the prototype chain; it must
-		// be treated like any other unrecognized value, not expanded as a cadence.
+		// "toString" passes an `in REPEAT_UNITS` check via the prototype chain; it
+		// must be treated like any other unrecognized value, not expanded.
 		mockUserInfo();
 		let visitor: Captured | undefined;
 		mockVisitors((c) => (visitor = c));
@@ -175,7 +252,7 @@ describe("repeating visits", () => {
 		let dm: any;
 		mockSlack("chat.postMessage", (b) => (dm = b));
 
-		const values = formValues({ ...base, repeat: "weekly", until: "2030-07-27" });
+		const values = formValues({ ...base, repeat: "week", until: "2030-07-27" });
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
 		expect(res.status).toBe(200);
 		expect(dm.text).toContain("⚠️ *Registration submitted — but not confirmed*");

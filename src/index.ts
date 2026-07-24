@@ -45,7 +45,9 @@ import {
 	fetchFullName,
 	mrkdwnEscape,
 	postMessage,
+	readCheckboxes,
 	readDate,
+	readNumber,
 	readSelect,
 	readText,
 	readTime,
@@ -55,17 +57,32 @@ import {
 	type SlackMessage,
 	type ViewState,
 } from "./slack";
-import { MAX_VISITS, REPEATS, expandRepeat, fromWallClock, toWallClock, type RepeatKey } from "./time";
+import {
+	MAX_VISITS,
+	REPEAT_UNITS,
+	WEEKDAYS,
+	expandRepeat,
+	fromWallClock,
+	repeatLabel,
+	toWallClock,
+	type RepeatKey,
+	type WeekdayKey,
+} from "./time";
 
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
 // rejected inline; the /my lookup used for confirmation only sees upcoming visits.
 const ARRIVAL_GRACE_S = 120;
 
 // Open the modal from a trigger_id (slash command or the Home-tab button
-// click). A failure is warned with the Slack error code (never PII); false
-// lets the slash-command path tell the user to retry.
-function openModal(env: Env, triggerId: string): Promise<boolean> {
-	return slackApiWarn(env, "views.open", { trigger_id: triggerId, view: visitorModal(env) });
+// click), prefilling "Person they are visiting" with the opener's own name
+// (usually the member registers their own guest; the field stays editable).
+// The users.info lookup falls back to the payload's username, then to no
+// prefill — never a reason not to open. A views.open failure is warned with
+// the Slack error code (never PII); false lets the slash-command path tell
+// the user to retry.
+async function openModal(env: Env, triggerId: string, opener?: { id?: string; name?: string }): Promise<boolean> {
+	const host = (opener?.id ? await fetchFullName(env, opener.id) : null) ?? opener?.name;
+	return slackApiWarn(env, "views.open", { trigger_id: triggerId, view: visitorModal(env, "none", host) });
 }
 
 // Swap the post-submission placeholder for the result, if the submitter still
@@ -291,10 +308,12 @@ export default {
 
 		if (path === "/slack/command") {
 			// Slash command: open the modal with the trigger_id (expires in ~3s).
-			const triggerId = new URLSearchParams(rawBody).get("trigger_id");
+			const params = new URLSearchParams(rawBody);
+			const triggerId = params.get("trigger_id");
 			if (!triggerId) return new Response("", { status: 200 });
 
-			if (!(await openModal(env, triggerId))) {
+			const opener = { id: params.get("user_id") ?? undefined, name: params.get("user_name") ?? undefined };
+			if (!(await openModal(env, triggerId, opener))) {
 				return new Response("Couldn't open the visitor form — please try again.", { status: 200 });
 			}
 			return new Response("", { status: 200 });
@@ -328,7 +347,13 @@ export default {
 			user?: SlackUser;
 			trigger_id?: string;
 			response_url?: string;
-			actions?: Array<{ action_id?: string; block_id?: string; value?: string; selected_conversation?: string }>;
+			actions?: Array<{
+				action_id?: string;
+				block_id?: string;
+				value?: string;
+				selected_conversation?: string;
+				selected_option?: { value?: string };
+			}>;
 			message?: SlackMessage; // present on block_actions from a message (delete-by-Id)
 			view?: { id?: string; callback_id?: string; state?: ViewState };
 		};
@@ -338,13 +363,22 @@ export default {
 			return new Response("", { status: 200 });
 		}
 
-		// Button clicks: the Home tab's "Register a visitor" opens the modal; a
+		// Button clicks and dispatched inputs: the Home tab's "Register a visitor"
+		// opens the modal; the modal's repeat select re-renders the modal so the
+		// interval and end fields only show while a repeat is chosen; a
 		// confirmation's "Delete registration" removes the visitor again. Slack
 		// delivers exactly one action per click.
 		if (payload.type === "block_actions") {
 			const action = payload.actions?.[0];
 			if (action?.action_id === OPEN_ACTION && payload.trigger_id) {
-				await openModal(env, payload.trigger_id);
+				await openModal(env, payload.trigger_id, payload.user);
+			} else if (action?.action_id === FIELDS.repeat.action && payload.view?.id) {
+				const unit = action.selected_option?.value;
+				const repeat: RepeatKey = unit !== undefined && Object.hasOwn(REPEAT_UNITS, unit) ? (unit as RepeatKey) : "none";
+				// Seed the unfolding "Ends on" picker with the arrival date already
+				// entered, so it starts on a valid (on-or-after) date.
+				const arrival = readDate(payload.view.state ?? {}, FIELDS.arrivalDate);
+				await slackApiWarn(env, "views.update", { view_id: payload.view.id, view: visitorModal(env, repeat, undefined, arrival) });
 			} else if (action?.action_id === DELETE_ACTION && action.value && payload.response_url) {
 				const ids = parseDeleteIds(action.value);
 				if (ids.length) {
@@ -373,7 +407,12 @@ export default {
 		// crafted payload may not; anything unrecognized reads as "none".
 		// Object.hasOwn, not `in`: a crafted "toString" must not walk the prototype.
 		const repeatRaw = readSelect(state, FIELDS.repeat);
-		const repeat: RepeatKey = repeatRaw !== undefined && Object.hasOwn(REPEATS, repeatRaw) ? (repeatRaw as RepeatKey) : "none";
+		const repeat: RepeatKey = repeatRaw !== undefined && Object.hasOwn(REPEAT_UNITS, repeatRaw) ? (repeatRaw as RepeatKey) : "none";
+		const repeatEvery = readNumber(state, FIELDS.repeatEvery);
+		// Unrecognized day values (crafted payload) are dropped; an empty result
+		// reads as no selection, i.e. the arrival date's weekday.
+		const daysRaw = readCheckboxes(state, FIELDS.repeatDays)?.filter((d): d is WeekdayKey => Object.hasOwn(WEEKDAYS, d));
+		const repeatDays = daysRaw?.length ? daysRaw : undefined;
 		const repeatUntil = readDate(state, FIELDS.repeatUntil);
 
 		// Expand the repeat into visit dates, bouncing bad combinations back onto
@@ -382,7 +421,7 @@ export default {
 		let arrivalEpochs: number[] | undefined;
 		let repeatInfo: VisitorInput["repeat"];
 		if (arrivalDate && arrivalTime) {
-			const expanded = expandRepeat(arrivalDate, repeat, repeatUntil);
+			const expanded = expandRepeat(arrivalDate, repeat, { every: repeatEvery, days: repeatDays, until: repeatUntil });
 			if ("error" in expanded) {
 				return fieldError(FIELDS[expanded.field].block, expanded.error);
 			}
@@ -391,7 +430,7 @@ export default {
 				// `until` is the last generated visit, not the raw picker value:
 				// "every week until Sep 19" may end days earlier.
 				const dates = expanded.dates;
-				repeatInfo = { label: REPEATS[repeat].label, until: dates[dates.length - 1], count: dates.length };
+				repeatInfo = { label: repeatLabel(repeat, repeatEvery ?? 1, repeatDays), until: dates[dates.length - 1], count: dates.length };
 			}
 		}
 		const input: VisitorInput = {

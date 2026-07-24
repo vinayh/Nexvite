@@ -73,9 +73,9 @@ describe("delete button -> remove visitor", () => {
 		// breaks intact because it's sourced from blocks, not the collapsed fallback.
 		const deletedText = [
 			"🗑️ *Registration deleted*",
-			"~*Name:* Jane Doe~",
-			"~*Email:* jane.doe@gmail.com~",
-			"~*Phone:* +44 7700 900123~",
+			"~*Visitor name:* Jane Doe~",
+			"~*Visitor email:* jane.doe@gmail.com~",
+			"~*Visitor phone:* +44 7700 900123~",
 			`~*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)~`,
 			"~*Visiting:* Sam~",
 			"~*Notes:* Needs step-free access~",
@@ -171,7 +171,9 @@ describe("delete button -> remove visitor", () => {
 		expect(respond.text).toContain("the space team"); // no KV record to name a contact
 	});
 
-	it("restyles from the fallback text when the clicked message carries no blocks", async () => {
+	it("restyles from the fallback text when the clicked message carries no blocks, striking legacy labels", async () => {
+		// "*Name:*" is the label older ✅ messages were posted with; their Delete
+		// buttons still work, so the restyle must keep striking it.
 		mockDelete(42);
 		let respond: any;
 		mockRespond((b) => (respond = b));
@@ -234,7 +236,7 @@ describe("delete button -> remove visitor", () => {
 	const SERIES_HEAD = [
 		"✅️ *Visitor registered*",
 		"_The visitor should receive a separate Nexudus invite at the email below for each visit in the series._",
-		"*Name:* Jane Doe",
+		"*Visitor name:* Jane Doe",
 		"*Repeats:* Every week until 2030-10-31 (3 visits)",
 	].join("\n");
 	const ROW_LINES: Record<number, string> = {
@@ -282,7 +284,7 @@ describe("delete button -> remove visitor", () => {
 		// Head restyled, every row struck, all buttons (accessories + actions) gone.
 		expect(respond.blocks.map((b: any) => b.type)).toEqual(["section", "section", "section", "section"]);
 		expect(respond.blocks[0].text.text).toBe(
-			["🗑️ *Registration deleted*", "~*Name:* Jane Doe~", "~*Repeats:* Every week until 2030-10-31 (3 visits)~"].join("\n"),
+			["🗑️ *Registration deleted*", "~*Visitor name:* Jane Doe~", "~*Repeats:* Every week until 2030-10-31 (3 visits)~"].join("\n"),
 		);
 		expect(respond.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`);
 		expect(JSON.stringify(respond.blocks)).not.toContain("delete_visitor");

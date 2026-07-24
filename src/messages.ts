@@ -11,7 +11,7 @@
  */
 
 import { mrkdwnEscape, type SlackMessage } from "./slack";
-import { MAX_VISITS, REPEATS, toWallClock, type RepeatKey } from "./time";
+import { MAX_INTERVAL, REPEAT_UNITS, WEEKDAYS, toWallClock, type RepeatKey, type WeekdayKey } from "./time";
 
 export const CALLBACK_ID = "visitor_registration";
 export const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
@@ -25,7 +25,11 @@ export const FIELDS = {
 	phone: { block: "phone", action: "value", cap: 50 },
 	arrivalDate: { block: "arrival_date", action: "value" },
 	arrivalTime: { block: "arrival_time", action: "value" },
-	repeat: { block: "repeat", action: "value" },
+	// The repeat select's action_id doubles as the block_actions dispatch id
+	// (changing it re-renders the modal), so it's distinct from "value".
+	repeat: { block: "repeat", action: "repeat_unit" },
+	repeatEvery: { block: "repeat_every", action: "value" },
+	repeatDays: { block: "repeat_days", action: "value" },
 	repeatUntil: { block: "repeat_until", action: "value" },
 	host: { block: "host", action: "value", cap: 200 },
 	notes: { block: "notes", action: "value", cap: 1000 },
@@ -35,22 +39,84 @@ export const FIELDS = {
 // The modal
 // ---------------------------------------------------------------------------
 
-function inputBlock(block: string, action: string, label: string, element: Record<string, unknown>, optional = false, hint?: string) {
+function inputBlock(
+	block: string,
+	action: string,
+	label: string,
+	element: Record<string, unknown>,
+	opts: { optional?: boolean; hint?: string; dispatch?: boolean } = {},
+) {
 	return {
 		type: "input",
 		block_id: block,
-		optional,
+		optional: opts.optional ?? false,
+		...(opts.dispatch && { dispatch_action: true }),
 		label: { type: "plain_text", text: label },
 		element: { action_id: action, ...element },
-		...(hint && { hint: { type: "plain_text", text: hint } }),
+		...(opts.hint && { hint: { type: "plain_text", text: opts.hint } }),
 	};
 }
 
 function repeatOption(key: RepeatKey) {
-	return { text: { type: "plain_text", text: REPEATS[key].label }, value: key };
+	return { text: { type: "plain_text", text: REPEAT_UNITS[key].label }, value: key };
 }
 
-export function visitorModal(env: Env) {
+// `repeat` is the currently selected unit: the select dispatches its changes
+// and the handler re-renders the modal, so the interval and end fields only
+// exist while a repeat is chosen (views.update keeps the values of the blocks
+// that survive, matched by block_id — including a `host` prefill the member
+// typed over, so the re-render doesn't need to know it). `untilInitial` seeds
+// the "Ends on" picker with the arrival date already in the form: Slack can't
+// cross-validate pickers client-side, so this only starts it on a valid date;
+// the real on/after check is the inline error at submission.
+export function visitorModal(env: Env, repeat: RepeatKey = "none", host?: string, untilInitial?: string) {
+	const repeatFields =
+		repeat === "none"
+			? []
+			: [
+					inputBlock(
+						FIELDS.repeatEvery.block,
+						FIELDS.repeatEvery.action,
+						"Repeat every",
+						{ type: "number_input", is_decimal_allowed: false, min_value: "1", max_value: String(MAX_INTERVAL) },
+						{
+							optional: true,
+							hint: `How many ${REPEAT_UNITS[repeat].noun}s between visits — leave blank for every ${REPEAT_UNITS[repeat].noun}`,
+						},
+					),
+					// Weekly repeats can pick the days to visit within each active week.
+					// A multi-select, not checkboxes: it renders as a single row (picked
+					// days become inline tokens) where checkboxes stack vertically. Its
+					// state arrives as selected_options, same as checkboxes.
+					...(repeat === "week"
+						? [
+								inputBlock(
+									FIELDS.repeatDays.block,
+									FIELDS.repeatDays.action,
+									"Repeats on",
+									{
+										type: "multi_static_select",
+										placeholder: { type: "plain_text", text: "Select days" },
+										options: (Object.keys(WEEKDAYS) as WeekdayKey[]).map((day) => ({
+											text: { type: "plain_text", text: WEEKDAYS[day].label },
+											value: day,
+										})),
+									},
+									{ optional: true, hint: "Days of the week to visit — leave blank for the arrival date's weekday" },
+								),
+							]
+						: []),
+					// Required: this block only exists while a repeat is chosen, so
+					// Slack itself demands it before the modal can submit (up to
+					// MAX_VISITS visits; over is bounced with an inline error).
+					inputBlock(
+						FIELDS.repeatUntil.block,
+						FIELDS.repeatUntil.action,
+						"Ends on",
+						{ type: "datepicker", ...(untilInitial && { initial_date: untilInitial }) },
+						{ hint: env.SPACE_TIMEZONE },
+					),
+				];
 	return {
 		type: "modal",
 		callback_id: CALLBACK_ID,
@@ -58,46 +124,52 @@ export function visitorModal(env: Env) {
 		submit: { type: "plain_text", text: "Register" },
 		close: { type: "plain_text", text: "Cancel" },
 		blocks: [
-			inputBlock(FIELDS.fullName.block, FIELDS.fullName.action, "Full name", {
+			inputBlock(FIELDS.fullName.block, FIELDS.fullName.action, "Visitor name", {
 				type: "plain_text_input",
 			}),
-			inputBlock(FIELDS.email.block, FIELDS.email.action, "Email", { type: "email_text_input" }),
-			inputBlock(FIELDS.phone.block, FIELDS.phone.action, "Phone", { type: "plain_text_input" }, true),
+			inputBlock(FIELDS.email.block, FIELDS.email.action, "Visitor email", { type: "email_text_input" }),
 			// Naive date + time pickers, not a datetimepicker: a datetimepicker
 			// renders in each member's own timezone, so the instant it submits
 			// depends on who submitted it. These values are read as SPACE_TIMEZONE
-			// wall-clock; the labels name that timezone because for a member
-			// abroad the field is *not* their local time.
-			inputBlock(FIELDS.arrivalDate.block, FIELDS.arrivalDate.action, `Expected arrival — date (${env.SPACE_TIMEZONE})`, {
-				type: "datepicker",
-			}),
+			// wall-clock; the bare timezone hint under each field says so, because
+			// for a member abroad the field is *not* their local time.
+			inputBlock(FIELDS.arrivalDate.block, FIELDS.arrivalDate.action, "Arrival date", { type: "datepicker" }, { hint: env.SPACE_TIMEZONE }),
 			inputBlock(
 				FIELDS.arrivalTime.block,
 				FIELDS.arrivalTime.action,
-				`Expected arrival — time (${env.SPACE_TIMEZONE})`,
+				"Arrival time",
 				{ type: "timepicker" },
-				false,
-				`Time at the space (${env.SPACE_TIMEZONE}), not your own time zone.`,
+				{ hint: env.SPACE_TIMEZONE },
 			),
-			// Repeat cadence + inclusive end date; the arrival above is the first
-			// visit. "Repeat until" must be optional so Slack doesn't demand it on
-			// single-visit submissions; picking a cadence without it is bounced
-			// with an inline error instead.
-			inputBlock(FIELDS.repeat.block, FIELDS.repeat.action, "Repeat visit", {
-				type: "static_select",
-				initial_option: repeatOption("none"),
-				options: (Object.keys(REPEATS) as RepeatKey[]).map(repeatOption),
+			// Everything below the line is fine to leave as-is for the common case.
+			{ type: "divider", block_id: "divider" },
+			// Required, but prefilled with the opener's own name, so the common
+			// case (registering your own guest) needs no typing.
+			inputBlock(FIELDS.host.block, FIELDS.host.action, "Person they are visiting", {
+				type: "plain_text_input",
+				...(host && { initial_value: host }),
 			}),
+			// The Nexudus portal's repeat model: every N days/weeks/months on
+			// chosen days, up to an end date. The arrival above is the first
+			// visit; choosing a unit unfolds the detail fields right below.
+			// Bracketing dividers set the repeat fields off as their own section
+			// (a modal has no stronger grouping than a divider).
+			{ type: "divider", block_id: "repeat_divider" },
 			inputBlock(
-				FIELDS.repeatUntil.block,
-				FIELDS.repeatUntil.action,
-				`Repeat until (${env.SPACE_TIMEZONE})`,
-				{ type: "datepicker" },
-				true,
-				`Last possible visit date when repeating — up to ${MAX_VISITS} visits.`,
+				FIELDS.repeat.block,
+				FIELDS.repeat.action,
+				"Repeat visit",
+				{
+					type: "static_select",
+					initial_option: repeatOption(repeat),
+					options: (Object.keys(REPEAT_UNITS) as RepeatKey[]).map(repeatOption),
+				},
+				{ dispatch: true },
 			),
-			inputBlock(FIELDS.host.block, FIELDS.host.action, "Who are they visiting?", { type: "plain_text_input" }, true),
-			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, true),
+			...repeatFields,
+			{ type: "divider", block_id: "repeat_end_divider" },
+			inputBlock(FIELDS.phone.block, FIELDS.phone.action, "Visitor phone", { type: "plain_text_input" }, { optional: true }),
+			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, { optional: true }),
 		],
 	};
 }
@@ -174,12 +246,16 @@ export interface VisitorInput {
 	submittedBy: string;
 }
 
-// The visitor's own field labels: written by submissionSummary and struck by
-// the 🗑️ restyle below. Keeping the list here (typed into both) means a new
-// summary field strikes correctly on deletion by construction. "Submitted by"
-// and "Nexudus ID" are deliberately absent so they survive the restyle.
-const SUMMARY_LABELS = ["Name", "Email", "Phone", "Arrival", "Repeats", "Visiting", "Notes"] as const;
-const STRUCK_LINE = new RegExp(`^\\*(${SUMMARY_LABELS.join("|")}|Visit \\d+):\\*`);
+// The visitor's own field labels, matching the modal's wording: written by
+// submissionSummary and struck by the 🗑️ restyle below. Keeping the list here
+// (typed into both) means a new summary field strikes correctly on deletion by
+// construction. "Submitted by" and "Nexudus ID" are deliberately absent so
+// they survive the restyle.
+const SUMMARY_LABELS = ["Visitor name", "Visitor email", "Visitor phone", "Arrival", "Repeats", "Visiting", "Notes"] as const;
+// Labels older ✅ messages were posted with; their Delete buttons still work,
+// so the restyle must keep striking them.
+const LEGACY_LABELS = ["Name", "Email", "Phone"] as const;
+const STRUCK_LINE = new RegExp(`^\\*(${[...SUMMARY_LABELS, ...LEGACY_LABELS].join("|")}|Visit \\d+):\\*`);
 
 // mrkdwn summary of what was submitted, shown under every result header (and in
 // the channel log). Blank optional fields are omitted; arrival is space-local
@@ -187,9 +263,9 @@ const STRUCK_LINE = new RegExp(`^\\*(${SUMMARY_LABELS.join("|")}|Visit \\d+):\\*
 export function submissionSummary(env: Env, input: VisitorInput): string {
 	const { repeat } = input;
 	const fields: Record<(typeof SUMMARY_LABELS)[number], string | undefined> = {
-		Name: input.fullName && mrkdwnEscape(input.fullName),
-		Email: input.email && mrkdwnEscape(input.email),
-		Phone: input.phone && mrkdwnEscape(input.phone),
+		"Visitor name": input.fullName && mrkdwnEscape(input.fullName),
+		"Visitor email": input.email && mrkdwnEscape(input.email),
+		"Visitor phone": input.phone && mrkdwnEscape(input.phone),
 		Arrival: input.arrivalEpochs?.length ? spaceTime(env, input.arrivalEpochs[0]) : undefined,
 		Repeats: repeat && `${repeat.label} until ${repeat.until} (${repeat.count} visit${repeat.count === 1 ? "" : "s"})`,
 		Visiting: input.host && mrkdwnEscape(input.host),

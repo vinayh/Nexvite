@@ -114,7 +114,7 @@ describe("view_submission -> register + DM", () => {
 		expect(dm.text).toContain("couldn't confirm it went through");
 		expect(dm.text).toContain("check with svc@example.com to avoid a duplicate");
 		expect(dm.text).not.toContain("❌"); // not framed as an outright failure
-		expect(dm.text).toContain("*Name:* Jane Doe"); // still echoes what was submitted
+		expect(dm.text).toContain("*Visitor name:* Jane Doe"); // still echoes what was submitted
 		expect(dm.text).not.toContain("*Nexudus ID:*");
 	});
 
@@ -175,7 +175,7 @@ describe("view_submission -> register + DM", () => {
 		expect(dm.text).toContain("❌ *Registration failed*");
 		expect(dm.text).toContain("couldn't connect to the visitor system");
 		expect(dm.text).toContain("contact svc@example.com"); // the Nexudus account, not "an admin"
-		expect(dm.text).toContain("*Name:* Jane Doe"); // summary included on failure too
+		expect(dm.text).toContain("*Visitor name:* Jane Doe"); // summary included on failure too
 		// The operational hint stays out of the member-facing message.
 		expect(dm.text).not.toContain("re-seed");
 		expect(dm.text).not.toContain("token");
@@ -287,7 +287,7 @@ describe("view_submission -> register + DM", () => {
 
 		// The Slack messages carry the escaped form, no mention injection…
 		for (const post of posts) {
-			expect(post.text).toContain("*Name:* Jane &lt;!channel&gt; &amp; Co");
+			expect(post.text).toContain("*Visitor name:* Jane &lt;!channel&gt; &amp; Co");
 			expect(post.text).not.toContain("<!channel>");
 		}
 		// …while Nexudus receives the text as typed.

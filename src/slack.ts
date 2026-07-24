@@ -133,7 +133,16 @@ export type SlackMessage = { text?: string; blocks?: unknown[] };
 export type ViewState = {
 	values?: Record<
 		string,
-		Record<string, { value?: unknown; selected_date?: unknown; selected_time?: unknown; selected_option?: { value?: unknown } }>
+		Record<
+			string,
+			{
+				value?: unknown;
+				selected_date?: unknown;
+				selected_time?: unknown;
+				selected_option?: { value?: unknown };
+				selected_options?: Array<{ value?: unknown }>;
+			}
+		>
 	>;
 };
 
@@ -177,4 +186,19 @@ export function readTime(state: ViewState, field: FieldRef): string | undefined 
 export function readSelect(state: ViewState, field: FieldRef): string | undefined {
 	const raw = fieldValue(state, field)?.selected_option?.value;
 	return typeof raw === "string" ? raw : undefined;
+}
+
+// A number_input's value as a non-negative integer; undefined when absent,
+// blank, or (crafted payload) not a plain digit string.
+export function readNumber(state: ViewState, field: FieldRef): number | undefined {
+	const raw = fieldValue(state, field)?.value;
+	return typeof raw === "string" && /^\d{1,7}$/.test(raw) ? Number(raw) : undefined;
+}
+
+// A checkboxes element's selected values (string ones only, dropping crafted
+// shapes); undefined when the block is absent from the state.
+export function readCheckboxes(state: ViewState, field: FieldRef): string[] | undefined {
+	const raw = fieldValue(state, field)?.selected_options;
+	if (!Array.isArray(raw)) return undefined;
+	return raw.map((o) => o?.value).filter((v): v is string => typeof v === "string");
 }

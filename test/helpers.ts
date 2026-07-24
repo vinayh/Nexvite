@@ -43,9 +43,9 @@ export const MY_RECORD = { Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival:
 export const SUCCESS_TEXT = [
 	"✅ *Visitor registered*",
 	"_The visitor should receive an invite from the Nexudus platform shortly at the email below._",
-	"*Name:* Jane Doe",
-	"*Email:* jane.doe@gmail.com",
-	"*Phone:* +44 7700 900123",
+	"*Visitor name:* Jane Doe",
+	"*Visitor email:* jane.doe@gmail.com",
+	"*Visitor phone:* +44 7700 900123",
 	`*Arrival:* ${ARRIVAL_LOCAL} (Europe/London)`,
 	"*Visiting:* Sam",
 	"*Notes:* Needs step-free access",
@@ -127,6 +127,8 @@ export function formValues(fields: {
 	date?: string;
 	time?: string | null;
 	repeat?: string;
+	every?: string | null;
+	days?: string[];
 	until?: string | null;
 	host?: string;
 	notes?: string;
@@ -137,7 +139,11 @@ export function formValues(fields: {
 	if ("phone" in fields) values.phone = { value: { type: "plain_text_input", value: fields.phone } };
 	if ("date" in fields) values.arrival_date = { value: { type: "datepicker", selected_date: fields.date } };
 	if ("time" in fields) values.arrival_time = { value: { type: "timepicker", selected_time: fields.time } };
-	if ("repeat" in fields) values.repeat = { value: { type: "static_select", selected_option: { value: fields.repeat } } };
+	if ("repeat" in fields) values.repeat = { repeat_unit: { type: "static_select", selected_option: { value: fields.repeat } } };
+	if ("every" in fields) values.repeat_every = { value: { type: "number_input", value: fields.every } };
+	if ("days" in fields) {
+		values.repeat_days = { value: { type: "multi_static_select", selected_options: fields.days?.map((day) => ({ value: day })) } };
+	}
 	if ("until" in fields) values.repeat_until = { value: { type: "datepicker", selected_date: fields.until } };
 	if ("host" in fields) values.host = { value: { type: "plain_text_input", value: fields.host } };
 	if ("notes" in fields) values.notes = { value: { type: "plain_text_input", value: fields.notes } };
@@ -188,6 +194,9 @@ export function blockActionsBody(
 		blockId?: string;
 		responseUrl?: string;
 		userId?: string;
+		selectedOption?: string; // a dispatched select change (the repeat unit)
+		viewId?: string; // present when the action comes from inside a modal
+		viewState?: object; // the modal's current state.values, as Slack sends it
 		messageText?: string;
 		messageBlocks?: unknown[];
 		messageRaw?: object;
@@ -223,8 +232,10 @@ export function blockActionsBody(
 				action_id: actionId,
 				...(extra.blockId ? { block_id: extra.blockId } : {}),
 				...(extra.value ? { value: extra.value } : {}),
+				...(extra.selectedOption ? { selected_option: { value: extra.selectedOption } } : {}),
 			},
 		],
+		...(extra.viewId ? { view: { id: extra.viewId, ...(extra.viewState ? { state: { values: extra.viewState } } : {}) } } : {}),
 		...(extra.responseUrl ? { response_url: extra.responseUrl } : {}),
 		...(message ? { message } : {}),
 	};
