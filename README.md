@@ -130,6 +130,8 @@ wrangler deploy
 
 scripts/nexudus-token.sh | scripts/nexudus-seed.sh   # seed the Nexudus auth record in KV
 # seeding from a remote Windows machine: see the header of scripts/nexudus-token.ps1
+# test as another Nexudus account: scripts/nexudus-swap.sh test|restore|status
+# (stashes the live record under a second KV key, swaps it back on restore)
 wrangler secret put SLACK_SIGNING_SECRET
 wrangler secret put SLACK_BOT_TOKEN
 ```
