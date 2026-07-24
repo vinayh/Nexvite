@@ -2,8 +2,9 @@
 // (Delete-all), and per-visit row deletes, with the 🗑️ restyling of the
 // clicked message and the ephemeral warnings on failure.
 
-import { fetchMock } from "cloudflare:test";
+import { env, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
+import { TOKEN_KEY } from "../src/nexudus";
 import {
 	ARRIVAL_LOCAL,
 	NEXUDUS_BASE,
@@ -129,6 +130,104 @@ describe("delete button -> remove visitor", () => {
 		expect(res.status).toBe(200);
 	});
 
+	it("ignores a Delete-all whose ids are not all numbers (no outbound calls)", async () => {
+		// Well-formed JSON but a crafted element type; the whole ref is dropped.
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ ids: [42, "43"] }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+	});
+
+	it("ignores a row-delete click whose value carries no id (no outbound calls)", async () => {
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor_row", "trig-del", {
+					value: "{}",
+					blockId: "visit_43",
+					responseUrl: `${RESPOND_BASE}/respond`,
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+	});
+
+	it("reports a friendly failure when the auth chain is broken mid-delete (unseeded KV)", async () => {
+		await env.TOKENS.delete(TOKEN_KEY); // undo the describe-level seed
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDeleteById(42, "✅ *Visitor registered*\n*Nexudus ID:* 42");
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("Deleting failed");
+		expect(respond.text).toContain("the space team"); // no KV record to name a contact
+	});
+
+	it("restyles from the fallback text when the clicked message carries no blocks", async () => {
+		mockDelete(42);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ id: 42 }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageRaw: { text: "✅️ *Visitor registered*\n*Name:* Jane Doe\n*Nexudus ID:* 42" },
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const expected = ["🗑️ *Registration deleted*", "~*Name:* Jane Doe~", "*Nexudus ID:* 42"].join("\n");
+		expect(respond.replace_original).toBe(true);
+		expect(respond.text).toBe(expected);
+		expect(respond.blocks).toEqual([{ type: "section", text: { type: "mrkdwn", text: expected } }]);
+	});
+
+	it("falls back to the bare 🗑️ header when the click carries no message at all", async () => {
+		mockDelete(42);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ id: 42 }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(true);
+		expect(respond.text).toBe("🗑️ *Registration deleted*");
+	});
+
+	it("survives a response_url post that returns an error status (delete still done)", async () => {
+		mockDelete(42);
+		fetchMock.get(RESPOND_BASE).intercept({ path: "/respond", method: "POST" }).reply(500, "");
+
+		const res = await clickDeleteById(42, "✅ *Visitor registered*\n*Nexudus ID:* 42");
+		expect(res.status).toBe(200); // the failure is only log-worthy
+	});
+
+	it("survives a response_url post whose fetch itself throws", async () => {
+		mockDelete(42);
+		fetchMock.get(RESPOND_BASE).intercept({ path: "/respond", method: "POST" }).replyWithError(new Error("connection reset"));
+
+		const res = await clickDeleteById(42, "✅ *Visitor registered*\n*Nexudus ID:* 42");
+		expect(res.status).toBe(200);
+	});
+
 	// A series ✅ message as posted: a summary head section, one row per visit
 	// with its own Delete accessory, then the Delete-all actions block (✅
 	// requalified as Slack returns it).
@@ -247,6 +346,118 @@ describe("delete button -> remove visitor", () => {
 		expect(row42.accessory.action_id).toBe("delete_visitor_row"); // others survive
 		expect(row44.accessory.action_id).toBe("delete_visitor_row");
 		expect(actions.type).toBe("actions"); // Delete-all survives
+	});
+
+	it("warns with the plural wording when every visit in a series is already gone", async () => {
+		mockDelete(42, 404);
+		mockDelete(43, 404);
+		mockDelete(44, 404);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await clickDeleteAll();
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toContain("Couldn't find these registrations");
+		expect(respond.text).toContain("svc@example.com");
+	});
+
+	it("passes an already-struck row through Delete-all without double-striking it", async () => {
+		// Row 43 was deleted via its own button earlier: struck text, accessory
+		// gone, already absent from Nexudus — but Delete-all still carries every
+		// Id captured at registration.
+		const blocks = seriesBlocks() as any[];
+		blocks[2] = { type: "section", block_id: "visit_43", text: { type: "mrkdwn", text: `~${ROW_LINES[43]}~` } };
+		mockDelete(42);
+		mockDelete(43, 404); // already gone
+		mockDelete(44);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ ids: [42, 43, 44] }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageBlocks: blocks,
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(true);
+		expect(respond.blocks[1].text.text).toBe(`~${ROW_LINES[42]}~`);
+		expect(respond.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`); // single strike, not ~~…~~
+		expect(respond.blocks[3].text.text).toBe(`~${ROW_LINES[44]}~`);
+		expect(respond.blocks.at(-1).text.text).toContain("1 of the 3 visits couldn't be found");
+	});
+
+	it("paces a long series delete in batches without dropping any (9 visits)", async () => {
+		// Nine ids cross the batch-of-8 pause (deletePause; its sleep is zeroed
+		// in tests) — every mockDelete being consumed proves all nine ran.
+		const ids = [51, 52, 53, 54, 55, 56, 57, 58, 59];
+		for (const id of ids) mockDelete(id);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ ids }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageText: "✅ *Visitor registered*\n*Name:* Jane Doe",
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(true);
+		expect(respond.text).toContain("🗑️ *Registration deleted*");
+	});
+
+	it("confirms ephemerally when the deleted row can't be found in the message (stale block_id)", async () => {
+		mockDelete(43);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		// The visit is still deleted in Nexudus, so the clicker gets a truthful
+		// ephemeral instead of a rebuilt message.
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor_row", "trig-del", {
+					value: JSON.stringify({ id: 43 }),
+					blockId: "visit_99",
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageBlocks: seriesBlocks(),
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(respond.replace_original).toBe(false);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toBe("🗑️ Visit deleted from Nexudus.");
+	});
+
+	it("confirms ephemerally too when the row click carries no block_id", async () => {
+		mockDelete(43);
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor_row", "trig-del", {
+					value: JSON.stringify({ id: 43 }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageBlocks: seriesBlocks(),
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(respond.response_type).toBe("ephemeral");
+		expect(respond.text).toBe("🗑️ Visit deleted from Nexudus.");
 	});
 
 	it("warns ephemerally, message untouched, when a row delete 404s", async () => {

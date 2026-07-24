@@ -312,6 +312,118 @@ describe("view_submission -> register + DM", () => {
 		expect(res.status).toBe(200);
 	});
 
+	it("acks with a plain 200 and does nothing when the submission carries no user id", async () => {
+		// No mocks registered: with nobody to DM, nothing may go out at all.
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { user: {} })));
+		expect(res.status).toBe(200);
+		expect(await res.text()).toBe(""); // no response_action; the modal just closes
+	});
+
+	it("treats a submission with no state as missing its required fields", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { noState: true })));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("required");
+	});
+
+	it("falls back to user.username when the payload carries no name", async () => {
+		// The ok:false reply also carries no error code → logged as "unknown".
+		mockUserInfo({ ok: false });
+		mockVisitors();
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		const res = await run(
+			await slackRequest("/slack/interactivity", submissionBody(undefined, { user: { id: "U1", username: "vinay.h" } })),
+		);
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Submitted by:* vinay.h");
+	});
+
+	it("labels the submitter 'a Slack user' when the payload carries no usable name", async () => {
+		mockUserInfo({ ok: false, error: "missing_scope" });
+		mockVisitors();
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(undefined, { user: { id: "U1" } })));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Submitted by:* a Slack user");
+	});
+
+	it("uses the top-level real_name when users.info returns no profile", async () => {
+		mockUserInfo({ ok: true, user: { real_name: "Jane Admin" } });
+		mockVisitors();
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Submitted by:* Jane Admin");
+	});
+
+	it("falls back to the username when users.info returns no name at all", async () => {
+		mockUserInfo({ ok: true, user: {} });
+		mockVisitors();
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Submitted by:* vinay");
+	});
+
+	it("names the HTTP status when Nexudus rejects with an empty body", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockVisitors(undefined, 400, ""); // rejection with nothing to quote
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("Nexudus rejected the registration: HTTP 400");
+	});
+
+	it("treats whitespace-only optional fields as absent (summary and Nexudus notes)", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		const values = formValues({
+			fullName: "Jane Doe",
+			email: "jane.doe@gmail.com",
+			date: ARRIVAL_DATE,
+			time: ARRIVAL_TIME,
+			host: "   ",
+			notes: " \t ",
+		});
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(visitor!.body!)[0].CustomerNotes).toBe("Submitted via Slack by Vinay Hiremath");
+		expect(posts[0].text).not.toContain("*Visiting:*");
+		expect(posts[0].text).not.toContain("*Notes:*");
+	});
+
+	it("treats a refresh 200 with a non-JSON body as a failure and leaves KV untouched", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockVisitors(undefined, 401);
+		// e.g. an HTML error page from a proxy that still says 200.
+		fetchMock.get(NEXUDUS_BASE).intercept({ path: "/api/token", method: "POST" }).reply(200, "<html>proxy error</html>");
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(AUTH);
+	});
+
 	it("updates the open modal with the success result, on the same view id, when the submission carries one", async () => {
 		let update: any;
 		mockUserInfo();
@@ -519,6 +631,21 @@ describe("Id lookup -> /my parsing", () => {
 		await submitExpectingUnconfirmed();
 	});
 
+	it("treats a non-JSON /my body as unconfirmed", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyListRaw("<html>bad gateway</html>"); // first lookup
+		mockMyListRaw("<html>bad gateway</html>"); // retry
+		await submitExpectingUnconfirmed();
+	});
+
+	it("skips records whose arrival doesn't parse and still resolves the rest", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([{ Id: 41, Email: "jane.doe@gmail.com", ExpectedArrival: "not-a-date" }, MY_RECORD]);
+		await submitExpectingId(42);
+	});
+
 	it("matches a record in the legacy /Date(ms)/ form", async () => {
 		mockUserInfo();
 		mockVisitors();
@@ -561,6 +688,16 @@ describe("Id lookup -> /my parsing", () => {
 		mockMyList([
 			{ Id: 41, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC },
 			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC },
+		]);
+		await submitExpectingId(43);
+	});
+
+	it("picks the newest Id when duplicates arrive newest-first too", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC },
+			{ Id: 41, Email: "jane.doe@gmail.com", ExpectedArrival: ARRIVAL_UTC },
 		]);
 		await submitExpectingId(43);
 	});

@@ -87,14 +87,14 @@ let nextIp = 1; // unique per request so tests don't trip the per-IP rate limite
 export async function slackRequest(
 	path: string,
 	rawBody: string,
-	opts: { timestamp?: number; signature?: string; omitSignature?: boolean; ip?: string } = {},
+	opts: { timestamp?: number; signature?: string; omitSignature?: boolean; ip?: string; omitIp?: boolean } = {},
 ): Promise<Request<unknown, IncomingRequestCfProperties>> {
 	const ts = String(opts.timestamp ?? Math.floor(Date.now() / 1000));
 	const headers: Record<string, string> = {
 		"Content-Type": "application/x-www-form-urlencoded",
 		"X-Slack-Request-Timestamp": ts,
-		"CF-Connecting-IP": opts.ip ?? `10.0.${(nextIp >> 8) & 255}.${nextIp++ & 255}`,
 	};
+	if (!opts.omitIp) headers["CF-Connecting-IP"] = opts.ip ?? `10.0.${(nextIp >> 8) & 255}.${nextIp++ & 255}`;
 	if (!opts.omitSignature) {
 		headers["X-Slack-Signature"] = opts.signature ?? (await sign(rawBody, ts));
 	}
@@ -146,7 +146,7 @@ export function formValues(fields: {
 
 export function submissionBody(
 	values?: Record<string, unknown>,
-	over: { type?: string; callback_id?: string; viewId?: string } = {},
+	over: { type?: string; callback_id?: string; viewId?: string; user?: Record<string, unknown>; noState?: boolean } = {},
 ): string {
 	const defaults = formValues({
 		fullName: "Jane Doe",
@@ -161,13 +161,16 @@ export function submissionBody(
 	});
 	const payload = {
 		type: over.type ?? "view_submission",
-		user: { id: "U1", name: "vinay" }, // `name` is the *username*; the full name comes from users.info
+		// `name` is the *username*; the full name comes from users.info. `user`
+		// models crafted payloads (no id, or no usable name at all).
+		user: over.user ?? { id: "U1", name: "vinay" },
 		view: {
 			// `id` is present on a real submission; omit it to model the modal
 			// already being gone (then no views.update is attempted).
 			...(over.viewId ? { id: over.viewId } : {}),
 			callback_id: over.callback_id ?? "visitor_registration",
-			state: { values: values ?? defaults },
+			// `noState` models a crafted submission with no state at all.
+			...(over.noState ? {} : { state: { values: values ?? defaults } }),
 		},
 	};
 	return new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
@@ -187,6 +190,7 @@ export function blockActionsBody(
 		userId?: string;
 		messageText?: string;
 		messageBlocks?: unknown[];
+		messageRaw?: object;
 	} = {},
 ): string {
 	// As Slack delivers the clicked message: verbatim content in `blocks`, a `text`
@@ -196,7 +200,9 @@ export function blockActionsBody(
 	// messageBlocks passes an explicit block list (series messages); messageText
 	// models the classic single-section shape.
 	let message: object | undefined;
-	if (extra.messageBlocks) {
+	if (extra.messageRaw) {
+		message = extra.messageRaw; // verbatim, e.g. a blocks-less message
+	} else if (extra.messageBlocks) {
 		message = { text: "(fallback)", blocks: extra.messageBlocks };
 	} else if (extra.messageText != null) {
 		const returned = extra.messageText.replace(/✅/g, "✅️");

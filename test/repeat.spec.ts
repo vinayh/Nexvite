@@ -80,6 +80,48 @@ describe("repeating visits", () => {
 		expect(JSON.parse(button.value)).toEqual({ ids: [42, 43, 44] });
 	});
 
+	it("expands a weekday repeat across a weekend, skipping Saturday and Sunday", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		// 2030-07-25 is a Thursday; weekdays until Monday the 29th is Thu, Fri,
+		// Mon — the weekend in between must not become visits. July is BST, so
+		// 15:30 UK is 14:30 UTC throughout.
+		mockMyList([
+			{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-25T14:30:00" },
+			{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-26T14:30:00" },
+			{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-07-29T14:30:00" },
+		]);
+		const posts = mockPosts();
+
+		const values = formValues({ ...base, date: "2030-07-25", repeat: "weekdays", until: "2030-07-29" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering 3 visits");
+
+		const body = JSON.parse(visitor!.body!);
+		expect(body.map((v: any) => v.ExpectedArrival)).toEqual(["2030-07-25T14:30:00", "2030-07-26T14:30:00", "2030-07-29T14:30:00"]);
+		expect(posts[0].text).toContain("*Repeats:* Every weekday (Mon–Fri) until 2030-07-29 (3 visits)");
+	});
+
+	it("uses singular wording when the repeat window only fits one visit", async () => {
+		mockUserInfo();
+		mockVisitors();
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		// Weekly from Saturday the 20th until Friday the 26th: the next Saturday
+		// falls past the end date, so the series is just the first visit.
+		const values = formValues({ ...base, repeat: "weekly", until: "2030-07-26" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(posts[0].text).toContain("*Repeats:* Every week until 2030-07-20 (1 visit)");
+		expect(posts[0].text).not.toContain("1 visits");
+		// One resolved Id means the single-visit confirmation, not series rows.
+		expect(posts[0].text).toContain("*Nexudus ID:* 42");
+		expect(posts[0].text).not.toContain("*Visit 1:*");
+	});
+
 	// Inline repeat errors happen before the ack, so no outbound calls at all.
 	async function expectInlineError(values: Record<string, unknown>, block: string, fragment: string): Promise<void> {
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
