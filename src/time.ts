@@ -4,25 +4,20 @@
  * No Slack or Nexudus knowledge — everything here is trivially unit-testable.
  */
 
-// The units offered by the modal's "Repeat visit" select, mirroring the
-// Nexudus portal's own repeat model: every N days/weeks/months, ending either
-// after a number of occurrences or on a date. Expansion steps through calendar
-// dates in SPACE_TIMEZONE date space; every occurrence keeps the first visit's
-// wall-clock time. Nexudus has no recurrence field — a repeating visit is just
-// one visitor object per date in a single create request (README) — so a
-// series is capped like the Nexudus portal's own "up to 30 visits in one go".
-export const REPEAT_UNITS = {
-	none: { label: "Does not repeat" },
-	day: { label: "Every day", noun: "day" },
-	week: { label: "Every week", noun: "week" },
-	month: { label: "Every month", noun: "month" },
-} as const;
-export type RepeatKey = keyof typeof REPEAT_UNITS;
+// A visit either doesn't repeat (the modal's "Repeat until" left blank) or
+// repeats weekly — every N weeks on chosen days, up to that inclusive end
+// date. Daily is weekly with every day selected; one repeat shape instead of
+// three. Expansion steps through calendar dates in SPACE_TIMEZONE date space;
+// every occurrence keeps the first visit's wall-clock time. Nexudus has no
+// recurrence field — a repeating visit is just one visitor object per date in
+// a single create request (README) — so a series is capped like the Nexudus
+// portal's own "up to 30 visits in one go".
 export const MAX_VISITS = 30;
 export const MAX_INTERVAL = 99;
 
-// A weekly repeat can name the days to visit (the modal's checkboxes); blank
-// falls back to the first visit's weekday. Weeks start on Monday.
+// The days a weekly repeat visits (the modal's multi-select, required while
+// repeating and preselected with the first visit's weekday). Weeks start on
+// Monday.
 export const WEEKDAYS = {
 	mon: { label: "Monday", short: "Mon" },
 	tue: { label: "Tuesday", short: "Tue" },
@@ -36,10 +31,9 @@ export type WeekdayKey = keyof typeof WEEKDAYS;
 const DAY_ORDER = Object.keys(WEEKDAYS) as WeekdayKey[];
 
 // The summary's cadence wording: "Every week", "Every 2 weeks on Mon, Thu".
-export function repeatLabel(repeat: Exclude<RepeatKey, "none">, every: number, days?: WeekdayKey[]): string {
-	const { noun } = REPEAT_UNITS[repeat];
-	const base = every === 1 ? `Every ${noun}` : `Every ${every} ${noun}s`;
-	if (repeat !== "week" || !days?.length) return base;
+export function repeatLabel(every: number, days?: WeekdayKey[]): string {
+	const base = every === 1 ? "Every week" : `Every ${every} weeks`;
+	if (!days?.length) return base;
 	const sorted = DAY_ORDER.filter((d) => days.includes(d));
 	return `${base} on ${sorted.map((d) => WEEKDAYS[d].short).join(", ")}`;
 }
@@ -87,76 +81,63 @@ function addDays(date: string, days: number): string {
 	return d.toISOString().slice(0, 10);
 }
 
-// Month steps keep the first visit's day-of-month, clamped into short months
-// (Jan 31 monthly → Feb 28 → Mar 31: always stepped from the anchor, so a
-// clamp doesn't stick for the rest of the series).
-function addMonths(date: string, months: number): string {
-	const [y, m, d] = date.split("-").map(Number);
-	const total = y * 12 + (m - 1) + months;
-	const year = Math.floor(total / 12);
-	const month = total % 12;
-	const day = Math.min(d, new Date(Date.UTC(year, month + 1, 0)).getUTCDate());
-	return `${String(year).padStart(4, "0")}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
 // Days since Monday for a naive date, matching DAY_ORDER (Mon = 0).
 function weekdayIndex(date: string): number {
 	return (new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7;
 }
 
+// The weekday of a naive date, e.g. "2030-07-20" → "sat".
+export function weekdayOf(date: string): WeekdayKey {
+	return DAY_ORDER[weekdayIndex(date)];
+}
+
 // Candidate visit dates, ascending and unbounded; the caller stops at `until`
-// or the visit cap. A weekly repeat with chosen days walks each active week's
-// selected days (Monday-based weeks anchored on the first visit's week), so
-// the first visit is the first chosen day on or after the arrival date.
-function* occurrences(firstDate: string, repeat: Exclude<RepeatKey, "none">, interval: number, days?: WeekdayKey[]): Generator<string> {
-	if (repeat === "week" && days?.length) {
-		const offsets = DAY_ORDER.flatMap((d, i) => (days.includes(d) ? [i] : []));
-		const weekStart = addDays(firstDate, -weekdayIndex(firstDate));
-		for (let week = 0; ; week++) {
-			for (const offset of offsets) {
-				const date = addDays(weekStart, week * interval * 7 + offset);
-				if (date >= firstDate) yield date;
-			}
+// or the visit cap. Each active week's selected days are walked (Monday-based
+// weeks anchored on the first visit's week), so the first visit is the first
+// chosen day on or after the arrival date.
+function* occurrences(firstDate: string, interval: number, days: WeekdayKey[]): Generator<string> {
+	const offsets = DAY_ORDER.flatMap((d, i) => (days.includes(d) ? [i] : []));
+	const weekStart = addDays(firstDate, -weekdayIndex(firstDate));
+	for (let week = 0; ; week++) {
+		for (const offset of offsets) {
+			const date = addDays(weekStart, week * interval * 7 + offset);
+			if (date >= firstDate) yield date;
 		}
-	}
-	for (let i = 0; ; i++) {
-		yield repeat === "month" ? addMonths(firstDate, i * interval) : addDays(firstDate, i * interval * (repeat === "week" ? 7 : 1));
 	}
 }
 
-// Expand the repeat selection into visit dates (ascending; the arrival date
-// itself unless a weekly day choice skips it) or an inline error naming the
+// Expand the repeat fields into visit dates (ascending; the arrival date
+// itself unless the day choice skips it) or an inline error naming the
 // offending form field (the caller maps the field key to its Slack block id).
-// `every` is the interval (undefined reads as 1); `until` is the inclusive
-// last-possible date — required, but only the modal enforces that, so a
-// crafted payload without it still errors here. ISO date strings compare
-// correctly as strings.
+// A blank `until` is a single visit — the repeat fields only apply once an
+// end date is chosen, so a crafted interval or day list without one is
+// ignored, not an error. `every` is the interval in weeks, already resolved
+// by the caller (a blank field reads as 1 there); `days` defaults to the
+// first visit's weekday (the modal requires a choice, so only crafted
+// payloads omit it); `until` is the inclusive last-possible date. ISO date
+// strings compare correctly as strings.
 export function expandRepeat(
 	firstDate: string,
-	repeat: RepeatKey,
-	opts: { every?: number; days?: WeekdayKey[]; until?: string },
+	opts: { every: number; days?: WeekdayKey[]; until?: string },
 ): { dates: string[] } | { field: "repeatEvery" | "repeatUntil"; error: string } {
-	if (repeat === "none") return { dates: [firstDate] };
-	const interval = opts.every ?? 1;
+	const { every: interval, until } = opts;
+	if (!until) return { dates: [firstDate] };
 	if (interval < 1 || interval > MAX_INTERVAL) {
-		return { field: "repeatEvery", error: `Repeat every 1 to ${MAX_INTERVAL} days/weeks/months.` };
-	}
-	const { until } = opts;
-	if (!until) {
-		return { field: "repeatUntil", error: "Pick the last visit date for the repeat." };
+		return { field: "repeatEvery", error: `Repeat every 1 to ${MAX_INTERVAL} weeks.` };
 	}
 	if (until < firstDate) {
 		return { field: "repeatUntil", error: "The repeat ends before the first visit — pick a later date." };
 	}
+	const days = opts.days?.length ? opts.days : [weekdayOf(firstDate)];
 	const dates: string[] = [];
-	for (const date of occurrences(firstDate, repeat, interval, opts.days)) {
+	for (const date of occurrences(firstDate, interval, days)) {
 		if (date > until) break;
 		dates.push(date);
 		if (dates.length > MAX_VISITS) {
 			return { field: "repeatUntil", error: `That's more than ${MAX_VISITS} visits — pick an earlier end date.` };
 		}
 	}
-	// Possible only with weekly day choices: no chosen day falls in the window.
+	// Possible only with day choices: no chosen day falls in the window.
 	if (!dates.length) {
 		return { field: "repeatUntil", error: "No chosen day falls before the end date — pick a later date or other days." };
 	}

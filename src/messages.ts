@@ -11,7 +11,7 @@
  */
 
 import { mrkdwnEscape, type SlackMessage } from "./slack";
-import { MAX_INTERVAL, REPEAT_UNITS, WEEKDAYS, toWallClock, type RepeatKey, type WeekdayKey } from "./time";
+import { MAX_INTERVAL, WEEKDAYS, toWallClock, weekdayOf, type WeekdayKey } from "./time";
 
 export const CALLBACK_ID = "visitor_registration";
 export const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
@@ -25,12 +25,12 @@ export const FIELDS = {
 	phone: { block: "phone", action: "value", cap: 50 },
 	arrivalDate: { block: "arrival_date", action: "value" },
 	arrivalTime: { block: "arrival_time", action: "value" },
-	// The repeat select's action_id doubles as the block_actions dispatch id
-	// (changing it re-renders the modal), so it's distinct from "value".
-	repeat: { block: "repeat", action: "repeat_unit" },
 	repeatEvery: { block: "repeat_every", action: "value" },
 	repeatDays: { block: "repeat_days", action: "value" },
-	repeatUntil: { block: "repeat_until", action: "value" },
+	// The "Repeat until" picker's action_id doubles as the block_actions
+	// dispatch id (picking a date re-renders the modal with the other repeat
+	// fields), so it's distinct from "value".
+	repeatUntil: { block: "repeat_until", action: "repeat_until" },
 	host: { block: "host", action: "value", cap: 200 },
 	notes: { block: "notes", action: "value", cap: 1000 },
 } as const;
@@ -57,82 +57,64 @@ function inputBlock(
 	};
 }
 
-function repeatOption(key: RepeatKey) {
-	return { text: { type: "plain_text", text: REPEAT_UNITS[key].label }, value: key };
+function dayOption(day: WeekdayKey) {
+	return { text: { type: "plain_text", text: WEEKDAYS[day].label }, value: day };
 }
 
-// `repeat` is the currently selected unit: the select dispatches its changes
-// and the handler re-renders the modal, so the interval and end fields only
-// exist while a repeat is chosen (views.update keeps the values of the blocks
-// that survive, matched by block_id — including a `host` prefill the member
-// typed over, so the re-render doesn't need to know it). `untilInitial` seeds
-// the "Ends on" picker with the arrival date already in the form: Slack can't
-// cross-validate pickers client-side, so this only starts it on a valid date;
-// the real on/after check is the inline error at submission.
-export function visitorModal(env: Env, repeat: RepeatKey = "none", host?: string, untilInitial?: string) {
-	const repeatFields =
-		repeat === "none"
-			? []
-			: [
-					inputBlock(
-						FIELDS.repeatEvery.block,
-						FIELDS.repeatEvery.action,
-						"Repeat every",
-						{ type: "number_input", is_decimal_allowed: false, min_value: "1", max_value: String(MAX_INTERVAL) },
-						{
-							optional: true,
-							hint: `How many ${REPEAT_UNITS[repeat].noun}s between visits — leave blank for every ${REPEAT_UNITS[repeat].noun}`,
-						},
-					),
-					// Weekly repeats can pick the days to visit within each active week.
-					// A multi-select, not checkboxes: it renders as a single row (picked
-					// days become inline tokens) where checkboxes stack vertically. Its
-					// state arrives as selected_options, same as checkboxes.
-					...(repeat === "week"
-						? [
-								inputBlock(
-									FIELDS.repeatDays.block,
-									FIELDS.repeatDays.action,
-									"Repeats on",
-									{
-										type: "multi_static_select",
-										placeholder: { type: "plain_text", text: "Select days" },
-										options: (Object.keys(WEEKDAYS) as WeekdayKey[]).map((day) => ({
-											text: { type: "plain_text", text: WEEKDAYS[day].label },
-											value: day,
-										})),
-									},
-									{ optional: true, hint: "Days of the week to visit — leave blank for the arrival date's weekday" },
-								),
-							]
-						: []),
-					// Required: this block only exists while a repeat is chosen, so
-					// Slack itself demands it before the modal can submit (up to
-					// MAX_VISITS visits; over is bounced with an inline error).
-					inputBlock(
-						FIELDS.repeatUntil.block,
-						FIELDS.repeatUntil.action,
-						"Ends on",
-						{ type: "datepicker", ...(untilInitial && { initial_date: untilInitial }) },
-						{ hint: env.SPACE_TIMEZONE },
-					),
-				];
+// `repeating` is whether a "Repeat until" date has been picked: the picker
+// dispatches its changes and the handler re-renders the modal, so the
+// interval and day fields only exist once an end date is chosen (views.update
+// keeps the values of the blocks that survive, matched by block_id —
+// including a `host` prefill the member typed over, so the re-render doesn't
+// need to know it). `arrivalDate` is the arrival already in the form: it
+// preselects the arrival's weekday in the day multi-select.
+export function visitorModal(env: Env, repeating = false, host?: string, arrivalDate?: string) {
+	const repeatFields = !repeating
+		? []
+		: [
+				// The days to visit within each active week (every day selected = a
+				// daily visit). Required — but preselected with the arrival date's
+				// weekday, so the common case needs no interaction. A multi-select
+				// renders as a single row: picked days become inline tokens.
+				inputBlock(FIELDS.repeatDays.block, FIELDS.repeatDays.action, "Repeat on", {
+					type: "multi_static_select",
+					placeholder: { type: "plain_text", text: "Select days" },
+					options: (Object.keys(WEEKDAYS) as WeekdayKey[]).map(dayOption),
+					...(arrivalDate && { initial_options: [dayOption(weekdayOf(arrivalDate))] }),
+				}),
+				inputBlock(
+					FIELDS.repeatEvery.block,
+					FIELDS.repeatEvery.action,
+					"Repeat every",
+					{ type: "number_input", is_decimal_allowed: false, min_value: "1", max_value: String(MAX_INTERVAL), initial_value: "1" },
+					{ hint: "week(s)" },
+				),
+			];
 	return {
 		type: "modal",
 		callback_id: CALLBACK_ID,
 		title: { type: "plain_text", text: "Register a visitor" },
 		submit: { type: "plain_text", text: "Register" },
 		close: { type: "plain_text", text: "Cancel" },
+		// Three divider-set groups, each answering one question — who is coming,
+		// when (arrival + repeat together, so the unfolding detail fields land
+		// beside the dates they modify), and context for reception. Optional
+		// fields close their group rather than gathering at the end, keeping
+		// each group scannable on its own.
 		blocks: [
+			// Who is coming.
 			inputBlock(FIELDS.fullName.block, FIELDS.fullName.action, "Visitor name", {
 				type: "plain_text_input",
 			}),
 			inputBlock(FIELDS.email.block, FIELDS.email.action, "Visitor email", { type: "email_text_input" }),
-			// Naive date + time pickers, not a datetimepicker: a datetimepicker
-			// renders in each member's own timezone, so the instant it submits
-			// depends on who submitted it. These values are read as SPACE_TIMEZONE
-			// wall-clock; the bare timezone hint under each field says so, because
-			// for a member abroad the field is *not* their local time.
+			inputBlock(FIELDS.phone.block, FIELDS.phone.action, "Visitor phone", { type: "plain_text_input" }, { optional: true }),
+			{ type: "divider", block_id: "visitor_divider" },
+			// When: naive date + time pickers, not a datetimepicker — a
+			// datetimepicker renders in each member's own timezone, so the instant
+			// it submits depends on who submitted it. These values are read as
+			// SPACE_TIMEZONE wall-clock; the bare timezone hint under each field
+			// says so, because for a member abroad the field is *not* their local
+			// time.
 			inputBlock(FIELDS.arrivalDate.block, FIELDS.arrivalDate.action, "Arrival date", { type: "datepicker" }, { hint: env.SPACE_TIMEZONE }),
 			inputBlock(
 				FIELDS.arrivalTime.block,
@@ -141,34 +123,24 @@ export function visitorModal(env: Env, repeat: RepeatKey = "none", host?: string
 				{ type: "timepicker" },
 				{ hint: env.SPACE_TIMEZONE },
 			),
-			// Everything below the line is fine to leave as-is for the common case.
-			{ type: "divider", block_id: "divider" },
-			// Required, but prefilled with the opener's own name, so the common
-			// case (registering your own guest) needs no typing.
+			// Blank = a single visit; picking a date turns the visit into a weekly
+			// repeat ending that day (inclusive) and unfolds the interval and day
+			// fields right below. The arrival above is the first visit.
+			inputBlock(
+				FIELDS.repeatUntil.block,
+				FIELDS.repeatUntil.action,
+				"Repeat until",
+				{ type: "datepicker" },
+				{ optional: true, dispatch: true, hint: `${env.SPACE_TIMEZONE} — leave blank for a single visit` },
+			),
+			...repeatFields,
+			{ type: "divider", block_id: "schedule_divider" },
+			// Context for reception. Required, but prefilled with the opener's own
+			// name, so the common case (registering your own guest) needs no typing.
 			inputBlock(FIELDS.host.block, FIELDS.host.action, "Person they are visiting", {
 				type: "plain_text_input",
 				...(host && { initial_value: host }),
 			}),
-			// The Nexudus portal's repeat model: every N days/weeks/months on
-			// chosen days, up to an end date. The arrival above is the first
-			// visit; choosing a unit unfolds the detail fields right below.
-			// Bracketing dividers set the repeat fields off as their own section
-			// (a modal has no stronger grouping than a divider).
-			{ type: "divider", block_id: "repeat_divider" },
-			inputBlock(
-				FIELDS.repeat.block,
-				FIELDS.repeat.action,
-				"Repeat visit",
-				{
-					type: "static_select",
-					initial_option: repeatOption(repeat),
-					options: (Object.keys(REPEAT_UNITS) as RepeatKey[]).map(repeatOption),
-				},
-				{ dispatch: true },
-			),
-			...repeatFields,
-			{ type: "divider", block_id: "repeat_end_divider" },
-			inputBlock(FIELDS.phone.block, FIELDS.phone.action, "Visitor phone", { type: "plain_text_input" }, { optional: true }),
 			inputBlock(FIELDS.notes.block, FIELDS.notes.action, "Notes", { type: "plain_text_input", multiline: true }, { optional: true }),
 		],
 	};

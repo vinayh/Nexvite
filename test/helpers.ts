@@ -126,7 +126,6 @@ export function formValues(fields: {
 	phone?: string;
 	date?: string;
 	time?: string | null;
-	repeat?: string;
 	every?: string | null;
 	days?: string[];
 	until?: string | null;
@@ -139,12 +138,11 @@ export function formValues(fields: {
 	if ("phone" in fields) values.phone = { value: { type: "plain_text_input", value: fields.phone } };
 	if ("date" in fields) values.arrival_date = { value: { type: "datepicker", selected_date: fields.date } };
 	if ("time" in fields) values.arrival_time = { value: { type: "timepicker", selected_time: fields.time } };
-	if ("repeat" in fields) values.repeat = { repeat_unit: { type: "static_select", selected_option: { value: fields.repeat } } };
 	if ("every" in fields) values.repeat_every = { value: { type: "number_input", value: fields.every } };
 	if ("days" in fields) {
 		values.repeat_days = { value: { type: "multi_static_select", selected_options: fields.days?.map((day) => ({ value: day })) } };
 	}
-	if ("until" in fields) values.repeat_until = { value: { type: "datepicker", selected_date: fields.until } };
+	if ("until" in fields) values.repeat_until = { repeat_until: { type: "datepicker", selected_date: fields.until } };
 	if ("host" in fields) values.host = { value: { type: "plain_text_input", value: fields.host } };
 	if ("notes" in fields) values.notes = { value: { type: "plain_text_input", value: fields.notes } };
 	return values;
@@ -160,7 +158,6 @@ export function submissionBody(
 		phone: "+44 7700 900123",
 		date: ARRIVAL_DATE,
 		time: ARRIVAL_TIME,
-		repeat: "none",
 		until: null,
 		host: "Sam",
 		notes: "Needs step-free access",
@@ -194,7 +191,7 @@ export function blockActionsBody(
 		blockId?: string;
 		responseUrl?: string;
 		userId?: string;
-		selectedOption?: string; // a dispatched select change (the repeat unit)
+		selectedDate?: string; // a dispatched datepicker change (the repeat-until pick)
 		viewId?: string; // present when the action comes from inside a modal
 		viewState?: object; // the modal's current state.values, as Slack sends it
 		messageText?: string;
@@ -232,7 +229,7 @@ export function blockActionsBody(
 				action_id: actionId,
 				...(extra.blockId ? { block_id: extra.blockId } : {}),
 				...(extra.value ? { value: extra.value } : {}),
-				...(extra.selectedOption ? { selected_option: { value: extra.selectedOption } } : {}),
+				...(extra.selectedDate ? { selected_date: extra.selectedDate } : {}),
 			},
 		],
 		...(extra.viewId ? { view: { id: extra.viewId, ...(extra.viewState ? { state: { values: extra.viewState } } : {}) } } : {}),

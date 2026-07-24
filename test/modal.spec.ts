@@ -19,7 +19,19 @@ describe("slash command -> open modal", () => {
 		expect(viewsOpen.trigger_id).toBe("trigger-123");
 		expect(viewsOpen.view.callback_id).toBe("visitor_registration");
 		const blockIds = viewsOpen.view.blocks.map((b: any) => b.block_id);
-		expect(blockIds).toEqual(["full_name", "email", "arrival_date", "arrival_time", "divider", "host", "repeat_divider", "repeat", "repeat_end_divider", "phone", "notes"]);
+		// Three divider-set groups: the visitor, the schedule, context.
+		expect(blockIds).toEqual([
+			"full_name",
+			"email",
+			"phone",
+			"visitor_divider",
+			"arrival_date",
+			"arrival_time",
+			"repeat_until",
+			"schedule_divider",
+			"host",
+			"notes",
+		]);
 		const byId = Object.fromEntries(viewsOpen.view.blocks.map((b: any) => [b.block_id, b]));
 		// The visitor's own fields say whose details they are.
 		expect(byId.full_name.label.text).toBe("Visitor name");
@@ -37,17 +49,14 @@ describe("slash command -> open modal", () => {
 		expect(byId.host.label.text).toBe("Person they are visiting");
 		expect(byId.host.element.initial_value).toBe("Vinay Hiremath");
 		expect(byId.host.optional).toBe(false);
-		// Repeat defaults to "none" so the single-visit flow needs no interaction;
-		// the interval and end fields only appear once a repeat is chosen (the
-		// select dispatches its changes so the handler can re-render).
-		expect(byId.repeat.element.initial_option.value).toBe("none");
-		expect(byId.repeat.dispatch_action).toBe(true);
-		expect(byId.repeat.element.options.map((o: any) => o.text.text)).toEqual([
-			"Does not repeat",
-			"Every day",
-			"Every week",
-			"Every month",
-		]);
+		// A blank "Repeat until" is the no-repeat default, so the single-visit
+		// flow needs no interaction; the interval and day fields only appear
+		// once an end date is picked (the picker dispatches its changes so the
+		// handler can re-render).
+		expect(byId.repeat_until.label.text).toBe("Repeat until");
+		expect(byId.repeat_until.optional).toBe(true);
+		expect(byId.repeat_until.dispatch_action).toBe(true);
+		expect(byId.repeat_until.hint.text).toBe("Europe/London — leave blank for a single visit");
 	});
 
 	it("falls back to the username prefill when users.info fails, and still opens the modal", async () => {
@@ -61,14 +70,14 @@ describe("slash command -> open modal", () => {
 		expect(host.element.initial_value).toBe("vinay"); // COMMAND_BODY's user_name
 	});
 
-	it("re-renders the modal with the repeat detail fields when a repeat is chosen, and without them on 'none'", async () => {
+	it("re-renders the modal with the repeat fields when an end date is picked, and without them when unset", async () => {
 		let update: any;
 		mockSlack("views.update", (b) => (update = b));
 		const res = await run(
 			await slackRequest(
 				"/slack/interactivity",
-				blockActionsBody("repeat_unit", "trig-xyz", {
-					selectedOption: "week",
+				blockActionsBody("repeat_until", "trig-xyz", {
+					selectedDate: "2030-08-20",
 					viewId: "V1",
 					viewState: { arrival_date: { value: { type: "datepicker", selected_date: "2030-07-20" } } },
 				}),
@@ -81,30 +90,26 @@ describe("slash command -> open modal", () => {
 		expect(update.view.blocks.map((b: any) => b.block_id)).toEqual([
 			"full_name",
 			"email",
+			"phone",
+			"visitor_divider",
 			"arrival_date",
 			"arrival_time",
-			"divider",
-			"host",
-			"repeat_divider",
-			"repeat",
-			"repeat_every",
-			"repeat_days",
 			"repeat_until",
-			"repeat_end_divider",
-			"phone",
+			"repeat_days",
+			"repeat_every",
+			"schedule_divider",
+			"host",
 			"notes",
 		]);
-		expect(byId.repeat.element.initial_option.value).toBe("week"); // the choice survives the re-render
-		// The interval is optional (blank = 1) and its hint names the chosen
-		// unit; the weekly day checkboxes are optional (blank = the arrival's
-		// weekday); the end date is required — Slack demands it client-side,
-		// which is safe because the block only exists while a repeat is chosen —
-		// and carries the bare timezone hint like the arrival pickers.
-		expect(byId.repeat_every.optional).toBe(true);
-		expect(byId.repeat_every.hint.text).toContain("weeks between visits");
-		expect(byId.repeat_days.optional).toBe(true);
-		// A multi-select renders as a single row, unlike stacked checkboxes; its
-		// state arrives as selected_options, so the reader is unchanged.
+		// Both revealed fields are required but prefilled — the interval starts
+		// at 1 with just the unit as its hint, and the single-row day
+		// multi-select is preselected with the weekday of the arrival date
+		// already in the form (2030-07-20 is a Saturday) — so the common case
+		// needs no interaction.
+		expect(byId.repeat_every.optional).toBe(false);
+		expect(byId.repeat_every.element.initial_value).toBe("1");
+		expect(byId.repeat_every.hint.text).toBe("week(s)");
+		expect(byId.repeat_days.optional).toBe(false);
 		expect(byId.repeat_days.element.type).toBe("multi_static_select");
 		expect(byId.repeat_days.element.options.map((o: any) => o.value)).toEqual(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
 		expect(byId.repeat_days.element.options.map((o: any) => o.text.text)).toEqual([
@@ -116,54 +121,36 @@ describe("slash command -> open modal", () => {
 			"Saturday",
 			"Sunday",
 		]);
-		expect(byId.repeat_until.optional).toBe(false);
-		expect(byId.repeat_until.label.text).toBe("Ends on");
-		expect(byId.repeat_until.hint.text).toBe("Europe/London");
-		// The picker unfolds starting on the arrival date already in the form
-		// (Slack can't cross-validate pickers, so this only seeds a valid
-		// default; the on/after check is the inline submission error).
-		expect(byId.repeat_until.element.initial_date).toBe("2030-07-20");
+		expect(byId.repeat_days.element.initial_options).toEqual([{ text: { type: "plain_text", text: "Saturday" }, value: "sat" }]);
 
-		// Without an arrival date in the form state, no seed.
+		// Without an arrival date in the form state, no day preselection.
 		let bare: any;
 		mockSlack("views.update", (b) => (bare = b));
 		await run(
-			await slackRequest("/slack/interactivity", blockActionsBody("repeat_unit", "trig-xyz", { selectedOption: "week", viewId: "V1" })),
+			await slackRequest("/slack/interactivity", blockActionsBody("repeat_until", "trig-xyz", { selectedDate: "2030-08-20", viewId: "V1" })),
 		);
-		expect(bare.view.blocks.find((b: any) => b.block_id === "repeat_until").element.initial_date).toBeUndefined();
+		expect(bare.view.blocks.find((b: any) => b.block_id === "repeat_days").element.initial_options).toBeUndefined();
 
-		// A non-weekly unit gets no day checkboxes.
-		let monthly: any;
-		mockSlack("views.update", (b) => (monthly = b));
-		await run(
-			await slackRequest("/slack/interactivity", blockActionsBody("repeat_unit", "trig-xyz", { selectedOption: "month", viewId: "V1" })),
-		);
-		const monthlyIds = monthly.view.blocks.map((b: any) => b.block_id);
-		expect(monthlyIds).toContain("repeat_until");
-		expect(monthlyIds).not.toContain("repeat_days");
-
-		// Switching back to "Does not repeat" drops the detail fields again.
+		// A dispatch without a date (the picker unset) drops the repeat fields.
 		let revert: any;
 		mockSlack("views.update", (b) => (revert = b));
-		await run(
-			await slackRequest("/slack/interactivity", blockActionsBody("repeat_unit", "trig-xyz", { selectedOption: "none", viewId: "V1" })),
-		);
+		await run(await slackRequest("/slack/interactivity", blockActionsBody("repeat_until", "trig-xyz", { viewId: "V1" })));
 		expect(revert.view.blocks.map((b: any) => b.block_id)).toEqual([
 			"full_name",
 			"email",
+			"phone",
+			"visitor_divider",
 			"arrival_date",
 			"arrival_time",
-			"divider",
+			"repeat_until",
+			"schedule_divider",
 			"host",
-			"repeat_divider",
-			"repeat",
-			"repeat_end_divider",
-			"phone",
 			"notes",
 		]);
 	});
 
 	it("tells the user to retry if views.open fails, still 200", async () => {
+		mockUserInfo(); // the host-prefill lookup that precedes views.open
 		mockSlack("views.open", undefined, { ok: false, error: "expired_trigger_id" });
 		const res = await run(await slackRequest("/slack/command", COMMAND_BODY));
 		expect(res.status).toBe(200);
@@ -173,6 +160,7 @@ describe("slash command -> open modal", () => {
 	it("tells the user to retry when Slack answers views.open with a non-JSON body", async () => {
 		// e.g. an HTML error page from a proxy: the transport must degrade to a
 		// failed call, not throw on the parse.
+		mockUserInfo();
 		fetchMock.get(SLACK_BASE).intercept({ path: "/api/views.open", method: "POST" }).reply(200, "<html>gateway error</html>");
 		const res = await run(await slackRequest("/slack/command", COMMAND_BODY));
 		expect(res.status).toBe(200);

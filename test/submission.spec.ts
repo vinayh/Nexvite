@@ -184,6 +184,59 @@ describe("view_submission -> register + DM", () => {
 		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(AUTH);
 	});
 
+	// The auth record the "other Worker" leaves in KV after winning a refresh
+	// race (the refresh token is single-use and the namespace is shared).
+	const RACED = { username: "svc@example.com", access_token: "other-access", refresh_token: "other-refresh" };
+
+	// This Worker's refresh loses the race: the exchange 400s (the single-use
+	// token was already spent) and the winner's rotation lands in KV meanwhile.
+	// The reply is delayed a tick so the unawaited put settles before the
+	// Worker re-reads the record.
+	function mockRefreshLosesRace() {
+		fetchMock
+			.get(NEXUDUS_BASE)
+			.intercept({ path: "/api/token", method: "POST" })
+			.reply(() => {
+				void env.TOKENS.put(TOKEN_KEY, JSON.stringify(RACED));
+				return { statusCode: 400, data: "bad_grant" };
+			})
+			.delay(10);
+	}
+
+	it("recovers from a lost refresh race: re-reads the rotated KV record and retries with its token", async () => {
+		let retried: Captured | undefined;
+		mockUserInfo();
+		mockVisitors(undefined, 401); // first attempt: token already superseded
+		mockRefreshLosesRace();
+		mockVisitors((c) => (retried = c), 200); // the single retry, with the winner's token
+		mockMyList([MY_RECORD]);
+		const posts = mockPosts();
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(retried?.auth).toBe("Bearer other-access");
+		// The winner's record survives; the loser must not write anything over it.
+		expect(JSON.parse((await env.TOKENS.get(TOKEN_KEY))!)).toEqual(RACED);
+		expect(posts[0].text).toBe(`${SUCCESS_TEXT}\n*Nexudus ID:* 42`);
+	});
+
+	it("DMs the friendly failure when the race-recovery retry still 401s (no further retries)", async () => {
+		let dm: any;
+		mockUserInfo();
+		mockVisitors(undefined, 401);
+		mockRefreshLosesRace();
+		mockVisitors(undefined, 401); // the rotated token is rejected too: broken chain
+		mockSlack("chat.postMessage", (b) => (dm = b));
+
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody()));
+		expect(res.status).toBe(200);
+		expect(dm.channel).toBe("U1");
+		expect(dm.text).toContain("❌ *Registration failed*");
+		expect(dm.text).toContain("couldn't connect to the visitor system");
+		expect(dm.text).not.toContain("token"); // ops hints stay out of the DM
+		// afterEach's assertNoPendingInterceptors proves exactly one retry ran.
+	});
+
 	it("DMs the friendly failure with the contact email when the network call itself fails", async () => {
 		let dm: any;
 		mockUserInfo();

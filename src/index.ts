@@ -45,10 +45,9 @@ import {
 	fetchFullName,
 	mrkdwnEscape,
 	postMessage,
-	readCheckboxes,
 	readDate,
+	readMultiSelect,
 	readNumber,
-	readSelect,
 	readText,
 	readTime,
 	respond,
@@ -57,17 +56,7 @@ import {
 	type SlackMessage,
 	type ViewState,
 } from "./slack";
-import {
-	MAX_VISITS,
-	REPEAT_UNITS,
-	WEEKDAYS,
-	expandRepeat,
-	fromWallClock,
-	repeatLabel,
-	toWallClock,
-	type RepeatKey,
-	type WeekdayKey,
-} from "./time";
+import { MAX_VISITS, WEEKDAYS, expandRepeat, fromWallClock, repeatLabel, toWallClock, type WeekdayKey } from "./time";
 
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
 // rejected inline; the /my lookup used for confirmation only sees upcoming visits.
@@ -82,7 +71,7 @@ const ARRIVAL_GRACE_S = 120;
 // the user to retry.
 async function openModal(env: Env, triggerId: string, opener?: { id?: string; name?: string }): Promise<boolean> {
 	const host = (opener?.id ? await fetchFullName(env, opener.id) : null) ?? opener?.name;
-	return slackApiWarn(env, "views.open", { trigger_id: triggerId, view: visitorModal(env, "none", host) });
+	return slackApiWarn(env, "views.open", { trigger_id: triggerId, view: visitorModal(env, false, host) });
 }
 
 // Swap the post-submission placeholder for the result, if the submitter still
@@ -351,8 +340,7 @@ export default {
 				action_id?: string;
 				block_id?: string;
 				value?: string;
-				selected_conversation?: string;
-				selected_option?: { value?: string };
+				selected_date?: string | null; // a dispatched datepicker change
 			}>;
 			message?: SlackMessage; // present on block_actions from a message (delete-by-Id)
 			view?: { id?: string; callback_id?: string; state?: ViewState };
@@ -364,21 +352,20 @@ export default {
 		}
 
 		// Button clicks and dispatched inputs: the Home tab's "Register a visitor"
-		// opens the modal; the modal's repeat select re-renders the modal so the
-		// interval and end fields only show while a repeat is chosen; a
+		// opens the modal; the modal's "Repeat until" picker re-renders the modal
+		// so the interval and day fields only show once an end date is chosen; a
 		// confirmation's "Delete registration" removes the visitor again. Slack
 		// delivers exactly one action per click.
 		if (payload.type === "block_actions") {
 			const action = payload.actions?.[0];
 			if (action?.action_id === OPEN_ACTION && payload.trigger_id) {
 				await openModal(env, payload.trigger_id, payload.user);
-			} else if (action?.action_id === FIELDS.repeat.action && payload.view?.id) {
-				const unit = action.selected_option?.value;
-				const repeat: RepeatKey = unit !== undefined && Object.hasOwn(REPEAT_UNITS, unit) ? (unit as RepeatKey) : "none";
-				// Seed the unfolding "Ends on" picker with the arrival date already
-				// entered, so it starts on a valid (on-or-after) date.
+			} else if (action?.action_id === FIELDS.repeatUntil.action && payload.view?.id) {
+				// The day multi-select the re-render unfolds preselects the weekday
+				// of the arrival date already entered.
 				const arrival = readDate(payload.view.state ?? {}, FIELDS.arrivalDate);
-				await slackApiWarn(env, "views.update", { view_id: payload.view.id, view: visitorModal(env, repeat, undefined, arrival) });
+				const repeating = typeof action.selected_date === "string" && action.selected_date.length > 0;
+				await slackApiWarn(env, "views.update", { view_id: payload.view.id, view: visitorModal(env, repeating, undefined, arrival) });
 			} else if (action?.action_id === DELETE_ACTION && action.value && payload.response_url) {
 				const ids = parseDeleteIds(action.value);
 				if (ids.length) {
@@ -403,17 +390,17 @@ export default {
 		// combined wall-clock is read in the space's timezone, not the member's.
 		const arrivalDate = readDate(state, FIELDS.arrivalDate);
 		const arrivalTime = readTime(state, FIELDS.arrivalTime);
-		// The repeat select always carries a value (it has an initial_option), but a
-		// crafted payload may not; anything unrecognized reads as "none".
-		// Object.hasOwn, not `in`: a crafted "toString" must not walk the prototype.
-		const repeatRaw = readSelect(state, FIELDS.repeat);
-		const repeat: RepeatKey = repeatRaw !== undefined && Object.hasOwn(REPEAT_UNITS, repeatRaw) ? (repeatRaw as RepeatKey) : "none";
-		const repeatEvery = readNumber(state, FIELDS.repeatEvery);
-		// Unrecognized day values (crafted payload) are dropped; an empty result
-		// reads as no selection, i.e. the arrival date's weekday.
-		const daysRaw = readCheckboxes(state, FIELDS.repeatDays)?.filter((d): d is WeekdayKey => Object.hasOwn(WEEKDAYS, d));
-		const repeatDays = daysRaw?.length ? daysRaw : undefined;
+		// A picked "Repeat until" date is what makes the visit repeat; blank (the
+		// default) is a single visit and the other repeat fields are ignored. A
+		// blank interval reads as 1 here, once; a crafted "0" stays 0 so the
+		// range check can bounce it.
 		const repeatUntil = readDate(state, FIELDS.repeatUntil);
+		const repeatEvery = readNumber(state, FIELDS.repeatEvery) ?? 1;
+		// Unrecognized day values (crafted payload) are dropped; an empty result
+		// reads as no selection, i.e. the arrival date's weekday. Object.hasOwn,
+		// not `in`: a crafted "toString" must not walk the prototype.
+		const daysRaw = readMultiSelect(state, FIELDS.repeatDays)?.filter((d): d is WeekdayKey => Object.hasOwn(WEEKDAYS, d));
+		const repeatDays = daysRaw?.length ? daysRaw : undefined;
 
 		// Expand the repeat into visit dates, bouncing bad combinations back onto
 		// the repeat fields inline. Skipped when the arrival itself is missing
@@ -421,16 +408,16 @@ export default {
 		let arrivalEpochs: number[] | undefined;
 		let repeatInfo: VisitorInput["repeat"];
 		if (arrivalDate && arrivalTime) {
-			const expanded = expandRepeat(arrivalDate, repeat, { every: repeatEvery, days: repeatDays, until: repeatUntil });
+			const expanded = expandRepeat(arrivalDate, { every: repeatEvery, days: repeatDays, until: repeatUntil });
 			if ("error" in expanded) {
 				return fieldError(FIELDS[expanded.field].block, expanded.error);
 			}
 			arrivalEpochs = expanded.dates.map((date) => fromWallClock(`${date}T${arrivalTime}:00`, env.SPACE_TIMEZONE));
-			if (repeat !== "none") {
+			if (repeatUntil) {
 				// `until` is the last generated visit, not the raw picker value:
 				// "every week until Sep 19" may end days earlier.
 				const dates = expanded.dates;
-				repeatInfo = { label: repeatLabel(repeat, repeatEvery ?? 1, repeatDays), until: dates[dates.length - 1], count: dates.length };
+				repeatInfo = { label: repeatLabel(repeatEvery, repeatDays), until: dates[dates.length - 1], count: dates.length };
 			}
 		}
 		const input: VisitorInput = {

@@ -100,8 +100,27 @@ async function nexudusFetch(
 		if (res.status === 401) {
 			const refreshed = await refreshAuth(base, auth);
 			if (!refreshed) {
-				console.error("nexudus token refresh failed; re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
-				return null;
+				// The refresh token is single-use and the KV record is shared (the
+				// Nexroom Worker binds the same namespace), so a failed exchange may
+				// just mean another Worker won a concurrent refresh and rotated the
+				// record. Re-read KV once: a changed record is the winner's, so
+				// retry with its access token (and leave the record alone — it's
+				// newer than anything this Worker holds). An unchanged (or missing)
+				// record is a genuinely broken chain.
+				const current = await readAuth(env);
+				if (!current || (current.access_token === auth.access_token && current.refresh_token === auth.refresh_token)) {
+					console.error("nexudus token refresh failed; re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh");
+					return null;
+				}
+				console.warn("nexudus refresh lost a concurrent rotation; retrying with the newer KV token");
+				res = await doFetch(current.access_token);
+				if (res.status === 401) {
+					console.error(
+						"nexudus rejected the concurrently rotated token; check the account, then re-seed with scripts/nexudus-token.sh | scripts/nexudus-seed.sh",
+					);
+					return null;
+				}
+				return res;
 			}
 			await env.TOKENS.put(TOKEN_KEY, JSON.stringify(refreshed));
 			res = await doFetch(refreshed.access_token);
