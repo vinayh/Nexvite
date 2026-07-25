@@ -53,7 +53,7 @@ describe("slash command -> open modal", () => {
 		// flow needs no interaction; the interval and day fields only appear
 		// once an end date is picked (the picker dispatches its changes so the
 		// handler can re-render).
-		expect(byId.repeat_until.label.text).toBe("Repeat until");
+		expect(byId.repeat_until.label.text).toBe("Repeat until [BETA]");
 		expect(byId.repeat_until.optional).toBe(true);
 		expect(byId.repeat_until.dispatch_action).toBe(true);
 		expect(byId.repeat_until.hint.text).toBe("Europe/London — leave blank for a single visit");

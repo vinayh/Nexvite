@@ -11,7 +11,7 @@
 import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll } from "vitest";
 import worker from "../src/index";
-import { TOKEN_KEY, deletePause, lookupRetry } from "../src/nexudus";
+import { TOKEN_KEY, deletePause, lookupPaging, lookupRetry } from "../src/nexudus";
 
 const SIGNING_SECRET = "test-signing-secret";
 
@@ -286,22 +286,28 @@ export function mockVisitors(capture?: (c: Captured) => void, status = 200, data
 		});
 }
 
-// GET /api/public/visitors/my?showUpcoming=true: the account's own upcoming
-// registrations (the only Nexudus read route). Each call registers one reply,
-// consumed in order, so multiple calls model successive lookups (e.g. a retry).
-export function mockMyList(records: unknown[]) {
+// GET /api/public/visitors/my: the account's own upcoming registrations (the
+// only Nexudus read route), paginated. Each call registers one reply for one
+// page, consumed in order, so multiple calls model successive lookups (e.g. a
+// retry) or successive pages — pass { page, hasNext } for the latter.
+export function mockMyList(records: unknown[], opts: { page?: number; hasNext?: boolean } = {}) {
 	fetchMock
 		.get(NEXUDUS_BASE)
-		.intercept({ path: "/api/public/visitors/my", method: "GET", query: { showUpcoming: "true" } })
-		.reply(200, JSON.stringify({ Records: records }));
+		.intercept({ path: "/api/public/visitors/my", method: "GET", query: myListQuery(opts.page) })
+		.reply(200, JSON.stringify({ Records: records, HasNextPage: opts.hasNext ?? false }));
 }
 
 // Raw /my reply, for the response shapes and statuses mockMyList can't model.
-export function mockMyListRaw(body: string, status = 200) {
+export function mockMyListRaw(body: string, status = 200, page?: number) {
 	fetchMock
 		.get(NEXUDUS_BASE)
-		.intercept({ path: "/api/public/visitors/my", method: "GET", query: { showUpcoming: "true" } })
+		.intercept({ path: "/api/public/visitors/my", method: "GET", query: myListQuery(page) })
 		.reply(status, body);
+}
+
+// Mirrors the query lookupVisitorIds sends; interception is an exact match.
+function myListQuery(page = 1) {
+	return { showUpcoming: "true", size: String(lookupPaging.size), page: String(page) };
 }
 
 export function mockRefresh(

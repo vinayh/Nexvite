@@ -129,7 +129,9 @@ export function visitorModal(env: Env, repeating = false, host?: string, arrival
 			inputBlock(
 				FIELDS.repeatUntil.block,
 				FIELDS.repeatUntil.action,
-				"Repeat until",
+				// [BETA] marks the whole repeating feature: this picker is its gate,
+				// and the interval and day fields only exist once it's set.
+				"Repeat until [BETA]",
 				{ type: "datepicker" },
 				{ optional: true, dispatch: true, hint: `${env.SPACE_TIMEZONE} — leave blank for a single visit` },
 			),
@@ -340,6 +342,26 @@ function deletedFromMessage(messageText: string | undefined): string {
 }
 
 type SectionBlock = { type?: string; block_id?: unknown; text?: { text?: unknown }; accessory?: unknown };
+
+// The in-place "working on it" state for a Delete-all that will take a while:
+// a long series is deleted one visit at a time, pausing between batches for
+// the Nexudus rate limit, so the click would otherwise sit silent for tens of
+// seconds. Keeps the summary readable, drops every button (a second click
+// would try to delete the same Ids again), and appends a progress line. The
+// final update rebuilds from the original message, which the handler still
+// holds, so nothing is lost by overwriting it here.
+export function deletingBlocks(message: SlackMessage | undefined, count: number): { text: string; blocks: unknown[] } {
+	// No mention of why it's slow: the pacing is our problem, not the member's.
+	const status = `⏳ *Deleting ${count} visits…* This can take up to a minute.`;
+	const kept = (message?.blocks ?? []).flatMap((raw) => {
+		const block = raw as SectionBlock;
+		if (block.type !== "section" || typeof block.text?.text !== "string") return [];
+		return [{ type: "section", text: { type: "mrkdwn", text: block.text.text } }];
+	});
+	const lines = kept.length ? kept.map((b) => b.text.text) : [message?.text ?? ""].filter(Boolean);
+	const blocks = [...kept, { type: "section", text: { type: "mrkdwn", text: status } }];
+	return { text: [...lines, status].join("\n"), blocks };
+}
 
 // Restyle the whole clicked message for the single/Delete-all path: every
 // section's lines run through deletedFromMessage's rules; accessories (row

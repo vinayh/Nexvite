@@ -13,9 +13,8 @@
 // ---------------------------------------------------------------------------
 //
 // Nexudus refresh tokens are single-use and rotate on every exchange, so the
-// live auth record lives in KV (env.TOKENS), shared with the Nexroom Worker,
-// which binds the same namespace. There is no other credential source: seed
-// (or re-seed after a broken chain) with
+// live auth record lives in KV (env.TOKENS) rather than static config. There
+// is no other credential source: seed (or re-seed after a broken chain) with
 // scripts/nexudus-token.sh | scripts/nexudus-seed.sh.
 
 export const TOKEN_KEY = "nexudus"; // exported for the tests
@@ -100,9 +99,9 @@ async function nexudusFetch(
 		if (res.status === 401) {
 			const refreshed = await refreshAuth(base, auth);
 			if (!refreshed) {
-				// The refresh token is single-use and the KV record is shared (the
-				// Nexroom Worker binds the same namespace), so a failed exchange may
-				// just mean another Worker won a concurrent refresh and rotated the
+				// The refresh token is single-use and every Worker instance binding
+				// this namespace rotates the same record, so a failed exchange may
+				// just mean another one won a concurrent refresh and rotated the
 				// record. Re-read KV once: a changed record is the winner's, so
 				// retry with its access token (and leave the record alone — it's
 				// newer than anything this Worker holds). An unchanged (or missing)
@@ -194,24 +193,29 @@ interface VisitorRecord {
 // Delay before the single lookup retry; mutable so tests can shrink it.
 export const lookupRetry = { ms: 1000 };
 
+// /my is paginated: 15 records per page by default, which a series alone can
+// exceed (the cap is 30), so ask for a large page and follow HasNextPage.
+// `size` and `page` are the params it honors; orderBy/dir are ignored, so the
+// order is always ExpectedArrival ascending and a new series can sit on any
+// page. maxPages bounds the request count against the 10 req / 5 s limit.
+export const lookupPaging = { size: 100, maxPages: 5 };
+
+// True only for a paged envelope that says another page follows.
+function hasNextPage(body: unknown): boolean {
+	return !!body && typeof body === "object" && !Array.isArray(body) && (body as { HasNextPage?: unknown }).HasNextPage === true;
+}
+
 // Resolve the new registrations' Ids from the account's own list (the only
 // read route, see README), matching on email + each exact visit instant,
-// newest wins per instant. One GET covers the whole series. Retries once for
+// newest wins per instant among the records read. Walks pages until every
+// visit resolves, so a long series can't fall off page 1. Retries once for
 // replication lag; null unless every visit resolves (a partial series takes
 // the soft-unconfirmed path rather than claiming success).
 export async function lookupVisitorIds(env: Env, email: string, arrivalUtcs: string[]): Promise<number[] | null> {
 	const sentMs = arrivalUtcs.map((arrivalUtc) => Date.parse(`${arrivalUtc}Z`));
-	const attempt = async (): Promise<number[] | null> => {
-		const res = await nexudusFetch(env, "/api/public/visitors/my?showUpcoming=true");
-		if (!res?.ok) return null;
-		// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
-		// space-local, so a visit one offset-hour away could match by coincidence.
-		const records = listRecords(await res.json().catch(() => null)).filter(
-			(r): r is VisitorRecord =>
-				typeof (r as { Id?: unknown })?.Id === "number" &&
-				typeof (r as { Email?: unknown })?.Email === "string" &&
-				(r as { Email: string }).Email.toLowerCase() === email.toLowerCase(),
-		);
+	// UtcExpectedArrival wins whenever it parses: ExpectedArrival can be
+	// space-local, so a visit one offset-hour away could match by coincidence.
+	const matchIds = (records: VisitorRecord[]): number[] | null => {
 		const ids = sentMs.map((ms) => {
 			const matches = records.filter(
 				(r) => (parseNexudusInstant(r.UtcExpectedArrival) ?? parseNexudusInstant(r.ExpectedArrival)) === ms,
@@ -219,6 +223,27 @@ export async function lookupVisitorIds(env: Env, email: string, arrivalUtcs: str
 			return matches.length ? matches.reduce((a, b) => (b.Id > a.Id ? b : a)).Id : null;
 		});
 		return ids.every((id): id is number => id != null) ? ids : null;
+	};
+	const attempt = async (): Promise<number[] | null> => {
+		const mine: VisitorRecord[] = [];
+		for (let page = 1; page <= lookupPaging.maxPages; page++) {
+			const res = await nexudusFetch(env, `/api/public/visitors/my?showUpcoming=true&size=${lookupPaging.size}&page=${page}`);
+			if (!res?.ok) return null;
+			const body = (await res.json().catch(() => null)) as unknown;
+			mine.push(
+				...listRecords(body).filter(
+					(r): r is VisitorRecord =>
+						typeof (r as { Id?: unknown })?.Id === "number" &&
+						typeof (r as { Email?: unknown })?.Email === "string" &&
+						(r as { Email: string }).Email.toLowerCase() === email.toLowerCase(),
+				),
+			);
+			const ids = matchIds(mine);
+			if (ids != null) return ids;
+			if (!hasNextPage(body)) return null;
+		}
+		console.warn(`visitor Id lookup gave up after ${lookupPaging.maxPages} pages`); // no PII
+		return null;
 	};
 	const ids = await attempt();
 	if (ids != null) return ids;

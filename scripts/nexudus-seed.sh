@@ -7,9 +7,6 @@
 #   scripts/nexudus-token.sh | scripts/nexudus-seed.sh           # production KV
 #   scripts/nexudus-token.sh | scripts/nexudus-seed.sh --local   # wrangler dev storage
 #   pbpaste | scripts/nexudus-seed.sh                            # from a copied snippet
-#
-# The production TOKENS namespace is shared between the Nexvite and Nexroom
-# Workers, so one seeding covers both.
 
 set -euo pipefail
 

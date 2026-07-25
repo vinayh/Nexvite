@@ -136,6 +136,39 @@ describe("repeating visits", () => {
 		expect(posts[0].text).toContain("*Repeats:* Every week on Mon, Thu until 2030-08-05 (4 visits)");
 	});
 
+	it("confirms a series whose visits are split across /my pages", async () => {
+		mockUserInfo();
+		mockVisitors();
+		// The bug this covers: /my pages at 15 records, so a series longer than
+		// what's left on page 1 used to come back partially matched, and a
+		// partial match is reported as unconfirmed even though the POST landed.
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-10-17T09:00:00" }], { hasNext: true });
+		mockMyList(
+			[
+				{ Id: 43, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-10-24T09:00:00" },
+				{ Id: 44, Email: "jane.doe@gmail.com", ExpectedArrival: "2030-10-31T10:00:00" },
+			],
+			{ page: 2 },
+		);
+		const posts = mockPosts();
+
+		const values = formValues({
+			fullName: "Jane Doe",
+			email: "jane.doe@gmail.com",
+			date: "2030-10-17",
+			time: "10:00",
+			until: "2030-11-01",
+		});
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+
+		// Every visit resolved, so this is the success path with all three Ids.
+		expect(posts).toHaveLength(2); // DM + channel log
+		expect(posts[0].text).not.toContain("not confirmed");
+		expect(posts[0].text).toContain("*Visit 1:* 2030-10-17 10:00 (Europe/London) · Nexudus ID 42");
+		expect(posts[0].text).toContain("*Visit 3:* 2030-10-31 10:00 (Europe/London) · Nexudus ID 44");
+	});
+
 	it("uses singular wording when the repeat window only fits one visit", async () => {
 		mockUserInfo();
 		mockVisitors();

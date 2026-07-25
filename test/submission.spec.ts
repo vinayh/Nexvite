@@ -4,7 +4,7 @@
 
 import { env, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeEach } from "vitest";
-import { TOKEN_KEY } from "../src/nexudus";
+import { TOKEN_KEY, lookupPaging } from "../src/nexudus";
 import {
 	ARRIVAL_DATE,
 	ARRIVAL_TIME,
@@ -522,7 +522,7 @@ describe("view_submission -> register + DM", () => {
 	});
 
 	it("treats a legacy KV pair without a username as unseeded", async () => {
-		// Nexroom shares this namespace and predates the {username, ...} shape.
+		// The auth record predates the {username, ...} shape in this form.
 		await env.TOKENS.put(TOKEN_KEY, JSON.stringify({ access_token: "old-access", refresh_token: "old-refresh" }));
 		let dm: any;
 		mockUserInfo();
@@ -690,6 +690,43 @@ describe("Id lookup -> /my parsing", () => {
 		mockMyListRaw("<html>bad gateway</html>"); // first lookup
 		mockMyListRaw("<html>bad gateway</html>"); // retry
 		await submitExpectingUnconfirmed();
+	});
+
+	it("follows HasNextPage when the record isn't on the first page", async () => {
+		mockUserInfo();
+		mockVisitors();
+		// /my pages at 15 records by default, so a busy account pushes a new
+		// registration off page 1 — the lookup must walk on rather than give up.
+		mockMyList([], { hasNext: true });
+		mockMyList([MY_RECORD], { page: 2 });
+		await submitExpectingId(42);
+	});
+
+	it("stops paging as soon as every visit is matched", async () => {
+		mockUserInfo();
+		mockVisitors();
+		// Page 1 resolves the visit, so page 2 is never requested (an unused
+		// interceptor would fail assertNoPendingInterceptors).
+		mockMyList([MY_RECORD], { hasNext: true });
+		await submitExpectingId(42);
+	});
+
+	it("gives up after maxPages and reports unconfirmed", async () => {
+		mockUserInfo();
+		mockVisitors();
+		const pages = lookupPaging.maxPages;
+		lookupPaging.maxPages = 2;
+		try {
+			// Every page claims another follows and none holds the record: both
+			// attempts walk the cap, then the soft-unconfirmed path.
+			for (let attempt = 0; attempt < 2; attempt++) {
+				mockMyList([], { hasNext: true });
+				mockMyList([], { page: 2, hasNext: true });
+			}
+			await submitExpectingUnconfirmed();
+		} finally {
+			lookupPaging.maxPages = pages;
+		}
 	});
 
 	it("skips records whose arrival doesn't parse and still resolves the rest", async () => {

@@ -30,14 +30,20 @@ describe("delete button -> remove visitor", () => {
 			.reply(status, "");
 	}
 
-	function mockRespond(capture: (body: any) => void) {
-		fetchMock
-			.get(RESPOND_BASE)
-			.intercept({ path: "/respond", method: "POST" })
-			.reply((opts) => {
-				capture(JSON.parse(opts.body as string));
-				return { statusCode: 200, data: "ok" };
-			});
+	// One interceptor per expected post, capturing each in order. A Delete-all
+	// posts more than once: the ⏳ placeholder first, then the result (and, when
+	// the delete fails, the original message restored before the warning), so
+	// `times` is the exact count and a capture that overwrites ends on the last.
+	function mockRespond(capture: (body: any) => void, times = 1) {
+		for (let i = 0; i < times; i++) {
+			fetchMock
+				.get(RESPOND_BASE)
+				.intercept({ path: "/respond", method: "POST" })
+				.reply((opts) => {
+					capture(JSON.parse(opts.body as string));
+					return { statusCode: 200, data: "ok" };
+				});
+		}
 	}
 
 	// The button carries just the Nexudus Id captured at registration.
@@ -271,12 +277,75 @@ describe("delete button -> remove visitor", () => {
 		);
 	}
 
+	it("shows the ⏳ working state, buttons dropped, before a series delete finishes", async () => {
+		// A series is deleted one visit at a time and paced, so the click would
+		// otherwise sit silent; the placeholder lands first and takes every button
+		// with it, so the same Ids can't be submitted twice.
+		mockDelete(42);
+		mockDelete(43);
+		mockDelete(44);
+		const posts: any[] = [];
+		mockRespond((b) => posts.push(b), 2);
+
+		const res = await clickDeleteAll();
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(2);
+
+		const [working, final] = posts;
+		expect(working.replace_original).toBe(true);
+		// Plain member copy: what's happening and how long, with no hint of why
+		// it's paced.
+		expect(working.blocks.at(-1).text.text).toBe("⏳ *Deleting 3 visits…* This can take up to a minute.");
+		expect(working.text).toContain("⏳ *Deleting 3 visits…*");
+		// The summary survives so the member still sees what's going; every
+		// button is gone until the result lands.
+		expect(working.blocks[0].text.text).toBe(SERIES_HEAD);
+		expect(JSON.stringify(working.blocks)).not.toContain("delete_visitor");
+
+		// The result still rebuilds from the original message, not the placeholder.
+		expect(final.blocks[0].text.text).toContain("🗑️ *Registration deleted*");
+		expect(final.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`);
+		expect(JSON.stringify(final.blocks)).not.toContain("Deleting 3 visits");
+	});
+
+	it("posts no working state for a single-visit delete (it's already quick)", async () => {
+		mockDelete(42);
+		const posts: any[] = [];
+		mockRespond((b) => posts.push(b), 1);
+
+		const res = await clickDeleteById(42, "✅ *Visitor registered*\n*Nexudus ID:* 42");
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(1);
+		expect(posts[0].text).not.toContain("⏳");
+	});
+
+	it("puts the message back, buttons and all, when a series delete fails after the working state", async () => {
+		// Without the restore the placeholder's button-less message would strand
+		// the visits that are still registered.
+		mockDelete(42);
+		mockDelete(43, 500);
+		mockDelete(44);
+		const posts: any[] = [];
+		mockRespond((b) => posts.push(b), 3);
+
+		const res = await clickDeleteAll();
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(3);
+
+		const [working, restored, warning] = posts;
+		expect(working.text).toContain("⏳ *Deleting 3 visits…*");
+		expect(restored.replace_original).toBe(true);
+		expect(restored.blocks).toEqual(seriesBlocks()); // exactly as clicked, buttons live again
+		expect(warning.response_type).toBe("ephemeral");
+		expect(warning.text).toContain("Deleted 2 of 3 registrations");
+	});
+
 	it("deletes every visit in a series and restyles the whole message, rows and Repeats struck", async () => {
 		mockDelete(42);
 		mockDelete(43);
 		mockDelete(44);
 		let respond: any;
-		mockRespond((b) => (respond = b));
+		mockRespond((b) => (respond = b), 2);
 
 		const res = await clickDeleteAll();
 		expect(res.status).toBe(200);
@@ -296,7 +365,7 @@ describe("delete button -> remove visitor", () => {
 		mockDelete(43, 404);
 		mockDelete(44);
 		let respond: any;
-		mockRespond((b) => (respond = b));
+		mockRespond((b) => (respond = b), 2); // ⏳ placeholder, then the result
 
 		const res = await clickDeleteAll();
 		expect(res.status).toBe(200);
@@ -313,7 +382,7 @@ describe("delete button -> remove visitor", () => {
 		mockDelete(43, 500);
 		mockDelete(44);
 		let respond: any;
-		mockRespond((b) => (respond = b));
+		mockRespond((b) => (respond = b), 3);
 
 		const res = await clickDeleteAll();
 		expect(res.status).toBe(200);
@@ -355,7 +424,7 @@ describe("delete button -> remove visitor", () => {
 		mockDelete(43, 404);
 		mockDelete(44, 404);
 		let respond: any;
-		mockRespond((b) => (respond = b));
+		mockRespond((b) => (respond = b), 3);
 
 		const res = await clickDeleteAll();
 		expect(res.status).toBe(200);
@@ -375,7 +444,7 @@ describe("delete button -> remove visitor", () => {
 		mockDelete(43, 404); // already gone
 		mockDelete(44);
 		let respond: any;
-		mockRespond((b) => (respond = b));
+		mockRespond((b) => (respond = b), 2);
 
 		const res = await run(
 			await slackRequest(
@@ -401,7 +470,7 @@ describe("delete button -> remove visitor", () => {
 		const ids = [51, 52, 53, 54, 55, 56, 57, 58, 59];
 		for (const id of ids) mockDelete(id);
 		let respond: any;
-		mockRespond((b) => (respond = b));
+		mockRespond((b) => (respond = b), 2);
 
 		const res = await run(
 			await slackRequest(

@@ -28,6 +28,7 @@ import {
 	OPEN_ACTION,
 	SERIES_INVITE_NOTE,
 	deletedFromBlocks,
+	deletingBlocks,
 	homeView,
 	registeringText,
 	seriesSuccessBlocks,
@@ -209,9 +210,21 @@ function respondEphemeral(responseUrl: string, text: string | undefined): Promis
 // Handle a single/Delete-all click: delete in Nexudus, then on success replace
 // the clicked message with its restyled form (every delete button dropped); on
 // failure send the clicker an ephemeral note.
+//
+// A multi-visit series is paced against the Nexudus rate limit, so it takes
+// tens of seconds: show the working state first, and put the original message
+// back if the delete fails — the placeholder dropped its buttons, and without
+// the restore the remaining visits would have no way to be deleted.
 async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
+	const slow = ids.length > 1;
+	if (slow) await respond(responseUrl, { replace_original: true, ...deletingBlocks(message, ids.length) });
 	const outcome = await deleteVisitors(env, ids);
-	if (!outcome.ok) return respondEphemeral(responseUrl, outcome.text);
+	if (!outcome.ok) {
+		if (slow && message?.blocks?.length) {
+			await respond(responseUrl, { replace_original: true, text: message.text, blocks: message.blocks });
+		}
+		return respondEphemeral(responseUrl, outcome.text);
+	}
 	const { text, blocks } = deletedFromBlocks(message);
 	const fullText = outcome.note ? `${text}\n${outcome.note}` : text;
 	const fullBlocks = outcome.note ? [...blocks, { type: "section", text: { type: "mrkdwn", text: outcome.note } }] : blocks;
