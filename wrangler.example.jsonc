@@ -13,9 +13,6 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
-	"compatibility_flags": [
-		"nodejs_compat"
-	],
 	// Non-secret config only; secrets live in .dev.vars / `wrangler secret put`.
 	"vars": {
 		// Space subdomain in https://{sub}.spaces.nexudus.com
@@ -24,7 +21,7 @@
 		"NEXUDUS_BUSINESS_ID": "1000000000",
 		// The modal's arrival pickers are labeled with this timezone and read as
 		// its wall-clock, and messages display arrival times in it;
-		// ExpectedArrival is sent as UTC (README). Tests assert Europe/London;
+		// ExpectedArrival is sent as UTC (AGENTS). Tests assert Europe/London;
 		// leave it if you run the suite.
 		"SPACE_TIMEZONE": "Europe/London",
 		// Registration log channel (id or #name); the bot must be invited to it.

@@ -618,6 +618,24 @@ describe("view_submission -> register + DM", () => {
 		expect(posts[0].text).toContain("*Arrival:* 2031-01-20 14:30 (Europe/London)");
 	});
 
+	it("resolves an arrival in the spring-forward gap to the next real instant", async () => {
+		let visitor: Captured | undefined;
+		mockUserInfo();
+		mockVisitors((c) => (visitor = c));
+		// UK clocks jump 01:00 GMT → 02:00 BST on 2031-03-30, so 01:30 local never
+		// happens. It must still resolve to a real instant rather than NaN: the
+		// gap shifts it forward an hour to 02:30 BST, which is 01:30 UTC.
+		mockMyList([{ Id: 42, Email: "jane.doe@gmail.com", ExpectedArrival: "2031-03-30T01:30:00" }]);
+		const posts = mockPosts();
+
+		const values = formValues({ fullName: "Jane Doe", email: "jane.doe@gmail.com", date: "2031-03-30", time: "01:30" });
+		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
+		expect(res.status).toBe(200);
+		expect(JSON.parse(visitor!.body!)[0].ExpectedArrival).toBe("2031-03-30T01:30:00");
+		// The member is shown the instant that actually exists, not what they typed.
+		expect(posts[0].text).toContain("*Arrival:* 2031-03-30 02:30 (Europe/London)");
+	});
+
 	it("drops the dangling half when the length cap splits an emoji", async () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();

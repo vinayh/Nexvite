@@ -10,8 +10,7 @@
 		"strict": true,
 		"skipLibCheck": true,
 		"types": [
-			"./worker-configuration.d.ts",
-			"node"
+			"./worker-configuration.d.ts"
 		]
 	},
 	"exclude": ["test"],

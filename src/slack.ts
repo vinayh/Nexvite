@@ -62,8 +62,8 @@ async function slackCall(env: Env, url: string, init: RequestInit): Promise<{ ok
 	}
 }
 
-// A JSON-POST Web API method call.
-export function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: boolean; error?: string }> {
+// A JSON-POST Web API method call. Every caller goes through slackApiWarn.
+function slackApi(env: Env, method: string, body: unknown): Promise<{ ok: boolean; error?: string }> {
 	return slackCall(env, `${SLACK_API}/${method}`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json; charset=utf-8" },

@@ -226,10 +226,7 @@ export interface VisitorInput {
 // construction. "Submitted by" and "Nexudus ID" are deliberately absent so
 // they survive the restyle.
 const SUMMARY_LABELS = ["Visitor name", "Visitor email", "Visitor phone", "Arrival", "Repeats", "Visiting", "Notes"] as const;
-// Labels older ✅ messages were posted with; their Delete buttons still work,
-// so the restyle must keep striking them.
-const LEGACY_LABELS = ["Name", "Email", "Phone"] as const;
-const STRUCK_LINE = new RegExp(`^\\*(${[...SUMMARY_LABELS, ...LEGACY_LABELS].join("|")}|Visit \\d+):\\*`);
+const STRUCK_LINE = new RegExp(`^\\*(${SUMMARY_LABELS.join("|")}|Visit \\d+):\\*`);
 
 // mrkdwn summary of what was submitted, shown under every result header (and in
 // the channel log). Blank optional fields are omitted; arrival is space-local
@@ -257,7 +254,7 @@ export const INVITE_NOTE = "_The visitor should receive an invite from the Nexud
 export const SERIES_INVITE_NOTE = "_The visitor should receive a separate Nexudus invite at the email below for each visit in the series._";
 
 // The delete buttons' payload: the Nexudus Id(s) captured at registration,
-// which the click handlers delete directly (README, delete flow). Single
+// which the click handlers delete directly (AGENTS, Deletion). Single
 // visits and per-visit rows use the `{id}` shape (so older single-visit
 // messages' buttons still work); a series' Delete-all button carries `{ids}`.
 export interface DeleteRef {
@@ -281,10 +278,16 @@ function deleteButton(label: string, ref: DeleteRef, actionId: string, confirmTe
 	};
 }
 
+// A plain mrkdwn section — the only block shape the builders and restyles
+// below emit, so the literal lives in one place.
+function section(text: string, blockId?: string) {
+	return { type: "section", ...(blockId && { block_id: blockId }), text: { type: "mrkdwn", text } };
+}
+
 // Single-visit ✅ blocks: the summary plus a Delete button.
 export function successBlocks(text: string, ref: DeleteRef): unknown[] {
 	return [
-		{ type: "section", text: { type: "mrkdwn", text } },
+		section(text),
 		{ type: "actions", elements: [deleteButton("Delete registration", ref, DELETE_ACTION, "The visitor will be removed from Nexudus.")] },
 	];
 }
@@ -296,11 +299,9 @@ export function successBlocks(text: string, ref: DeleteRef): unknown[] {
 // restyle exactly the clicked row.
 export function seriesSuccessBlocks(headText: string, rows: { id: number; line: string }[]): unknown[] {
 	return [
-		{ type: "section", text: { type: "mrkdwn", text: headText } },
+		section(headText),
 		...rows.map((row) => ({
-			type: "section",
-			block_id: `visit_${row.id}`,
-			text: { type: "mrkdwn", text: row.line },
+			...section(row.line, `visit_${row.id}`),
 			accessory: deleteButton("Delete", { id: row.id }, DELETE_ROW_ACTION, "This visit will be removed from Nexudus."),
 		})),
 		{
@@ -343,6 +344,16 @@ function deletedFromMessage(messageText: string | undefined): string {
 
 type SectionBlock = { type?: string; block_id?: unknown; text?: { text?: unknown }; accessory?: unknown };
 
+// The mrkdwn text of each section block in a clicked message, in order;
+// accessories, actions blocks and anything unrecognized are dropped. Every
+// restyle below starts here, so the cast lives in one place.
+function sectionTexts(message: SlackMessage | undefined): string[] {
+	return (message?.blocks ?? []).flatMap((raw) => {
+		const block = raw as SectionBlock;
+		return block.type === "section" && typeof block.text?.text === "string" ? [block.text.text] : [];
+	});
+}
+
 // The in-place "working on it" state for a Delete-all that will take a while:
 // a long series is deleted one visit at a time, pausing between batches for
 // the Nexudus rate limit, so the click would otherwise sit silent for tens of
@@ -353,31 +364,21 @@ type SectionBlock = { type?: string; block_id?: unknown; text?: { text?: unknown
 export function deletingBlocks(message: SlackMessage | undefined, count: number): { text: string; blocks: unknown[] } {
 	// No mention of why it's slow: the pacing is our problem, not the member's.
 	const status = `⏳ *Deleting ${count} visits…* This can take up to a minute.`;
-	const kept = (message?.blocks ?? []).flatMap((raw) => {
-		const block = raw as SectionBlock;
-		if (block.type !== "section" || typeof block.text?.text !== "string") return [];
-		return [{ type: "section", text: { type: "mrkdwn", text: block.text.text } }];
-	});
-	const lines = kept.length ? kept.map((b) => b.text.text) : [message?.text ?? ""].filter(Boolean);
-	const blocks = [...kept, { type: "section", text: { type: "mrkdwn", text: status } }];
-	return { text: [...lines, status].join("\n"), blocks };
+	const kept = sectionTexts(message);
+	const lines = kept.length ? kept : [message?.text ?? ""].filter(Boolean);
+	return { text: [...lines, status].join("\n"), blocks: [...kept.map((line) => section(line)), section(status)] };
 }
 
 // Restyle the whole clicked message for the single/Delete-all path: every
 // section's lines run through deletedFromMessage's rules; accessories (row
 // Delete buttons) and actions blocks are dropped. Falls back to the text-only
-// form when the message carries no section blocks.
-export function deletedFromBlocks(message?: SlackMessage): { text: string; blocks: unknown[] } {
-	const restyled = (message?.blocks ?? []).flatMap((raw) => {
-		const block = raw as SectionBlock;
-		if (block.type !== "section" || typeof block.text?.text !== "string") return [];
-		return [{ type: "section", text: { type: "mrkdwn", text: deletedFromMessage(block.text.text) } }];
-	});
-	if (!restyled.length) {
-		const text = deletedFromMessage(message?.text);
-		return { text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] };
-	}
-	return { text: restyled.map((b) => b.text.text).join("\n"), blocks: restyled };
+// form when the message carries no section blocks. `note` appends a trailing
+// line, e.g. the visits that turned out to be already gone.
+export function deletedFromBlocks(message?: SlackMessage, note?: string): { text: string; blocks: unknown[] } {
+	const restyled = sectionTexts(message).map(deletedFromMessage);
+	const lines = restyled.length ? restyled : [deletedFromMessage(message?.text)];
+	if (note) lines.push(note);
+	return { text: lines.join("\n"), blocks: lines.map((line) => section(line)) };
 }
 
 // Strike one visit row in place (per-visit Delete): the row's text is struck
@@ -391,17 +392,10 @@ export function strikeRowBlocks(message: SlackMessage | undefined, blockId: stri
 		const block = raw as SectionBlock;
 		if (block.type === "section" && block.block_id === blockId && typeof block.text?.text === "string") {
 			found = true;
-			return { type: "section", block_id: blockId, text: { type: "mrkdwn", text: `~${block.text.text}~` } };
+			return section(`~${block.text.text}~`, blockId);
 		}
 		return raw;
 	});
 	if (!found) return null;
-	const text = rebuilt
-		.map((raw) => {
-			const block = raw as SectionBlock;
-			return block.type === "section" && typeof block.text?.text === "string" ? block.text.text : "";
-		})
-		.filter(Boolean)
-		.join("\n");
-	return { text, blocks: rebuilt };
+	return { text: sectionTexts({ blocks: rebuilt }).filter(Boolean).join("\n"), blocks: rebuilt };
 }

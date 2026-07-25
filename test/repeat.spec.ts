@@ -235,6 +235,10 @@ describe("repeating visits", () => {
 		await expectInlineError(formValues({ ...base, every: "0", until: "2030-08-20" }), "repeat_every", "1 to 99");
 	});
 
+	it("rejects an interval above the cap (the picker's maximum is MAX_INTERVAL)", async () => {
+		await expectInlineError(formValues({ ...base, every: "100", until: "2030-08-20" }), "repeat_every", "1 to 99");
+	});
+
 	it("drops crafted day values, falling back to the arrival date's weekday", async () => {
 		mockUserInfo();
 		let visitor: Captured | undefined;

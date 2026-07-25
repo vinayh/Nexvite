@@ -177,9 +177,7 @@ describe("delete button -> remove visitor", () => {
 		expect(respond.text).toContain("the space team"); // no KV record to name a contact
 	});
 
-	it("restyles from the fallback text when the clicked message carries no blocks, striking legacy labels", async () => {
-		// "*Name:*" is the label older ✅ messages were posted with; their Delete
-		// buttons still work, so the restyle must keep striking it.
+	it("restyles from the fallback text when the clicked message carries no blocks", async () => {
 		mockDelete(42);
 		let respond: any;
 		mockRespond((b) => (respond = b));
@@ -190,12 +188,12 @@ describe("delete button -> remove visitor", () => {
 				blockActionsBody("delete_visitor", "trig-del", {
 					value: JSON.stringify({ id: 42 }),
 					responseUrl: `${RESPOND_BASE}/respond`,
-					messageRaw: { text: "✅️ *Visitor registered*\n*Name:* Jane Doe\n*Nexudus ID:* 42" },
+					messageRaw: { text: "✅️ *Visitor registered*\n*Visitor name:* Jane Doe\n*Nexudus ID:* 42" },
 				}),
 			),
 		);
 		expect(res.status).toBe(200);
-		const expected = ["🗑️ *Registration deleted*", "~*Name:* Jane Doe~", "*Nexudus ID:* 42"].join("\n");
+		const expected = ["🗑️ *Registration deleted*", "~*Visitor name:* Jane Doe~", "*Nexudus ID:* 42"].join("\n");
 		expect(respond.replace_original).toBe(true);
 		expect(respond.text).toBe(expected);
 		expect(respond.blocks).toEqual([{ type: "section", text: { type: "mrkdwn", text: expected } }]);
@@ -306,6 +304,59 @@ describe("delete button -> remove visitor", () => {
 		expect(final.blocks[0].text.text).toContain("🗑️ *Registration deleted*");
 		expect(final.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`);
 		expect(JSON.stringify(final.blocks)).not.toContain("Deleting 3 visits");
+	});
+
+	it("restores a blocks-less series message from its text when the delete fails", async () => {
+		// The placeholder collapses a blocks-less message to the ⏳ line and drops
+		// its buttons, so the failure path must put the text back — otherwise the
+		// visits still registered would be stranded with nothing left to click.
+		mockDelete(42);
+		mockDelete(43, 500);
+		const clicked = "✅️ *Visitor registered*\n*Visitor name:* Jane Doe";
+		const posts: any[] = [];
+		mockRespond((b) => posts.push(b), 3);
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ ids: [42, 43] }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+					messageRaw: { text: clicked },
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		const [working, restored, warning] = posts;
+		expect(working.text).toContain("⏳ *Deleting 2 visits…*");
+		expect(restored.replace_original).toBe(true);
+		expect(restored.text).toBe(clicked); // exactly as clicked
+		expect(restored.blocks).toBeUndefined(); // there were none to restore
+		expect(warning.response_type).toBe("ephemeral");
+		expect(warning.text).toContain("Deleted 1 of 2 registrations");
+	});
+
+	it("skips the working state for a series click carrying no message at all", async () => {
+		// Nothing to put back, so posting the placeholder would replace the ✅ with
+		// a button-less ⏳ that no failure path could undo. Only the warning goes out.
+		mockDelete(42);
+		mockDelete(43, 500);
+		const posts: any[] = [];
+		mockRespond((b) => posts.push(b), 1);
+
+		const res = await run(
+			await slackRequest(
+				"/slack/interactivity",
+				blockActionsBody("delete_visitor", "trig-del", {
+					value: JSON.stringify({ ids: [42, 43] }),
+					responseUrl: `${RESPOND_BASE}/respond`,
+				}),
+			),
+		);
+		expect(res.status).toBe(200);
+		expect(posts).toHaveLength(1);
+		expect(posts[0].response_type).toBe("ephemeral");
+		expect(posts[0].text).toContain("Deleted 1 of 2 registrations");
 	});
 
 	it("posts no working state for a single-visit delete (it's already quick)", async () => {
@@ -478,7 +529,7 @@ describe("delete button -> remove visitor", () => {
 				blockActionsBody("delete_visitor", "trig-del", {
 					value: JSON.stringify({ ids }),
 					responseUrl: `${RESPOND_BASE}/respond`,
-					messageText: "✅ *Visitor registered*\n*Name:* Jane Doe",
+					messageText: "✅ *Visitor registered*\n*Visitor name:* Jane Doe",
 				}),
 			),
 		);

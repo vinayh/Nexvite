@@ -152,10 +152,11 @@ export interface NewVisitor {
 }
 
 // POST the whole series in a single create request: this is how the Nexudus
-// API registers a repeating series — there is no recurrence field (README).
+// API registers a repeating series — there is no recurrence field (AGENTS).
 // Null on an auth or network failure (see nexudusFetch).
 export function createVisitors(env: Env, visitors: NewVisitor[]): Promise<Response | null> {
-	const body = JSON.stringify(visitors.map((visitor) => ({ BusinessId: Number(env.NEXUDUS_BUSINESS_ID), ...visitor })));
+	// BusinessId is stamped last so config always wins, whatever the caller passed.
+	const body = JSON.stringify(visitors.map((visitor) => ({ ...visitor, BusinessId: Number(env.NEXUDUS_BUSINESS_ID) })));
 	return nexudusFetch(env, "/api/public/visitors", { method: "POST", headers: { "Content-Type": "application/json" }, body });
 }
 
@@ -206,7 +207,7 @@ function hasNextPage(body: unknown): boolean {
 }
 
 // Resolve the new registrations' Ids from the account's own list (the only
-// read route, see README), matching on email + each exact visit instant,
+// read route, see AGENTS), matching on email + each exact visit instant,
 // newest wins per instant among the records read. Walks pages until every
 // visit resolves, so a long series can't fall off page 1. Retries once for
 // replication lag; null unless every visit resolves (a partial series takes

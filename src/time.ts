@@ -10,7 +10,7 @@
 // three. Expansion steps through calendar dates in SPACE_TIMEZONE date space;
 // every occurrence keeps the first visit's wall-clock time. Nexudus has no
 // recurrence field — a repeating visit is just one visitor object per date in
-// a single create request (README) — so a series is capped like the Nexudus
+// a single create request (AGENTS) — so a series is capped like the Nexudus
 // portal's own "up to 30 visits in one go".
 export const MAX_VISITS = 30;
 export const MAX_INTERVAL = 99;

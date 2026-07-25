@@ -7,7 +7,7 @@
  * verifies the signature, acks the submission with a "registering" placeholder
  * modal, registers the visitor in Nexudus in the background, then updates the
  * modal and DMs the result. The DM is the durable record. Flow diagram and
- * design rationale: README.md.
+ * design rationale: AGENTS.md.
  *
  * This module owns routing and flow orchestration; the pieces live in
  * src/slack.ts (transport + payload readers), src/messages.ts (modal, Home
@@ -139,7 +139,7 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 		return failed(`Nexudus rejected the registration: ${detail ? mrkdwnEscape(detail) : `HTTP ${regRes.status}`}`);
 	}
 
-	// The create returns no Ids (README), so confirm by finding each record in
+	// The create returns no Ids (AGENTS), so confirm by finding each record in
 	// the account's own list, which also yields the Ids the Delete button needs.
 	// If any visit can't be found the POST may still have landed (whole or in
 	// part), so warn softly (DM only, no channel log) and steer away from a
@@ -215,20 +215,25 @@ function respondEphemeral(responseUrl: string, text: string | undefined): Promis
 // tens of seconds: show the working state first, and put the original message
 // back if the delete fails — the placeholder dropped its buttons, and without
 // the restore the remaining visits would have no way to be deleted.
+//
+// Both are gated on the same condition, so they can't diverge: with nothing to
+// put back (a click carrying no message at all) the placeholder is skipped
+// too, rather than replacing the ✅ with a button-less ⏳ that no failure path
+// can undo.
 async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
-	const slow = ids.length > 1;
-	if (slow) await respond(responseUrl, { replace_original: true, ...deletingBlocks(message, ids.length) });
+	const restorable = ids.length > 1 && Boolean(message?.blocks?.length || message?.text);
+	if (restorable) await respond(responseUrl, { replace_original: true, ...deletingBlocks(message, ids.length) });
 	const outcome = await deleteVisitors(env, ids);
 	if (!outcome.ok) {
-		if (slow && message?.blocks?.length) {
-			await respond(responseUrl, { replace_original: true, text: message.text, blocks: message.blocks });
+		if (restorable && message) {
+			// Blocks when the message had them, text alone otherwise — the same
+			// content the placeholder was built from.
+			const restored = message.blocks?.length ? { text: message.text, blocks: message.blocks } : { text: message.text };
+			await respond(responseUrl, { replace_original: true, ...restored });
 		}
 		return respondEphemeral(responseUrl, outcome.text);
 	}
-	const { text, blocks } = deletedFromBlocks(message);
-	const fullText = outcome.note ? `${text}\n${outcome.note}` : text;
-	const fullBlocks = outcome.note ? [...blocks, { type: "section", text: { type: "mrkdwn", text: outcome.note } }] : blocks;
-	return respond(responseUrl, { replace_original: true, text: fullText, blocks: fullBlocks });
+	return respond(responseUrl, { replace_original: true, ...deletedFromBlocks(message, outcome.note) });
 }
 
 // Handle a per-visit Delete click on a series message: delete that one visit,
@@ -374,11 +379,16 @@ export default {
 			if (action?.action_id === OPEN_ACTION && payload.trigger_id) {
 				await openModal(env, payload.trigger_id, payload.user);
 			} else if (action?.action_id === FIELDS.repeatUntil.action && payload.view?.id) {
-				// The day multi-select the re-render unfolds preselects the weekday
-				// of the arrival date already entered.
-				const arrival = readDate(payload.view.state ?? {}, FIELDS.arrivalDate);
+				// Re-render from what's already in the form: the host goes back as
+				// the prefill (views.update keeps what the member typed, but an
+				// untouched prefill only survives if we send it again), and the
+				// arrival date preselects its weekday in the day multi-select the
+				// re-render unfolds.
+				const formState = payload.view.state ?? {};
+				const arrival = readDate(formState, FIELDS.arrivalDate);
+				const host = readText(formState, FIELDS.host);
 				const repeating = typeof action.selected_date === "string" && action.selected_date.length > 0;
-				await slackApiWarn(env, "views.update", { view_id: payload.view.id, view: visitorModal(env, repeating, undefined, arrival) });
+				await slackApiWarn(env, "views.update", { view_id: payload.view.id, view: visitorModal(env, repeating, host, arrival) });
 			} else if (action?.action_id === DELETE_ACTION && action.value && payload.response_url) {
 				const ids = parseDeleteIds(action.value);
 				if (ids.length) {
