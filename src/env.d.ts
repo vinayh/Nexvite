@@ -5,4 +5,5 @@
 interface Env {
 	SLACK_SIGNING_SECRET: string;
 	SLACK_BOT_TOKEN: string;
+	NEXUDUS_AUTH_SEED: string;
 }

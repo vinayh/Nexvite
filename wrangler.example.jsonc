@@ -28,10 +28,13 @@
 		// Change it here and redeploy; empty disables the channel log.
 		"VISITOR_CHANNEL": "#visitor-requests"
 	},
-	// Live, auto-rotating Nexudus auth record {username, access_token,
-	// refresh_token}. Seeding: README, Deploying.
-	"kv_namespaces": [
-		{ "binding": "TOKENS", "id": "00000000000000000000000000000000" }
+	// Strongly consistent coordinator for the rotating Nexudus credential and
+	// account-wide deletion pacing. Seeding: README, First deployment.
+	"durable_objects": {
+		"bindings": [{ "name": "NEXUDUS_AUTH", "class_name": "NexudusAuthCoordinator" }]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["NexudusAuthCoordinator"] }
 	],
 	// Per-IP rate limit ahead of the HMAC work (workers.dev has no zone, so no
 	// WAF rules). namespace_id is an arbitrary per-Worker integer.

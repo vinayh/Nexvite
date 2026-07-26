@@ -1,29 +1,31 @@
 /**
  * Shared test infrastructure: signed-request builders, Slack payload
  * factories, and fetchMock interceptors for the Slack and Nexudus APIs.
- * Every spec file calls setupSuite() once to activate fetchMock, zero the
- * retry/batch pauses, and isolate KV state between tests.
+ * Every spec file calls setupSuite() once to activate fetchMock and zero the
+ * Id-lookup retry and deletion spacing. Workers Vitest isolates Durable Object
+ * storage per test.
  *
  * The specs are integration tests through worker.fetch — split by flow
- * (http, modal, submission, repeat, delete), not by source module.
+ * (http, modal, auth, submission, repeat, delete), not by source module.
  */
 
 import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
 import { afterEach, beforeAll } from "vitest";
 import worker from "../src/index";
-import { TOKEN_KEY, deletePause, lookupPaging, lookupRetry } from "../src/nexudus";
+import { deletePacing, lookupPaging, lookupRetry } from "../src/nexudus";
 
 const SIGNING_SECRET = "test-signing-secret";
+
+export const AUTH = { seed_version: 1, username: "svc@example.com", access_token: "seed-access", refresh_token: "seed-refresh" };
 
 export const testEnv = {
 	...env,
 	SLACK_SIGNING_SECRET: SIGNING_SECRET,
 	SLACK_BOT_TOKEN: "xoxb-test",
+	NEXUDUS_AUTH_SEED: JSON.stringify(AUTH),
 } satisfies Env;
 
-// The seeded KV auth record the Nexudus-touching tests start from.
-export const AUTH = { username: "svc@example.com", access_token: "kv-access", refresh_token: "kv-refresh" };
-export const seed = () => env.TOKENS.put(TOKEN_KEY, JSON.stringify(AUTH));
+export const withoutAuth = { ...testEnv, NEXUDUS_AUTH_SEED: "" } satisfies Env;
 
 export const NEXUDUS_BASE = `https://${env.NEXUDUS_SUBDOMAIN}.spaces.nexudus.com`;
 export const SLACK_BASE = "https://slack.com";
@@ -60,11 +62,10 @@ export function setupSuite(): void {
 		fetchMock.activate();
 		fetchMock.disableNetConnect();
 		lookupRetry.ms = 0; // don't really sleep between Id-lookup attempts
-		deletePause.ms = 0; // …or between series-delete batches
+		deletePacing.ms = 0; // …or between account-wide deletion slots
 	});
-	afterEach(async () => {
+	afterEach(() => {
 		fetchMock.assertNoPendingInterceptors();
-		await env.TOKENS.delete(TOKEN_KEY); // isolate KV state between tests
 	});
 }
 

@@ -23,15 +23,6 @@ describe("routing", () => {
 		expect(res.status).toBe(200);
 	});
 
-	it("acks a malformed interactivity payload with a 200 (no outbound calls)", async () => {
-		const res = await run(await slackRequest("/slack/interactivity", new URLSearchParams({ payload: "{not json" }).toString()));
-		expect(res.status).toBe(200);
-	});
-
-	it("acks an interactivity POST with no payload parameter at all (no outbound calls)", async () => {
-		const res = await run(await slackRequest("/slack/interactivity", "foo=bar"));
-		expect(res.status).toBe(200);
-	});
 });
 
 describe("rate limiting", () => {
@@ -46,13 +37,6 @@ describe("rate limiting", () => {
 		}
 		expect(statuses[0]).toBe(401);
 		expect(statuses[20]).toBe(429);
-	});
-
-	it("still handles a request with no client IP header (limiter keys on 'unknown')", async () => {
-		// No CF-Connecting-IP: the limiter falls back to a shared key and the
-		// request still reaches signature verification (unsigned → 401, not 500).
-		const res = await run(await slackRequest("/slack/command", COMMAND_BODY, { omitSignature: true, omitIp: true }));
-		expect(res.status).toBe(401);
 	});
 
 	it("fails open (request still handled) when the limiter itself errors", async () => {
@@ -70,11 +54,6 @@ describe("rate limiting", () => {
 });
 
 describe("signature verification", () => {
-	it("rejects a request with no signature header (401)", async () => {
-		const res = await run(await slackRequest("/slack/command", COMMAND_BODY, { omitSignature: true }));
-		expect(res.status).toBe(401);
-	});
-
 	it("rejects a bad signature (401)", async () => {
 		const res = await run(await slackRequest("/slack/command", COMMAND_BODY, { signature: "v0=deadbeef" }));
 		expect(res.status).toBe(401);

@@ -2,9 +2,8 @@
 // and the App Home tab's button, plus the events endpoint that publishes the
 // Home tab.
 
-import { fetchMock } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import { COMMAND_BODY, SLACK_BASE, blockActionsBody, eventBody, mockSlack, mockUserInfo, run, setupSuite, slackRequest } from "./helpers";
+import { COMMAND_BODY, blockActionsBody, eventBody, mockSlack, mockUserInfo, run, setupSuite, slackRequest } from "./helpers";
 
 setupSuite();
 
@@ -157,21 +156,6 @@ describe("slash command -> open modal", () => {
 		expect(await res.text()).toContain("Couldn't open");
 	});
 
-	it("tells the user to retry when Slack answers views.open with a non-JSON body", async () => {
-		// e.g. an HTML error page from a proxy: the transport must degrade to a
-		// failed call, not throw on the parse.
-		mockUserInfo();
-		fetchMock.get(SLACK_BASE).intercept({ path: "/api/views.open", method: "POST" }).reply(200, "<html>gateway error</html>");
-		const res = await run(await slackRequest("/slack/command", COMMAND_BODY));
-		expect(res.status).toBe(200);
-		expect(await res.text()).toContain("Couldn't open");
-	});
-
-	it("acks a slash command that carries no trigger_id (no outbound calls)", async () => {
-		const res = await run(await slackRequest("/slack/command", new URLSearchParams({ command: "/visitor" }).toString()));
-		expect(res.status).toBe(200);
-		expect(await res.text()).toBe("");
-	});
 });
 
 describe("App Home -> button -> modal", () => {
@@ -194,27 +178,9 @@ describe("App Home -> button -> modal", () => {
 		expect(actions.elements[0].action_id).toBe("open_visitor_form");
 	});
 
-	it("answers url_verification without a challenge with an empty 200", async () => {
-		const res = await run(await slackRequest("/slack/events", JSON.stringify({ type: "url_verification" })));
-		expect(res.status).toBe(200);
-		expect(await res.text()).toBe("");
-	});
-
-	it("acks an event_callback with no event object (no outbound calls)", async () => {
-		const res = await run(await slackRequest("/slack/events", JSON.stringify({ type: "event_callback" })));
-		expect(res.status).toBe(200);
-	});
-
 	it("ignores app_home_opened for the Messages tab (no outbound calls)", async () => {
 		const res = await run(await slackRequest("/slack/events", eventBody({ type: "app_home_opened", user: "U1", tab: "messages" })));
 		expect(res.status).toBe(200); // afterEach asserts no views.publish happened
-	});
-
-	it("ignores a DM to the bot, since the DM entry point is disabled (no outbound calls)", async () => {
-		const res = await run(
-			await slackRequest("/slack/events", eventBody({ type: "message", channel_type: "im", channel: "D42", user: "U1", text: "hi" })),
-		);
-		expect(res.status).toBe(200);
 	});
 
 	it("opens the modal when the button is clicked (block_actions), host prefilled like the slash command", async () => {

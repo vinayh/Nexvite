@@ -11,8 +11,9 @@
  *
  * This module owns routing and flow orchestration; the pieces live in
  * src/slack.ts (transport + payload readers), src/messages.ts (modal, Home
- * tab, message builders and restyles), src/nexudus.ts (API client and auth),
- * and src/time.ts (wall-clock conversion, repeat expansion).
+ * tab, message builders and restyles), src/nexudus.ts (API client and visitor
+ * operations), src/nexudus-auth.ts (token and deletion coordination), and
+ * src/time.ts (wall-clock conversion, repeat expansion).
  *
  * Never log modal values, visitor fields, tokens, or Nexudus/Slack response
  * bodies; visitor PII must not reach Workers Logs. Slack and Nexudus error
@@ -58,6 +59,8 @@ import {
 	type ViewState,
 } from "./slack";
 import { MAX_VISITS, WEEKDAYS, expandRepeat, fromWallClock, repeatLabel, toWallClock, type WeekdayKey } from "./time";
+
+export { NexudusAuthCoordinator } from "./nexudus-auth";
 
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
 // rejected inline; the /my lookup used for confirmation only sees upcoming visits.

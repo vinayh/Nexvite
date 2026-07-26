@@ -61,13 +61,12 @@ try {
         -ContentType 'application/x-www-form-urlencoded' `
         -Body @{ grant_type = 'password'; username = $Username; password = $Password }
 } catch {
-    $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-    [Console]::Error.WriteLine("Token request failed: $detail")
+    [Console]::Error.WriteLine("Token request failed.")
     exit 1
 }
 
 if ($resp.access_token -isnot [string] -or $resp.refresh_token -isnot [string]) {
-    [Console]::Error.WriteLine("Token request failed: $($resp | ConvertTo-Json -Compress)")
+    [Console]::Error.WriteLine("Token response did not contain both required tokens.")
     exit 1
 }
 

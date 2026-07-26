@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
 #
-# Write the Nexudus auth record { username, access_token, refresh_token } to
-# the TOKENS KV namespace, from KEY=value lines on stdin (the output of
-# scripts/nexudus-token.sh). Requires `wrangler login`.
+# Write a fresh Nexudus auth seed to the NEXUDUS_AUTH_SEED Worker secret from
+# KEY=value lines on stdin (the output of scripts/nexudus-token.sh). A new
+# seed_version tells the Durable Object to replace its stored credential.
+# Requires `wrangler login` and an existing deployed Worker.
 #
-#   scripts/nexudus-token.sh | scripts/nexudus-seed.sh           # production KV
-#   scripts/nexudus-token.sh | scripts/nexudus-seed.sh --local   # wrangler dev storage
-#   pbpaste | scripts/nexudus-seed.sh                            # from a copied snippet
+#   scripts/nexudus-token.sh | scripts/nexudus-seed.sh
+#   pbpaste | scripts/nexudus-seed.sh
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-
-TARGET="--remote"
-[ "${1:-}" = "--local" ] && TARGET="--local"
 
 USERNAME="" ACCESS="" REFRESH=""
 while IFS='=' read -r key value; do
@@ -33,8 +30,8 @@ fi
 
 RECORD="$(node -e '
 const [u, a, r] = process.argv.slice(1);
-console.log(JSON.stringify({ username: u, access_token: a, refresh_token: r }));
+console.log(JSON.stringify({ seed_version: Date.now(), username: u, access_token: a, refresh_token: r }));
 ' "$USERNAME" "$ACCESS" "$REFRESH")"
 
-npx wrangler kv key put --binding TOKENS "$TARGET" nexudus "$RECORD" >/dev/null
-echo "✅ Nexudus auth record seeded to KV ($TARGET)." >&2
+printf '%s' "$RECORD" | npx wrangler secret put NEXUDUS_AUTH_SEED >/dev/null
+echo "✅ Nexudus auth seed updated; the Durable Object will import it on the next request." >&2

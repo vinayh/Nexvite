@@ -5,8 +5,8 @@
 # Prompts for the account username and password (or reads NEXUDUS_USERNAME /
 # NEXUDUS_PASSWORD from the environment); the subdomain defaults to the value
 # in wrangler.jsonc. Exactly three KEY=value lines go to stdout, so the output
-# can be piped straight into scripts/nexudus-seed.sh to write the auth record
-# to KV, or copied and seeded later with `pbpaste | scripts/nexudus-seed.sh`.
+# can be piped straight into scripts/nexudus-seed.sh to update the Worker
+# secret, or copied and seeded later with `pbpaste | scripts/nexudus-seed.sh`.
 #
 # The token request must be application/x-www-form-urlencoded (a JSON body
 # returns unsupported_grant_type).
@@ -36,7 +36,7 @@ process.stdin.on("data", (d) => (s += d)).on("end", () => {
 	let j = {};
 	try { j = JSON.parse(s); } catch {}
 	if (typeof j.access_token !== "string" || typeof j.refresh_token !== "string") {
-		console.error("Token request failed:", j.error || s.slice(0, 200));
+		console.error("Token response did not contain both required tokens.");
 		process.exit(1);
 	}
 	console.log("NEXUDUS_USERNAME=" + process.argv[1]);

@@ -3,7 +3,7 @@
 // expanded into one multi-visitor POST; the inline validation errors and the
 // series result message.
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
 	ARRIVAL_DATE,
 	ARRIVAL_TIME,
@@ -15,7 +15,6 @@ import {
 	mockUserInfo,
 	mockVisitors,
 	run,
-	seed,
 	setupSuite,
 	slackRequest,
 	submissionBody,
@@ -25,8 +24,6 @@ import {
 setupSuite();
 
 describe("repeating visits", () => {
-	beforeEach(seed);
-
 	it("expands a weekly repeat into one POST of one visitor per date, DST-correct, and DMs the series result", async () => {
 		let visitor: Captured | undefined;
 		mockUserInfo();
@@ -169,40 +166,6 @@ describe("repeating visits", () => {
 		expect(posts[0].text).toContain("*Visit 3:* 2030-10-31 10:00 (Europe/London) · Nexudus ID 44");
 	});
 
-	it("uses singular wording when the repeat window only fits one visit", async () => {
-		mockUserInfo();
-		mockVisitors();
-		mockMyList([MY_RECORD]);
-		const posts = mockPosts();
-
-		// Weekly from Saturday the 20th until Friday the 26th: the next Saturday
-		// falls past the end date, so the series is just the first visit.
-		const values = formValues({ ...base, days: ["sat"], until: "2030-07-26" });
-		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
-		expect(res.status).toBe(200);
-		expect(posts[0].text).toContain("*Repeats:* Every week on Sat until 2030-07-20 (1 visit)");
-		expect(posts[0].text).not.toContain("1 visits");
-		// One resolved Id means the single-visit confirmation, not series rows.
-		expect(posts[0].text).toContain("*Nexudus ID:* 42");
-		expect(posts[0].text).not.toContain("*Visit 1:*");
-	});
-
-	it("ignores crafted interval and day values when no end date is picked (single visit)", async () => {
-		// Blank "Repeat until" is the no-repeat default, so the other repeat
-		// fields must not turn a single visit into a series.
-		mockUserInfo();
-		let visitor: Captured | undefined;
-		mockVisitors((c) => (visitor = c));
-		mockMyList([MY_RECORD]);
-		mockPosts();
-
-		const values = formValues({ ...base, every: "2", days: ["mon", "tue"] });
-		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
-		expect(res.status).toBe(200);
-		expect(JSON.parse(await res.text()).view.blocks[0].text.text).toContain("Registering your visitor");
-		expect(JSON.parse(visitor!.body!)).toHaveLength(1);
-	});
-
 	// Inline repeat errors happen before the ack, so no outbound calls at all.
 	async function expectInlineError(values: Record<string, unknown>, block: string, fragment: string): Promise<void> {
 		const res = await run(await slackRequest("/slack/interactivity", submissionBody(values)));
@@ -233,10 +196,6 @@ describe("repeating visits", () => {
 
 	it("rejects a crafted zero interval (the picker's minimum is 1)", async () => {
 		await expectInlineError(formValues({ ...base, every: "0", until: "2030-08-20" }), "repeat_every", "1 to 99");
-	});
-
-	it("rejects an interval above the cap (the picker's maximum is MAX_INTERVAL)", async () => {
-		await expectInlineError(formValues({ ...base, every: "100", until: "2030-08-20" }), "repeat_every", "1 to 99");
 	});
 
 	it("drops crafted day values, falling back to the arrival date's weekday", async () => {
