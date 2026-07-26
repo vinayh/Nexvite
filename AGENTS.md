@@ -67,7 +67,7 @@ recognized path using anything but `POST` returns `405`. A `GET` returning
 to the bot are deliberately not an entry point (the manifest makes the
 Messages tab read-only).
 
-Every recognized `POST` then passes two gates before handling:
+Every recognized `POST` then passes three gates before handling:
 
 1. **Rate limit**: 20 requests/min per IP (`CF-Connecting-IP`) via a Workers
    rate-limiting binding, checked before the HMAC work. Over the limit returns
@@ -76,14 +76,18 @@ Every recognized `POST` then passes two gates before handling:
    insurance. The IP is Slack's egress, not the member's, so the bucket is
    effectively shared by the whole workspace. The check fails open if the
    limiter errors — losing the limiter must not down the endpoint.
-2. **Signature**: `v0=HMAC-SHA256(SLACK_SIGNING_SECRET, "v0:{timestamp}:{body}")`
+2. **Body size**: the raw request body is capped at 256 KiB while streaming it
+   into memory. An oversized `Content-Length` is rejected immediately, and the
+   byte count remains authoritative if the header is missing or inaccurate.
+   Oversized requests return `413` before signature verification.
+3. **Signature**: `v0=HMAC-SHA256(SLACK_SIGNING_SECRET, "v0:{timestamp}:{body}")`
    over the raw body, compared against `X-Slack-Signature` in constant time.
    Returns `401` if the header is missing, the timestamp is older than 5
    minutes (replay protection), or the signature mismatches. Slack request
    signing is the only gate; there is no shared secret.
 
-The raw body is read via `TextDecoder` on the `ArrayBuffer` rather than
-`request.text()` — the HMAC needs the exact bytes, and `text()` makes workerd
+The raw body is decoded incrementally with `TextDecoder` rather than
+`request.text()` — the HMAC needs the exact string, and `text()` makes workerd
 warn about the `application/x-www-form-urlencoded` body.
 
 Submissions ack inside Slack's 3s window with a `response_action:update`
@@ -148,22 +152,16 @@ a crafted `0` interval for range validation, and filter day keys with
 
 ## Deletion
 
-Delete button values are a JSON `DeleteRef`: `{id}` for a single visit or a
-series row, `{ids}` for a series' Delete-all. Parsing is capped at `MAX_VISITS`
-so a malformed value can't drive an unbounded delete loop. The Ids were
-captured at registration, so deletion is a direct `DELETE
+New Delete button values are a JSON `DeleteRef` containing `{id}` for a single
+visit or a series row. Legacy `{ids}` Delete-all values are still recognized,
+but the handler rejects them with a private explanation and makes no Nexudus
+request. The Ids were captured at registration, so deletion is a direct `DELETE
 /api/public/visitors/{id}` with no lookup and no duplicate ambiguity.
 
 Every delete reserves an account-wide slot from the coordinator Durable Object,
 750 ms after the previous slot. The persisted schedule coordinates concurrent
 delete flows and leaves room under the public API's 10 requests / 5 s limit for
 a 401, refresh and retry. It does not pace registration or lookup calls.
-
-A series therefore takes too long to leave its click unanswered. The ⏳
-placeholder keeps the summary but removes every button to prevent a second
-submission. On failure the original message and its buttons are restored before
-the ephemeral warning. Final restyling rebuilds from the original clicked
-message, which the handler retains.
 
 A row delete strikes just its block (found by the `visit_<id>` `block_id`) and
 drops that row's accessory; everything else survives so the rest of the series
@@ -206,11 +204,11 @@ Slack and Nexudus mocked by `fetchMock`. They are integration tests through
 | [`test/delete.spec.ts`](test/delete.spec.ts) | The Delete buttons |
 
 [`test/helpers.ts`](test/helpers.ts) holds the signed-request builders, payload
-factories and API mocks; `setupSuite()` activates `fetchMock` and zeroes the Id
-lookup retry and deletion spacing. Workers Vitest isolates Durable Object
-storage between tests. `assertNoPendingInterceptors` in `afterEach` makes an
-unused mock a failure, which is how the specs assert no outbound calls and exact
-retry counts.
+factories and API mocks; `setupSuite()` installs the fetch stub and zeroes the Id
+lookup retry and deletion spacing. `reset()` clears Durable Object storage after
+each test (Vitest 4 otherwise isolates storage per file). The fetch mock's
+pending-interceptor check in `afterEach` makes an unused mock a failure, which is
+how the specs assert no outbound calls and exact retry counts.
 
 Arrival fixtures sit in 2030 on purpose: past arrivals are rejected inline, and
 summer dates exercise the BST offset. The suite asserts `Europe/London`, so

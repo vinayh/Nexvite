@@ -29,7 +29,6 @@ import {
 	OPEN_ACTION,
 	SERIES_INVITE_NOTE,
 	deletedFromBlocks,
-	deletingBlocks,
 	homeView,
 	registeringText,
 	seriesSuccessBlocks,
@@ -65,6 +64,41 @@ export { NexudusAuthCoordinator } from "./nexudus-auth";
 // Past-arrival grace ("now" rounds down to the minute; slow submits). Older is
 // rejected inline; the /my lookup used for confirmation only sees upcoming visits.
 const ARRIVAL_GRACE_S = 120;
+
+// Slack payloads are small, but these endpoints are public. Bound the body
+// before signature verification so an unauthenticated request cannot make the
+// Worker buffer an arbitrarily large payload. The stream count remains the
+// authority when Content-Length is absent or inaccurate.
+const MAX_SLACK_BODY_BYTES = 256 * 1024;
+
+async function readSlackBody(request: Request): Promise<string | null> {
+	const contentLength = request.headers.get("Content-Length");
+	if (contentLength != null) {
+		const claimedBytes = Number(contentLength);
+		if (!Number.isSafeInteger(claimedBytes) || claimedBytes < 0 || claimedBytes > MAX_SLACK_BODY_BYTES) return null;
+	}
+	if (!request.body) return "";
+
+	const reader = request.body.getReader();
+	const decoder = new TextDecoder();
+	let bytesRead = 0;
+	let text = "";
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			bytesRead += value.byteLength;
+			if (bytesRead > MAX_SLACK_BODY_BYTES) {
+				await reader.cancel("request body too large");
+				return null;
+			}
+			text += decoder.decode(value, { stream: true });
+		}
+		return text + decoder.decode();
+	} finally {
+		reader.releaseLock();
+	}
+}
 
 // Open the modal from a trigger_id (slash command or the Home-tab button
 // click), prefilling "Person they are visiting" with the opener's own name
@@ -174,35 +208,21 @@ async function registerVisitor(env: Env, input: VisitorInput): Promise<Registrat
 // Deletion (the ✅ message's Delete button)
 // ---------------------------------------------------------------------------
 
-// Delete the registration(s) by Id and word the outcome. Never throws; the
-// clicker always gets feedback. On ok the caller restyles the clicked message
-// itself; `note` flags visits that were already gone, `text` is the ephemeral
-// warning for failures.
-async function deleteVisitors(env: Env, ids: number[]): Promise<{ ok: boolean; note?: string; text?: string }> {
-	const { missing, failed } = await deleteVisitorIds(env, ids);
+// Delete one registration by Id and word the outcome. Never throws; the
+// clicker always gets feedback. On success the caller restyles the clicked
+// message; `text` is the private warning on failure.
+async function deleteVisitor(env: Env, id: number): Promise<{ ok: boolean; text?: string }> {
+	const { missing, failed } = await deleteVisitorIds(env, [id]);
 	if (failed === 0 && missing === 0) return { ok: true };
 
 	// Failure contact is the Nexudus account email (see nexudusContact), not
 	// the portal, since members can't see these registrations in their own login.
 	const contact = await nexudusContact(env);
-	if (failed > 0) {
-		const done = ids.length - missing - failed;
-		const text =
-			ids.length === 1
-				? `⚠️ Deleting failed — please contact ${contact} to remove the visitor.`
-				: `⚠️ Deleted ${done} of ${ids.length} registrations — the rest couldn't be deleted. Please contact ${contact} to remove them.`;
-		return { ok: false, text };
-	}
-	if (missing === ids.length) {
-		const text =
-			ids.length === 1
-				? `⚠️ Couldn't find this registration — it may already be deleted. If it still needs removing, contact ${contact}.`
-				: `⚠️ Couldn't find these registrations — they may already be deleted. If they still need removing, contact ${contact}.`;
-		return { ok: false, text };
-	}
-	// Some visits deleted, the rest already gone: the series is fully removed
-	// either way, so confirm with a note rather than warn.
-	return { ok: true, note: `_${missing} of the ${ids.length} visits couldn't be found — they may already have been deleted._` };
+	if (failed > 0) return { ok: false, text: `⚠️ Deleting failed — please contact ${contact} to remove the visitor.` };
+	return {
+		ok: false,
+		text: `⚠️ Couldn't find this registration — it may already be deleted. If it still needs removing, contact ${contact}.`,
+	};
 }
 
 // An ephemeral note to just the clicker, leaving the clicked message as-is.
@@ -210,40 +230,22 @@ function respondEphemeral(responseUrl: string, text: string | undefined): Promis
 	return respond(responseUrl, { replace_original: false, response_type: "ephemeral", text });
 }
 
-// Handle a single/Delete-all click: delete in Nexudus, then on success replace
-// the clicked message with its restyled form (every delete button dropped); on
-// failure send the clicker an ephemeral note.
-//
-// A multi-visit series is paced against the Nexudus rate limit, so it takes
-// tens of seconds: show the working state first, and put the original message
-// back if the delete fails — the placeholder dropped its buttons, and without
-// the restore the remaining visits would have no way to be deleted.
-//
-// Both are gated on the same condition, so they can't diverge: with nothing to
-// put back (a click carrying no message at all) the placeholder is skipped
-// too, rather than replacing the ✅ with a button-less ⏳ that no failure path
-// can undo.
-async function handleDeleteClick(env: Env, ids: number[], responseUrl: string, message?: SlackMessage): Promise<void> {
-	const restorable = ids.length > 1 && Boolean(message?.blocks?.length || message?.text);
-	if (restorable) await respond(responseUrl, { replace_original: true, ...deletingBlocks(message, ids.length) });
-	const outcome = await deleteVisitors(env, ids);
+// Handle a single-visit Delete click: delete in Nexudus, then on success replace
+// the clicked message with its restyled form; on failure leave it alone and send
+// the clicker a private warning.
+async function handleDeleteClick(env: Env, id: number, responseUrl: string, message?: SlackMessage): Promise<void> {
+	const outcome = await deleteVisitor(env, id);
 	if (!outcome.ok) {
-		if (restorable && message) {
-			// Blocks when the message had them, text alone otherwise — the same
-			// content the placeholder was built from.
-			const restored = message.blocks?.length ? { text: message.text, blocks: message.blocks } : { text: message.text };
-			await respond(responseUrl, { replace_original: true, ...restored });
-		}
 		return respondEphemeral(responseUrl, outcome.text);
 	}
-	return respond(responseUrl, { replace_original: true, ...deletedFromBlocks(message, outcome.note) });
+	return respond(responseUrl, { replace_original: true, ...deletedFromBlocks(message) });
 }
 
 // Handle a per-visit Delete click on a series message: delete that one visit,
-// then strike just its row in place (other rows and the Delete-all button
-// survive). Failure wording matches the single-visit path.
+// then strike just its row in place (the other rows stay deletable). Failure
+// wording matches the single-visit path.
 async function handleRowDeleteClick(env: Env, id: number, blockId: string, responseUrl: string, message?: SlackMessage): Promise<void> {
-	const outcome = await deleteVisitors(env, [id]);
+	const outcome = await deleteVisitor(env, id);
 	if (!outcome.ok) return respondEphemeral(responseUrl, outcome.text);
 	const struck = strikeRowBlocks(message, blockId);
 	// A stale/foreign message we can't rebuild still gets a truthful ephemeral.
@@ -252,20 +254,23 @@ async function handleRowDeleteClick(env: Env, id: number, blockId: string, respo
 }
 
 // A delete button's value is a JSON DeleteRef: `{id}` (single visit or a
-// series row) or `{ids}` (a series' Delete-all). Empty on a stale or foreign
-// value; capped so a malformed value can't drive an unbounded delete loop.
-function parseDeleteIds(value: string): number[] {
+// series row) or legacy `{ids}` (an older series' Delete-all). Empty on a stale
+// or foreign value; arrays are capped before the handler rejects them.
+function parseDeleteRef(value: string): { ids: number[]; legacyBulk: boolean } {
 	try {
 		const parsed = JSON.parse(value) as DeleteRef;
-		if (typeof parsed.id === "number") return [parsed.id];
+		if (typeof parsed.id === "number") return { ids: [parsed.id], legacyBulk: false };
 		if (Array.isArray(parsed.ids) && parsed.ids.every((v): v is number => typeof v === "number")) {
-			return parsed.ids.slice(0, MAX_VISITS);
+			return { ids: parsed.ids.slice(0, MAX_VISITS), legacyBulk: true };
 		}
 	} catch {
 		// stale or foreign button value, ignore
 	}
-	return [];
+	return { ids: [], legacyBulk: false };
 }
+
+const DELETE_ALL_UNAVAILABLE =
+	"Delete all isn't available right now. Delete each visit separately using its own Delete button.";
 
 // ---------------------------------------------------------------------------
 // Routing
@@ -308,10 +313,11 @@ export default {
 			// limiter unavailable, let the request through
 		}
 
-		// Read the raw bytes (needed verbatim for the HMAC). Decoding via
-		// TextDecoder rather than request.text() avoids workerd's noisy
-		// "not text" warning for the application/x-www-form-urlencoded body.
-		const rawBody = new TextDecoder().decode(await request.arrayBuffer());
+		// Read and decode the body with a hard byte cap. TextDecoder avoids
+		// workerd's noisy "not text" warning for form-encoded payloads while
+		// preserving the exact UTF-8 string Slack signed.
+		const rawBody = await readSlackBody(request);
+		if (rawBody == null) return new Response("Request too large", { status: 413 });
 		if (!(await verifySlackSignature(request, rawBody, env.SLACK_SIGNING_SECRET))) {
 			return new Response("Invalid signature", { status: 401 });
 		}
@@ -393,13 +399,13 @@ export default {
 				const repeating = typeof action.selected_date === "string" && action.selected_date.length > 0;
 				await slackApiWarn(env, "views.update", { view_id: payload.view.id, view: visitorModal(env, repeating, host, arrival) });
 			} else if (action?.action_id === DELETE_ACTION && action.value && payload.response_url) {
-				const ids = parseDeleteIds(action.value);
-				if (ids.length) {
-					ctx.waitUntil(handleDeleteClick(env, ids, payload.response_url, payload.message));
-				}
+				const { ids, legacyBulk } = parseDeleteRef(action.value);
+				if (legacyBulk) ctx.waitUntil(respondEphemeral(payload.response_url, DELETE_ALL_UNAVAILABLE));
+				else if (ids.length === 1) ctx.waitUntil(handleDeleteClick(env, ids[0], payload.response_url, payload.message));
 			} else if (action?.action_id === DELETE_ROW_ACTION && action.value && payload.response_url) {
-				const [id] = parseDeleteIds(action.value);
-				if (id != null) {
+				const { ids, legacyBulk } = parseDeleteRef(action.value);
+				if (!legacyBulk && ids[0] != null) {
+					const [id] = ids;
 					ctx.waitUntil(handleRowDeleteClick(env, id, action.block_id ?? "", payload.response_url, payload.message));
 				}
 			}

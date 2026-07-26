@@ -1,16 +1,17 @@
 /**
  * Shared test infrastructure: signed-request builders, Slack payload
- * factories, and fetchMock interceptors for the Slack and Nexudus APIs.
- * Every spec file calls setupSuite() once to activate fetchMock and zero the
- * Id-lookup retry and deletion spacing. Workers Vitest isolates Durable Object
- * storage per test.
+ * factories, and fetch interceptors for the Slack and Nexudus APIs.
+ * Every spec file calls setupSuite() once to install the fetch mock, zero the
+ * Id-lookup retry and deletion spacing, and clear Durable Object storage after
+ * each test.
  *
  * The specs are integration tests through worker.fetch — split by flow
  * (http, modal, auth, submission, repeat, delete), not by source module.
  */
 
-import { env, createExecutionContext, waitOnExecutionContext, fetchMock } from "cloudflare:test";
-import { afterEach, beforeAll } from "vitest";
+import { createExecutionContext, reset, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { afterEach, beforeAll, vi } from "vitest";
 import worker from "../src/index";
 import { deletePacing, lookupPaging, lookupRetry } from "../src/nexudus";
 
@@ -56,16 +57,82 @@ export const SUCCESS_TEXT = [
 
 export const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
+type FetchMatch = { path: string; method: string; query?: Record<string, string> };
+type FetchReplyOptions = { body: string; headers: Headers };
+type FetchReplyResult = { statusCode: number; data?: string };
+type FetchReply = FetchReplyResult | ((options: FetchReplyOptions) => FetchReplyResult);
+
+interface PendingFetch {
+	origin: string;
+	match: FetchMatch;
+	reply?: FetchReply;
+	delayMs: number;
+}
+
+const pendingFetches: PendingFetch[] = [];
+
+function matchesFetch(expected: PendingFetch, request: Request): boolean {
+	const url = new URL(request.url);
+	if (url.origin !== expected.origin || url.pathname !== expected.match.path || request.method !== expected.match.method) return false;
+	const query = expected.match.query;
+	if (!query) return true;
+	if (url.searchParams.size !== Object.keys(query).length) return false;
+	return Object.entries(query).every(([key, value]) => url.searchParams.get(key) === value);
+}
+
+async function mockedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+	const request = new Request(input, init);
+	const index = pendingFetches.findIndex((expected) => matchesFetch(expected, request));
+	if (index < 0) throw new Error(`Unmocked fetch: ${request.method} ${request.url}`);
+	const [expected] = pendingFetches.splice(index, 1);
+	if (!expected.reply) throw new Error(`Mock has no reply: ${request.method} ${request.url}`);
+	if (expected.delayMs) await new Promise((resolve) => setTimeout(resolve, expected.delayMs));
+	const options = { body: new TextDecoder().decode(await request.arrayBuffer()), headers: request.headers };
+	const reply = typeof expected.reply === "function" ? expected.reply(options) : expected.reply;
+	return new Response(reply.data ?? "", { status: reply.statusCode });
+}
+
+// Small declarative facade retained for the specs after Cloudflare removed its
+// fetchMock export in the Vitest 4 pool. It supports only the exact matching and
+// queued replies this suite uses; all unregistered network access fails closed.
+export const fetchMock = {
+	get(origin: string) {
+		return {
+			intercept(match: FetchMatch) {
+				const pending: PendingFetch = { origin, match, delayMs: 0 };
+				pendingFetches.push(pending);
+				const chain = {
+					reply(statusOrFactory: number | ((options: FetchReplyOptions) => FetchReplyResult), data = "") {
+						pending.reply =
+							typeof statusOrFactory === "function" ? statusOrFactory : { statusCode: statusOrFactory, data };
+						return chain;
+					},
+					delay(ms: number) {
+						pending.delayMs = ms;
+						return chain;
+					},
+				};
+				return chain;
+			},
+		};
+	},
+	assertNoPendingInterceptors() {
+		const pending = pendingFetches.map(({ match }) => `${match.method} ${match.path}`);
+		pendingFetches.length = 0;
+		if (pending.length) throw new Error(`Pending fetch interceptors: ${pending.join(", ")}`);
+	},
+};
+
 // Per-spec-file lifecycle: called once at the top of each spec file.
 export function setupSuite(): void {
 	beforeAll(() => {
-		fetchMock.activate();
-		fetchMock.disableNetConnect();
+		vi.stubGlobal("fetch", mockedFetch);
 		lookupRetry.ms = 0; // don't really sleep between Id-lookup attempts
 		deletePacing.ms = 0; // …or between account-wide deletion slots
 	});
-	afterEach(() => {
+	afterEach(async () => {
 		fetchMock.assertNoPendingInterceptors();
+		await reset();
 	});
 }
 

@@ -29,7 +29,7 @@ The series runs from the first chosen day on or after the arrival date through t
 
 A series is capped at **30 visits**. That cap, an end date before the first visit, or a day choice that fits no visit before the end date are all refused with an inline error, so nothing is registered until the dates make sense.
 
-Every visit is a separate Nexudus registration, so **the visitor gets one invite email per visit**, each with its own PIN/QR. The ✅ message says so and lists each visit on its own line with its own **Delete** button, plus a **Delete all** button at the end.
+Every visit is a separate Nexudus registration, so **the visitor gets one invite email per visit**, each with its own PIN/QR. The ✅ message says so and lists each visit on its own line with its own **Delete** button.
 
 ### Outcomes
 
@@ -41,9 +41,9 @@ Whoever submitted is recorded on the Nexudus record along with the host and note
 
 ## Deleting a registration
 
-Every ✅ message's delete buttons remove the visitor from Nexudus directly. A single visit has one **Delete registration** button; a series has a **Delete** button per visit plus **Delete all N registrations**. All of them sit behind a confirm dialog.
+Every ✅ message's delete buttons remove the visitor from Nexudus directly. A single visit has one **Delete registration** button; a series has one **Delete** button per visit. Every button sits behind a confirm dialog.
 
-Deleting one visit from a series strikes just that line and leaves the rest deletable. Delete-all (and a single visit's delete) strikes the whole message. A long series takes up to a minute, so Delete-all shows a ⏳ progress state while it works; if it fails partway, the message comes back with its buttons intact and an explanation of what did and didn't go.
+Deleting one visit from a series strikes just that line and leaves the rest deletable. Delete the remaining visits individually if the whole series needs removing. A single visit's delete strikes the whole message.
 
 If a visit was already deleted — often because the same registration was removed from the other copy of the message — you'll be told it may already be gone. The DM and channel copies aren't kept in sync, so their buttons can disagree.
 

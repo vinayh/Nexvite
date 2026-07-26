@@ -63,19 +63,15 @@ describe("repeating visits", () => {
 		expect(posts[0].text).toContain("*Visit 2:* 2030-10-24 10:00 (Europe/London) · Nexudus ID 43");
 		expect(posts[0].text).toContain("*Visit 3:* 2030-10-31 10:00 (Europe/London) · Nexudus ID 44");
 
-		// …and in blocks: summary section, one row per visit with its own Delete
-		// accessory, then the Delete-all actions block.
+		// …and in blocks: summary section, then one row per visit with its own
+		// Delete accessory.
 		const blocks = posts[0].blocks;
-		expect(blocks.map((b: any) => b.type)).toEqual(["section", "section", "section", "section", "actions"]);
+		expect(blocks.map((b: any) => b.type)).toEqual(["section", "section", "section", "section"]);
 		const rows = blocks.slice(1, 4);
 		expect(rows.map((b: any) => b.block_id)).toEqual(["visit_42", "visit_43", "visit_44"]);
 		expect(rows[1].text.text).toBe("*Visit 2:* 2030-10-24 10:00 (Europe/London) · Nexudus ID 43");
 		expect(rows[1].accessory.action_id).toBe("delete_visitor_row");
 		expect(JSON.parse(rows[1].accessory.value)).toEqual({ id: 43 });
-		const button = blocks[4].elements[0];
-		expect(button.action_id).toBe("delete_visitor");
-		expect(button.text.text).toBe("Delete all 3 registrations");
-		expect(JSON.parse(button.value)).toEqual({ ids: [42, 43, 44] });
 	});
 
 	it("honors the interval: every 2 weeks skips the weeks in between", async () => {

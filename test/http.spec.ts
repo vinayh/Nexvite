@@ -23,6 +23,17 @@ describe("routing", () => {
 		expect(res.status).toBe(200);
 	});
 
+	it("rejects an oversized request body with 413 before signature verification", async () => {
+		const req = new IncomingRequest("https://worker.example/slack/interactivity", {
+			method: "POST",
+			headers: { "CF-Connecting-IP": "203.0.113.10" },
+			body: "x".repeat(256 * 1024 + 1),
+		});
+		const res = await run(req);
+		expect(res.status).toBe(413);
+		expect(await res.text()).toBe("Request too large");
+	});
+
 });
 
 describe("rate limiting", () => {

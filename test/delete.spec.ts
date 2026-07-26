@@ -1,14 +1,14 @@
-// The ✅ confirmation's Delete buttons: single visit, whole series
-// (Delete-all), and per-visit row deletes, with the 🗑️ restyling of the
-// clicked message and the ephemeral warnings on failure.
+// The ✅ confirmation's Delete buttons: single visits and per-visit series
+// rows, with the 🗑️ restyling of the clicked message and private warnings on
+// failure. Older Delete-all buttons are rejected without an outbound delete.
 
-import { fetchMock } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 import {
 	ARRIVAL_LOCAL,
 	NEXUDUS_BASE,
 	SUCCESS_TEXT,
 	blockActionsBody,
+	fetchMock,
 	run,
 	setupSuite,
 	slackRequest,
@@ -26,10 +26,7 @@ describe("delete button -> remove visitor", () => {
 			.reply(status, "");
 	}
 
-	// One interceptor per expected post, capturing each in order. A Delete-all
-	// posts more than once: the ⏳ placeholder first, then the result (and, when
-	// the delete fails, the original message restored before the warning), so
-	// `times` is the exact count and a capture that overwrites ends on the last.
+	// One interceptor per expected response_url post, capturing each in order.
 	function mockRespond(capture: (body: any) => void, times = 1) {
 		for (let i = 0; i < times; i++) {
 			fetchMock
@@ -162,9 +159,8 @@ describe("delete button -> remove visitor", () => {
 		expect(res.status).toBe(200); // the failure is only log-worthy
 	});
 
-	// A series ✅ message as posted: a summary head section, one row per visit
-	// with its own Delete accessory, then the Delete-all actions block (✅
-	// requalified as Slack returns it).
+	// A series ✅ message as posted: a summary head section followed by one row
+	// per visit with its own Delete accessory (✅ requalified by Slack).
 	const SERIES_HEAD = [
 		"✅️ *Visitor registered*",
 		"_The visitor should receive a separate Nexudus invite at the email below for each visit in the series._",
@@ -185,13 +181,14 @@ describe("delete button -> remove visitor", () => {
 				text: { type: "mrkdwn", text: ROW_LINES[id] },
 				accessory: { type: "button", action_id: "delete_visitor_row", value: JSON.stringify({ id }) },
 			})),
-			{ type: "actions", elements: [{ type: "button", action_id: "delete_visitor", value: JSON.stringify({ ids: [42, 43, 44] }) }] },
 		];
 	}
 
-	// The series' Delete-all button carries every Id captured at registration.
-	async function clickDeleteAll(): Promise<Response> {
-		return run(
+	it("rejects Delete-all clicks from older messages without calling Nexudus", async () => {
+		let respond: any;
+		mockRespond((b) => (respond = b));
+
+		const res = await run(
 			await slackRequest(
 				"/slack/interactivity",
 				blockActionsBody("delete_visitor", "trig-del", {
@@ -201,110 +198,10 @@ describe("delete button -> remove visitor", () => {
 				}),
 			),
 		);
-	}
-
-	it("shows a button-free working state before a series delete finishes", async () => {
-		// A series is deleted one visit at a time and paced, so the click would
-		// otherwise sit silent; the placeholder lands first and takes every button
-		// with it, so the same Ids can't be submitted twice.
-		mockDelete(42);
-		mockDelete(43);
-		mockDelete(44);
-		const posts: any[] = [];
-		mockRespond((b) => posts.push(b), 2);
-
-		const res = await clickDeleteAll();
-		expect(res.status).toBe(200);
-		expect(posts).toHaveLength(2);
-
-		const [working, final] = posts;
-		expect(working.replace_original).toBe(true);
-		// Plain member copy: what's happening and how long, with no hint of why
-		// it's paced.
-		expect(working.blocks.at(-1).text.text).toBe("⏳ *Deleting 3 visits…* This can take up to a minute.");
-		expect(working.text).toContain("⏳ *Deleting 3 visits…*");
-		// The summary survives so the member still sees what's going; every
-		// button is gone until the result lands.
-		expect(working.blocks[0].text.text).toBe(SERIES_HEAD);
-		expect(JSON.stringify(working.blocks)).not.toContain("delete_visitor");
-
-		// The result still rebuilds from the original message, not the placeholder.
-		expect(final.blocks[0].text.text).toContain("🗑️ *Registration deleted*");
-		expect(final.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`);
-		expect(JSON.stringify(final.blocks)).not.toContain("Deleting 3 visits");
-	});
-
-	it("puts the message back, buttons and all, when a series delete fails after the working state", async () => {
-		// Without the restore the placeholder's button-less message would strand
-		// the visits that are still registered.
-		mockDelete(42);
-		mockDelete(43, 500);
-		mockDelete(44);
-		const posts: any[] = [];
-		mockRespond((b) => posts.push(b), 3);
-
-		const res = await clickDeleteAll();
-		expect(res.status).toBe(200);
-		expect(posts).toHaveLength(3);
-
-		const [working, restored, warning] = posts;
-		expect(working.text).toContain("⏳ *Deleting 3 visits…*");
-		expect(restored.replace_original).toBe(true);
-		expect(restored.blocks).toEqual(seriesBlocks()); // exactly as clicked, buttons live again
-		expect(warning.response_type).toBe("ephemeral");
-		expect(warning.text).toContain("Deleted 2 of 3 registrations");
-	});
-
-	it("deletes every visit in a series and restyles the whole message, rows and Repeats struck", async () => {
-		mockDelete(42);
-		mockDelete(43);
-		mockDelete(44);
-		let respond: any;
-		mockRespond((b) => (respond = b), 2);
-
-		const res = await clickDeleteAll();
-		expect(res.status).toBe(200);
-		expect(respond.replace_original).toBe(true);
-		// Head restyled, every row struck, all buttons (accessories + actions) gone.
-		expect(respond.blocks.map((b: any) => b.type)).toEqual(["section", "section", "section", "section"]);
-		expect(respond.blocks[0].text.text).toBe(
-			["🗑️ *Registration deleted*", "~*Visitor name:* Jane Doe~", "~*Repeats:* Every week until 2030-10-31 (3 visits)~"].join("\n"),
-		);
-		expect(respond.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`);
-		expect(JSON.stringify(respond.blocks)).not.toContain("delete_visitor");
-		expect(respond.text).not.toContain("separate Nexudus invite"); // note gone
-	});
-
-	it("still confirms, with a note, when part of a series is already gone (404)", async () => {
-		mockDelete(42);
-		mockDelete(43, 404);
-		mockDelete(44);
-		let respond: any;
-		mockRespond((b) => (respond = b), 2); // ⏳ placeholder, then the result
-
-		const res = await clickDeleteAll();
-		expect(res.status).toBe(200);
-		// The series is fully removed either way, so the message is replaced,
-		// with the shortfall noted rather than warned about.
-		expect(respond.replace_original).toBe(true);
-		expect(respond.blocks[0].text.text).toContain("🗑️ *Registration deleted*");
-		expect(respond.blocks.at(-1).text.text).toContain("1 of the 3 visits couldn't be found");
-		expect(respond.text).toContain("1 of the 3 visits couldn't be found");
-	});
-
-	it("reports the partial outcome (ephemeral) when a series delete hits a hard failure", async () => {
-		mockDelete(42);
-		mockDelete(43, 500);
-		mockDelete(44);
-		let respond: any;
-		mockRespond((b) => (respond = b), 3);
-
-		const res = await clickDeleteAll();
 		expect(res.status).toBe(200);
 		expect(respond.replace_original).toBe(false);
 		expect(respond.response_type).toBe("ephemeral");
-		expect(respond.text).toContain("Deleted 2 of 3 registrations");
-		expect(respond.text).toContain("svc@example.com");
+		expect(respond.text).toContain("Delete each visit separately");
 	});
 
 	it("deletes one visit from a series and strikes only its row, keeping the other buttons", async () => {
@@ -325,58 +222,12 @@ describe("delete button -> remove visitor", () => {
 		);
 		expect(res.status).toBe(200);
 		expect(respond.replace_original).toBe(true);
-		const [head, row42, row43, row44, actions] = respond.blocks;
+		const [head, row42, row43, row44] = respond.blocks;
 		expect(head.text.text).toBe(SERIES_HEAD); // summary untouched
 		expect(row43.text.text).toBe(`~${ROW_LINES[43]}~`);
 		expect(row43.accessory).toBeUndefined(); // its Delete gone
 		expect(row42.accessory.action_id).toBe("delete_visitor_row"); // others survive
 		expect(row44.accessory.action_id).toBe("delete_visitor_row");
-		expect(actions.type).toBe("actions"); // Delete-all survives
-	});
-
-	it("warns with the plural wording when every visit in a series is already gone", async () => {
-		mockDelete(42, 404);
-		mockDelete(43, 404);
-		mockDelete(44, 404);
-		let respond: any;
-		mockRespond((b) => (respond = b), 3);
-
-		const res = await clickDeleteAll();
-		expect(res.status).toBe(200);
-		expect(respond.replace_original).toBe(false);
-		expect(respond.response_type).toBe("ephemeral");
-		expect(respond.text).toContain("Couldn't find these registrations");
-		expect(respond.text).toContain("svc@example.com");
-	});
-
-	it("passes an already-struck row through Delete-all without double-striking it", async () => {
-		// Row 43 was deleted via its own button earlier: struck text, accessory
-		// gone, already absent from Nexudus — but Delete-all still carries every
-		// Id captured at registration.
-		const blocks = seriesBlocks() as any[];
-		blocks[2] = { type: "section", block_id: "visit_43", text: { type: "mrkdwn", text: `~${ROW_LINES[43]}~` } };
-		mockDelete(42);
-		mockDelete(43, 404); // already gone
-		mockDelete(44);
-		let respond: any;
-		mockRespond((b) => (respond = b), 2);
-
-		const res = await run(
-			await slackRequest(
-				"/slack/interactivity",
-				blockActionsBody("delete_visitor", "trig-del", {
-					value: JSON.stringify({ ids: [42, 43, 44] }),
-					responseUrl: `${RESPOND_BASE}/respond`,
-					messageBlocks: blocks,
-				}),
-			),
-		);
-		expect(res.status).toBe(200);
-		expect(respond.replace_original).toBe(true);
-		expect(respond.blocks[1].text.text).toBe(`~${ROW_LINES[42]}~`);
-		expect(respond.blocks[2].text.text).toBe(`~${ROW_LINES[43]}~`); // single strike, not ~~…~~
-		expect(respond.blocks[3].text.text).toBe(`~${ROW_LINES[44]}~`);
-		expect(respond.blocks.at(-1).text.text).toContain("1 of the 3 visits couldn't be found");
 	});
 
 	it("confirms ephemerally when the deleted row can't be found in the message (stale block_id)", async () => {

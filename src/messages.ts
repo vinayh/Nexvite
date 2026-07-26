@@ -15,7 +15,7 @@ import { MAX_INTERVAL, WEEKDAYS, toWallClock, weekdayOf, type WeekdayKey } from 
 
 export const CALLBACK_ID = "visitor_registration";
 export const OPEN_ACTION = "open_visitor_form"; // the Home-tab button that opens the modal
-export const DELETE_ACTION = "delete_visitor"; // button on the ✅ confirmation messages (single visit / whole series)
+export const DELETE_ACTION = "delete_visitor"; // button on a single-visit ✅ confirmation
 export const DELETE_ROW_ACTION = "delete_visitor_row"; // per-visit button on a series ✅ message's rows
 
 // Modal block/action ids, used to read each value from view.state.values.
@@ -255,8 +255,8 @@ export const SERIES_INVITE_NOTE = "_The visitor should receive a separate Nexudu
 
 // The delete buttons' payload: the Nexudus Id(s) captured at registration,
 // which the click handlers delete directly (AGENTS, Deletion). Single
-// visits and per-visit rows use the `{id}` shape (so older single-visit
-// messages' buttons still work); a series' Delete-all button carries `{ids}`.
+// visits and per-visit rows use the `{id}` shape. `{ids}` is retained only so
+// clicks from older series messages can be recognized and rejected safely.
 export interface DeleteRef {
 	id?: number;
 	ids?: number[];
@@ -293,9 +293,9 @@ export function successBlocks(text: string, ref: DeleteRef): unknown[] {
 }
 
 // Series ✅ blocks: the summary section, then one row per visit with its own
-// Delete accessory (strikes just that row), then a Delete-all button. 30 rows
-// + head + actions stays well under Slack's 50-block message cap. The row's
-// block_id carries the visit's Nexudus Id so the click handler can find and
+// Delete accessory (strikes just that row). Deleting a whole series can exceed
+// the Worker's background-execution window, so visits are deleted individually.
+// The row's block_id carries the Nexudus Id so the click handler can find and
 // restyle exactly the clicked row.
 export function seriesSuccessBlocks(headText: string, rows: { id: number; line: string }[]): unknown[] {
 	return [
@@ -304,17 +304,6 @@ export function seriesSuccessBlocks(headText: string, rows: { id: number; line: 
 			...section(row.line, `visit_${row.id}`),
 			accessory: deleteButton("Delete", { id: row.id }, DELETE_ROW_ACTION, "This visit will be removed from Nexudus."),
 		})),
-		{
-			type: "actions",
-			elements: [
-				deleteButton(
-					`Delete all ${rows.length} registrations`,
-					{ ids: rows.map((row) => row.id) },
-					DELETE_ACTION,
-					`All ${rows.length} visits will be removed from Nexudus.`,
-				),
-			],
-		},
 	];
 }
 
@@ -354,37 +343,19 @@ function sectionTexts(message: SlackMessage | undefined): string[] {
 	});
 }
 
-// The in-place "working on it" state for a Delete-all that will take a while:
-// a long series is deleted one visit at a time, pausing between batches for
-// the Nexudus rate limit, so the click would otherwise sit silent for tens of
-// seconds. Keeps the summary readable, drops every button (a second click
-// would try to delete the same Ids again), and appends a progress line. The
-// final update rebuilds from the original message, which the handler still
-// holds, so nothing is lost by overwriting it here.
-export function deletingBlocks(message: SlackMessage | undefined, count: number): { text: string; blocks: unknown[] } {
-	// No mention of why it's slow: the pacing is our problem, not the member's.
-	const status = `⏳ *Deleting ${count} visits…* This can take up to a minute.`;
-	const kept = sectionTexts(message);
-	const lines = kept.length ? kept : [message?.text ?? ""].filter(Boolean);
-	return { text: [...lines, status].join("\n"), blocks: [...kept.map((line) => section(line)), section(status)] };
-}
-
-// Restyle the whole clicked message for the single/Delete-all path: every
-// section's lines run through deletedFromMessage's rules; accessories (row
-// Delete buttons) and actions blocks are dropped. Falls back to the text-only
-// form when the message carries no section blocks. `note` appends a trailing
-// line, e.g. the visits that turned out to be already gone.
-export function deletedFromBlocks(message?: SlackMessage, note?: string): { text: string; blocks: unknown[] } {
+// Restyle a clicked single-visit message: every section's lines run through
+// deletedFromMessage's rules and the action block is dropped. Falls back to the
+// text-only form when the message carries no section blocks.
+export function deletedFromBlocks(message?: SlackMessage): { text: string; blocks: unknown[] } {
 	const restyled = sectionTexts(message).map(deletedFromMessage);
 	const lines = restyled.length ? restyled : [deletedFromMessage(message?.text)];
-	if (note) lines.push(note);
 	return { text: lines.join("\n"), blocks: lines.map((line) => section(line)) };
 }
 
 // Strike one visit row in place (per-visit Delete): the row's text is struck
 // and its Delete accessory dropped; every other block — the summary, the other
-// rows' buttons, the Delete-all actions block — survives, so the rest of the
-// series stays deletable. Null when the row can't be found (stale message).
+// rows' buttons — survives, so the rest of the series stays deletable. Null
+// when the row can't be found (stale message).
 export function strikeRowBlocks(message: SlackMessage | undefined, blockId: string): { text: string; blocks: unknown[] } | null {
 	if (!message?.blocks || !blockId) return null;
 	let found = false;

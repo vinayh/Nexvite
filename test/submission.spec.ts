@@ -2,7 +2,7 @@
 // lookup → modal update + DM + channel log, including the auth-refresh chain
 // and the /my response-shape parsing the Id lookup tolerates.
 
-import { env } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { lookupPaging } from "../src/nexudus";
 import {

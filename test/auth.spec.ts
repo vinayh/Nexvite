@@ -1,6 +1,6 @@
-import { env, fetchMock } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { NEXUDUS_BASE, setupSuite, testEnv } from "./helpers";
+import { NEXUDUS_BASE, fetchMock, setupSuite, testEnv } from "./helpers";
 
 setupSuite();
 
